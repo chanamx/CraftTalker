@@ -262,26 +262,39 @@ async function loadWorldEntries(
 ) {
   const worldNames: string[] = []
 
-  // ST 角色卡在 extensions.world 中指定关联世界书
+  // 角色绑定的世界书
   const charWorld = (character.extensions as any)?.world as string | undefined
   if (charWorld) worldNames.push(charWorld)
+
+  // 加载启用的全局世界书（未绑定任何角色的）
+  try {
+    const allWorlds = await worldService.listWorlds()
+    for (const w of allWorlds) {
+      if (w.enabled && w.bound_to.length === 0 && !worldNames.includes(w.name)) {
+        worldNames.push(w.name)
+      }
+    }
+  } catch { /* 列表失败不阻塞生成 */ }
 
   if (worldNames.length === 0) return undefined
 
   const scanText = messages.map(m => m.content).join('\n')
   const allEntries: Record<string, import('../services/world.service.js').WorldBookEntry> = {}
+  let maxScanDepth = 100
 
   for (const name of worldNames) {
     try {
       const world = await worldService.getWorld(name)
+      if (!world.enabled) continue
       Object.assign(allEntries, world.entries)
+      if (world.scan_depth > maxScanDepth) maxScanDepth = world.scan_depth
     } catch {
       // 世界书不存在则跳过
     }
   }
 
   if (Object.keys(allEntries).length === 0) return undefined
-  const matched = matchWorldEntries(allEntries, scanText)
+  const matched = matchWorldEntries(allEntries, scanText, maxScanDepth)
   return matched.length > 0 ? matched : undefined
 }
 

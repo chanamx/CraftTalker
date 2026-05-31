@@ -1,5 +1,7 @@
 # CraftTalker (语琢)
 
+**English** | [中文](README_ZH.md)
+
 A modern chat frontend for the SillyTavern/Luker ecosystem, built with React 19 + Hono.
 
 ## Features

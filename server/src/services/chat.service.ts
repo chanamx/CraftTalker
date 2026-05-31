@@ -134,7 +134,16 @@ export async function regenerateLast(characterName: string, chatId: string): Pro
 
 export async function renameChatFile(characterName: string, chatId: string, newName: string): Promise<boolean> {
   const filePath = getChatPath(characterName, chatId)
-  return updateChatMetadataLine(filePath, { character_name: newName })
+  const lines = await readChatFile(filePath)
+  if (lines.length === 0 || !('chat_metadata' in lines[0])) return false
+  const meta = lines[0] as Record<string, unknown>
+  const chatMeta = (meta.chat_metadata ?? {}) as Record<string, unknown>
+  chatMeta.chat_name = newName
+  chatMeta.modified = new Date().toISOString()
+  meta.chat_metadata = chatMeta
+  lines[0] = meta as any
+  await writeChatFile(filePath, lines)
+  return true
 }
 
 export async function addSwipe(characterName: string, chatId: string, lineIndex: number, content: string): Promise<ChatLine | null> {
