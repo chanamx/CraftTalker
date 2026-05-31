@@ -20,6 +20,11 @@ lerna-debug.log*
 .env.*
 !.env.example
 
+# Secrets — API keys, tokens, credentials
+**/secrets*
+**/credentials*
+**/cookie-secret*
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
@@ -32,10 +37,12 @@ lerna-debug.log*
 *.sw?
 Thumbs.db
 
-# User data — test characters, chat logs, personal world books
+# User data — test characters, chat logs, personal world books, presets
 server/data/characters/
 server/data/chats/
 server/data/worlds/
+server/data/presets/
+server/data/backups/
 
 # Preserve directory structure with .gitkeep
 !server/data/.gitkeep
