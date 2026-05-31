@@ -1,0 +1,143 @@
+{
+  "app": {
+    "title": "CraftTalker",
+    "titleZh": "语琢",
+    "disclaimer": "CraftTalker · 内容由 AI 生成，请谨慎甄别"
+  },
+  "sidebar": {
+    "searchPlaceholder": "搜索角色...",
+    "searchAria": "搜索角色",
+    "searchResults": "搜索结果",
+    "noResults": "未找到匹配角色",
+    "pinned": "置顶",
+    "recent": "最近",
+    "importTitle": "导入角色卡",
+    "importAria": "导入角色卡",
+    "connected": "已连接 · 3 个模型可用"
+  },
+  "chat": {
+    "newChat": "新建对话",
+    "newConversation": "新对话",
+    "noChats": "暂无对话记录",
+    "emptyChat": "空对话",
+    "messageCount": " 条消息",
+    "inputPlaceholder": "输入消息...",
+    "inputPlaceholderDesktop": "输入消息... (Enter 发送, Shift+Enter 换行)",
+    "sendAria": "发送消息",
+    "you": "你"
+  },
+  "panel": {
+    "genSettings": "生成设置",
+    "chatSettings": "聊天设置",
+    "worldBook": "世界书",
+    "manage": "管理",
+    "genPreset": "生成预设",
+    "default": "默认",
+    "charInfo": "角色卡信息",
+    "aboutChar": "关于角色",
+    "charName": "角色名称",
+    "model": "模型",
+    "fileId": "文件标识",
+    "summary": "简介",
+    "charId": "角色 ID",
+    "noDescription": "暂无角色描述信息。",
+    "modelPrefix": "模型:",
+    "openSettingsBtn": "打开 LLM 设置",
+    "openSettingsAria": "打开 LLM 设置",
+    "settingsHint": "当前 LLM 配置已在全局设置中管理。点击下方按钮修改 API 地址、密钥及模型参数。",
+    "charDetail": "角色详情",
+    "closePanel": "关闭角色面板"
+  },
+  "settings": {
+    "title": "设置",
+    "closeAria": "关闭设置",
+    "tabLLM": "LLM 连接",
+    "tabUI": "界面设置",
+    "apiType": "API 类型",
+    "apiUrl": "API 地址",
+    "apiKey": "API 密钥",
+    "apiKeyPlaceholder": "留空则无需密钥",
+    "modelName": "模型名称",
+    "testConnection": "测试连接",
+    "connected": "连接成功",
+    "connectionFailed": "连接失败",
+    "uiSettingsHint": "界面设置将在后续版本中提供更多选项。",
+    "cancel": "取消",
+    "save": "保存设置",
+    "openaiCompatible": "OpenAI 兼容",
+    "custom": "自定义"
+  },
+  "preset": {
+    "title": "预设管理",
+    "newPreset": "新建预设",
+    "newPresetName": "新预设",
+    "loadError": "加载预设失败",
+    "loading": "加载中...",
+    "noPresets": "暂无预设",
+    "create": "新建",
+    "save": "保存",
+    "hint": "选择已有预设或新建一个",
+    "openaiCompatible": "OpenAI 兼容"
+  },
+  "import": {
+    "title": "导入角色卡",
+    "closeAria": "关闭导入",
+    "success": "角色卡导入成功！",
+    "error": "导入失败，请检查文件格式",
+    "done": "完成",
+    "cancel": "取消",
+    "dropHint": "拖放角色卡文件到此处",
+    "supportedFormats": "支持 PNG / JSON / WebP 格式",
+    "importing": "导入中...",
+    "import": "导入角色"
+  },
+  "worldBook": {
+    "title": "世界书编辑器",
+    "list": "世界书列表",
+    "entries": " 条目",
+    "deleteConfirm": "确定要删除世界书 \"{name}\" 吗？",
+    "namePlaceholder": "世界书名称",
+    "create": "创建",
+    "cancel": "取消",
+    "newWorldBook": "新建世界书",
+    "selectHint": "选择左侧世界书开始编辑",
+    "addEntry": "添加条目",
+    "save": "保存",
+    "noEntries": "暂无条目，点击上方按钮添加",
+    "keyPlaceholder": "触发关键词...",
+    "contentPlaceholder": "条目内容...",
+    "position": "位置",
+    "beforeChar": "角色前",
+    "afterChar": "角色后",
+    "depth": "深度",
+    "order": "顺序",
+    "probability": "概率%",
+    "alwaysActive": "始终激活",
+    "disabled": "禁用",
+    "enabled": "启用"
+  },
+  "theme": {
+    "switchLight": "切换到浅色模式",
+    "switchDark": "切换到深色模式"
+  },
+  "error": {
+    "title": "出了点问题",
+    "defaultMessage": "应用发生了未知错误",
+    "retry": "重试"
+  },
+  "layout": {
+    "expandSidebar": "展开侧边栏",
+    "collapseSidebar": "收起侧边栏",
+    "closeSidebar": "关闭侧边栏",
+    "expandPanel": "展开角色面板",
+    "collapsePanel": "收起角色面板",
+    "worldBookEditor": "世界书编辑器",
+    "presetManager": "预设管理",
+    "settings": "设置"
+  },
+  "markdown": {
+    "copy": "复制",
+    "copied": "已复制",
+    "failed": "失败"
+  }
+}
