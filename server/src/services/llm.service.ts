@@ -2,7 +2,49 @@ import type { GenerationPreset } from './preset.service.js'
 import type { CharacterCard } from '../lib/png-parser.js'
 import { createError, ErrorCode, AppError } from '../lib/errors.js'
 
+/**
+ * Chat Completion API 源类型
+ */
+export type ChatCompletionSource =
+  | 'openai' | 'anthropic' | 'google' | 'azure_openai' | 'vertexai'
+  | 'openrouter' | 'groq' | 'fireworks' | 'togetherai' | 'perplexity'
+  | 'deepseek' | 'moonshot' | 'siliconflow' | 'minimax' | 'zhipu'
+  | 'mistral' | 'cohere' | 'ai21' | 'xai' | 'pollinations'
+  | 'kobold' | 'textgen' | 'ollama' | 'llamacpp' | 'vllm'
+  | 'custom_openai_chat' | 'custom_openai_responses' | 'custom_claude' | 'custom_gemini'
+
+/**
+ * 自定义 API 格式
+ */
+export type CustomAPIFormat =
+  | 'openai_chat'        // OpenAI Chat Completions: /chat/completions
+  | 'openai_responses'   // OpenAI Responses: /responses
+  | 'claude_messages'    // Claude Messages: /messages
+  | 'gemini_interactions' // Gemini Interactions: /interactions
+
 export interface LLMConfig {
+  // 新增字段
+  source?: ChatCompletionSource
+  useReverseProxy?: boolean
+  reverseProxyUrl?: string
+  reverseProxyPassword?: string
+  customApiFormat?: CustomAPIFormat
+  customHeaders?: Record<string, string>
+  customBodyFields?: Record<string, unknown>
+  excludeBodyFields?: string[]
+  azureConfig?: {
+    resourceName: string
+    deploymentName: string
+    apiVersion: string
+  }
+  vertexConfig?: {
+    projectId: string
+    region: string
+    authMode: 'express' | 'service_account'
+  }
+  regionEndpoint?: string
+
+  // 核心字段（保持兼容）
   apiUrl: string
   apiKey: string
   model: string

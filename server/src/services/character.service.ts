@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url'
 import { readCharacterCard, parseCharacterJson, type CharacterCard } from '../lib/png-parser.js'
 import { createError, ErrorCode } from '../lib/errors.js'
 import { saveWorldBook, type WorldBook, type WorldBookEntry } from './world.service.js'
+import { safePath } from '../lib/path-utils.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const DEFAULT_DATA_DIR = path.resolve(__dirname, '../../data')
@@ -34,7 +35,7 @@ export interface CharacterDetail extends CharacterCard {
 }
 
 function getCharDir(name: string): string {
-  return path.join(getCharactersDir(), name)
+  return safePath(getCharactersDir(), name)
 }
 
 function getJsonPath(name: string): string {
@@ -78,7 +79,7 @@ async function extractAndSaveWorldBook(rawJson: string, worldName: string): Prom
       selective: (e.selective as boolean) ?? false,
       insertion_order: (e.insertion_order as number) ?? 100,
       enabled: (e.enabled as boolean) ?? true,
-      position: (e.position as string) === 'after_char' ? 'after_char' : 'before_char',
+      position: typeof e.position === 'number' ? e.position : (e.position === 'after_char' ? 1 : 0),
       depth: (e.depth as number) ?? 4,
       order: (e.order as number) ?? (e.insertion_order as number) ?? 100,
       use_regexp: (e.use_regex as boolean) ?? (e.use_regexp as boolean) ?? false,

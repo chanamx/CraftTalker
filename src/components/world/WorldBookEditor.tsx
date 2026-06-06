@@ -2,14 +2,30 @@ import { useState, useEffect } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import {
   X, Plus, Trash2, BookOpen, Save, Eye, EyeOff,
-  ArrowDown, GripVertical, User, Globe, Power, Unlink
+  ArrowDown, GripVertical, User, Globe, Power, Unlink, Code
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useWorlds, useWorld, useCreateWorld, useUpdateWorld, useDeleteWorld,
   useAddWorldEntry, useUpdateWorldEntry, useDeleteWorldEntry,
   useBindWorld, useUnbindWorld } from '@/hooks/use-worlds'
 import { useCharacters } from '@/hooks/use-characters'
+import { useSettingsStore } from '@/stores/settings-store'
 import type { WorldBookEntry } from '@/lib/api'
+
+const POSITION_LABELS: Record<number, string> = {
+  0: '角色定义前',
+  1: '角色定义后',
+  2: '作者注释顶部',
+  3: '作者注释底部',
+  4: '指定深度',
+  5: '示例对话前',
+  6: '示例对话后',
+}
+
+const TRIGGER_LABELS = {
+  constant: '永久激活',
+  keyword: '关键词触发',
+} as const
 
 interface WorldBookEditorProps {
   open: boolean
@@ -27,7 +43,7 @@ function createDefaultEntry(): Partial<WorldBookEntry> {
     selective: false,
     insertion_order: 100,
     enabled: true,
-    position: 'before_char',
+    position: 0,
     depth: 4,
     order: 100,
     probability: 100,
@@ -363,6 +379,8 @@ interface EntryCardProps {
 }
 
 function EntryCard({ entry, isEditing, onToggleEdit, onToggleEnabled, onUpdateField, onDelete }: EntryCardProps) {
+  const developerMode = useSettingsStore((s) => s.developerMode)
+
   return (
     <motion.div
       initial={{ opacity: 0, y: 4 }}
@@ -447,24 +465,38 @@ function EntryCard({ entry, isEditing, onToggleEdit, onToggleEnabled, onUpdateFi
               />
 
               <div className="grid grid-cols-4 gap-2">
+                <MiniField label="触发策略">
+                  <select
+                    value={entry.constant ? 'constant' : 'keyword'}
+                    onChange={e => onUpdateField('constant', e.target.value === 'constant')}
+                    className="w-full h-7 px-2 rounded-md bg-[var(--color-bg-elevated)] border border-[var(--color-border-subtle)] text-[11px] text-[var(--color-text-primary)]"
+                  >
+                    <option value="constant">{TRIGGER_LABELS.constant}</option>
+                    <option value="keyword">{TRIGGER_LABELS.keyword}</option>
+                  </select>
+                </MiniField>
                 <MiniField label="位置">
                   <select
                     value={entry.position}
-                    onChange={e => onUpdateField('position', e.target.value as 'before_char' | 'after_char')}
+                    onChange={e => onUpdateField('position', Number(e.target.value))}
                     className="w-full h-7 px-2 rounded-md bg-[var(--color-bg-elevated)] border border-[var(--color-border-subtle)] text-[11px] text-[var(--color-text-primary)]"
                   >
-                    <option value="before_char">角色前</option>
-                    <option value="after_char">角色后</option>
+                    {Object.entries(POSITION_LABELS).map(([val, label]) => (
+                      <option key={val} value={val}>{label}</option>
+                    ))}
                   </select>
                 </MiniField>
-                <MiniField label="深度">
-                  <input
-                    type="number"
-                    value={entry.depth}
-                    onChange={e => onUpdateField('depth', Number(e.target.value))}
-                    className="w-full h-7 px-2 rounded-md bg-[var(--color-bg-elevated)] border border-[var(--color-border-subtle)] text-[11px] text-[var(--color-text-primary)]"
-                  />
-                </MiniField>
+                {entry.position === 4 && (
+                  <MiniField label="深度">
+                    <input
+                      type="number"
+                      value={entry.depth}
+                      onChange={e => onUpdateField('depth', Number(e.target.value))}
+                      min={0}
+                      className="w-full h-7 px-2 rounded-md bg-[var(--color-bg-elevated)] border border-[var(--color-border-subtle)] text-[11px] text-[var(--color-text-primary)]"
+                    />
+                  </MiniField>
+                )}
                 <MiniField label="顺序">
                   <input
                     type="number"
@@ -473,25 +505,136 @@ function EntryCard({ entry, isEditing, onToggleEdit, onToggleEnabled, onUpdateFi
                     className="w-full h-7 px-2 rounded-md bg-[var(--color-bg-elevated)] border border-[var(--color-border-subtle)] text-[11px] text-[var(--color-text-primary)]"
                   />
                 </MiniField>
-                <MiniField label="概率%">
-                  <input
-                    type="number"
-                    value={entry.probability}
-                    onChange={e => onUpdateField('probability', Number(e.target.value))}
-                    className="w-full h-7 px-2 rounded-md bg-[var(--color-bg-elevated)] border border-[var(--color-border-subtle)] text-[11px] text-[var(--color-text-primary)]"
-                  />
-                </MiniField>
               </div>
 
-              <label className="flex items-center gap-2 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={entry.constant}
-                  onChange={e => onUpdateField('constant', e.target.checked)}
-                  className="w-3.5 h-3.5 rounded border-[var(--color-border-default)] text-[var(--color-accent)]"
-                />
-                <span className="text-[11px] text-[var(--color-text-secondary)]">始终激活</span>
-              </label>
+              {developerMode && (
+                <div className="mt-3 pt-3 border-t border-[var(--color-border-subtle)] space-y-2">
+                  <div className="flex items-center gap-1 mb-1">
+                    <Code size={10} className="text-[var(--color-text-muted)]" />
+                    <span className="text-[10px] font-semibold text-[var(--color-text-muted)] uppercase tracking-wider">高级设置</span>
+                  </div>
+
+                  <div className="space-y-1">
+                    <span className="text-[10px] text-[var(--color-text-muted)]">次要关键词（选择性模式，逗号分隔）</span>
+                    <input
+                      type="text"
+                      value={entry.keysecondary.join(', ')}
+                      onChange={e => onUpdateField('keysecondary', e.target.value.split(',').map(k => k.trim()))}
+                      placeholder="次要关键词..."
+                      className="w-full h-7 px-2.5 rounded-lg bg-[var(--color-bg-elevated)] border border-[var(--color-border-subtle)] text-xs text-[var(--color-text-primary)] placeholder:text-[var(--color-text-muted)] focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)]/20"
+                    />
+                  </div>
+
+                  <div className="grid grid-cols-4 gap-2">
+                    <MiniField label="概率%">
+                      <input
+                        type="number"
+                        value={entry.probability}
+                        onChange={e => onUpdateField('probability', Number(e.target.value))}
+                        min={0} max={100}
+                        className="w-full h-7 px-2 rounded-md bg-[var(--color-bg-elevated)] border border-[var(--color-border-subtle)] text-[11px] text-[var(--color-text-primary)]"
+                      />
+                    </MiniField>
+                    <MiniField label="扫描深度">
+                      <input
+                        type="number"
+                        value={entry.scan_depth}
+                        onChange={e => onUpdateField('scan_depth', Number(e.target.value))}
+                        min={0}
+                        className="w-full h-7 px-2 rounded-md bg-[var(--color-bg-elevated)] border border-[var(--color-border-subtle)] text-[11px] text-[var(--color-text-primary)]"
+                      />
+                    </MiniField>
+                    <MiniField label="分组">
+                      <input
+                        type="text"
+                        value={entry.group}
+                        onChange={e => onUpdateField('group', e.target.value)}
+                        className="w-full h-7 px-2 rounded-md bg-[var(--color-bg-elevated)] border border-[var(--color-border-subtle)] text-[11px] text-[var(--color-text-primary)]"
+                      />
+                    </MiniField>
+                    <MiniField label="角色">
+                      <select
+                        value={entry.role}
+                        onChange={e => onUpdateField('role', Number(e.target.value))}
+                        className="w-full h-7 px-2 rounded-md bg-[var(--color-bg-elevated)] border border-[var(--color-border-subtle)] text-[11px] text-[var(--color-text-primary)]"
+                      >
+                        <option value={0}>系统</option>
+                        <option value={1}>用户</option>
+                        <option value={2}>助手</option>
+                      </select>
+                    </MiniField>
+                  </div>
+
+                  <div className="grid grid-cols-3 gap-2">
+                    <MiniField label="粘性">
+                      <input
+                        type="number"
+                        value={entry.sticky}
+                        onChange={e => onUpdateField('sticky', Number(e.target.value))}
+                        min={0}
+                        className="w-full h-7 px-2 rounded-md bg-[var(--color-bg-elevated)] border border-[var(--color-border-subtle)] text-[11px] text-[var(--color-text-primary)]"
+                      />
+                    </MiniField>
+                    <MiniField label="冷却">
+                      <input
+                        type="number"
+                        value={entry.cooldown}
+                        onChange={e => onUpdateField('cooldown', Number(e.target.value))}
+                        min={0}
+                        className="w-full h-7 px-2 rounded-md bg-[var(--color-bg-elevated)] border border-[var(--color-border-subtle)] text-[11px] text-[var(--color-text-primary)]"
+                      />
+                    </MiniField>
+                    <MiniField label="延迟">
+                      <input
+                        type="number"
+                        value={entry.delay}
+                        onChange={e => onUpdateField('delay', Number(e.target.value))}
+                        min={0}
+                        className="w-full h-7 px-2 rounded-md bg-[var(--color-bg-elevated)] border border-[var(--color-border-subtle)] text-[11px] text-[var(--color-text-primary)]"
+                      />
+                    </MiniField>
+                  </div>
+
+                  <div className="flex flex-wrap gap-x-4 gap-y-1.5 pt-1">
+                    <label className="flex items-center gap-1.5 cursor-pointer">
+                      <input type="checkbox" checked={entry.selective} onChange={e => onUpdateField('selective', e.target.checked)} className="w-3 h-3 rounded" />
+                      <span className="text-[10px] text-[var(--color-text-secondary)]">选择性</span>
+                    </label>
+                    <label className="flex items-center gap-1.5 cursor-pointer">
+                      <input type="checkbox" checked={entry.use_regexp} onChange={e => onUpdateField('use_regexp', e.target.checked)} className="w-3 h-3 rounded" />
+                      <span className="text-[10px] text-[var(--color-text-secondary)]">正则匹配</span>
+                    </label>
+                    <label className="flex items-center gap-1.5 cursor-pointer">
+                      <input type="checkbox" checked={entry.case_sensitive} onChange={e => onUpdateField('case_sensitive', e.target.checked)} className="w-3 h-3 rounded" />
+                      <span className="text-[10px] text-[var(--color-text-secondary)]">区分大小写</span>
+                    </label>
+                    <label className="flex items-center gap-1.5 cursor-pointer">
+                      <input type="checkbox" checked={entry.match_whole_words} onChange={e => onUpdateField('match_whole_words', e.target.checked)} className="w-3 h-3 rounded" />
+                      <span className="text-[10px] text-[var(--color-text-secondary)]">全词匹配</span>
+                    </label>
+                    <label className="flex items-center gap-1.5 cursor-pointer">
+                      <input type="checkbox" checked={entry.group_override} onChange={e => onUpdateField('group_override', e.target.checked)} className="w-3 h-3 rounded" />
+                      <span className="text-[10px] text-[var(--color-text-secondary)]">分组覆盖</span>
+                    </label>
+                    <label className="flex items-center gap-1.5 cursor-pointer">
+                      <input type="checkbox" checked={entry.use_group_scoring} onChange={e => onUpdateField('use_group_scoring', e.target.checked)} className="w-3 h-3 rounded" />
+                      <span className="text-[10px] text-[var(--color-text-secondary)]">分组评分</span>
+                    </label>
+                    <label className="flex items-center gap-1.5 cursor-pointer">
+                      <input type="checkbox" checked={entry.exclude_recursion} onChange={e => onUpdateField('exclude_recursion', e.target.checked)} className="w-3 h-3 rounded" />
+                      <span className="text-[10px] text-[var(--color-text-secondary)]">排除递归</span>
+                    </label>
+                    <label className="flex items-center gap-1.5 cursor-pointer">
+                      <input type="checkbox" checked={entry.prevent_recursion} onChange={e => onUpdateField('prevent_recursion', e.target.checked)} className="w-3 h-3 rounded" />
+                      <span className="text-[10px] text-[var(--color-text-secondary)]">阻止递归</span>
+                    </label>
+                    <label className="flex items-center gap-1.5 cursor-pointer">
+                      <input type="checkbox" checked={entry.delay_until_recursion} onChange={e => onUpdateField('delay_until_recursion', e.target.checked)} className="w-3 h-3 rounded" />
+                      <span className="text-[10px] text-[var(--color-text-secondary)]">延迟至递归</span>
+                    </label>
+                  </div>
+                </div>
+              )}
             </div>
           </motion.div>
         )}

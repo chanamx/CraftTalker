@@ -2,7 +2,7 @@ import { Hono } from 'hono'
 import { zValidator } from '@hono/zod-validator'
 import { z } from 'zod'
 import * as worldService from '../services/world.service.js'
-import { updateCharacter, getCharacter, listCharacters } from '../services/character.service.js'
+import { updateCharacter, getCharacter } from '../services/character.service.js'
 
 const worldsRoute = new Hono()
 
@@ -62,9 +62,10 @@ const entrySchema = z.object({
   selective: z.boolean().optional(),
   insertion_order: z.number().optional(),
   enabled: z.boolean().optional(),
-  position: z.enum(['before_char', 'after_char']).optional(),
+  position: z.number().min(0).max(6).optional(),
   depth: z.number().optional(),
   order: z.number().optional(),
+  use_regexp: z.boolean().optional(),
   probability: z.number().optional(),
   group: z.string().optional(),
   group_override: z.boolean().optional(),
@@ -75,6 +76,7 @@ const entrySchema = z.object({
   match_whole_words: z.boolean().optional(),
   use_group_scoring: z.boolean().optional(),
   case_sensitive: z.boolean().optional(),
+  automation_id: z.string().optional(),
   role: z.number().optional(),
   sticky: z.number().optional(),
   cooldown: z.number().optional(),

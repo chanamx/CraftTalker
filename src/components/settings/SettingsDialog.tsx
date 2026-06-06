@@ -1,8 +1,9 @@
 import { useState } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
-import { X, Globe, Key, Cpu, Zap, Check, Loader2 } from 'lucide-react'
+import { X, Globe, Key, Cpu, Zap, Check, Loader2, Code } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { api } from '@/lib/api'
+import { useSettingsStore } from '@/stores/settings-store'
 import type { LLMConfig } from '@/types'
 
 export type { LLMConfig }
@@ -189,9 +190,16 @@ export function SettingsDialog({ open, onClose, config, onSave }: SettingsDialog
 
                 {tab === 'ui' && (
                   <div className="space-y-3">
-                    <p className="text-sm text-[var(--color-text-secondary)]">
-                      界面设置将在后续版本中提供更多选项。
-                    </p>
+                    <label className="flex items-center justify-between cursor-pointer group">
+                      <div className="flex items-center gap-2">
+                        <Code size={15} className="text-[var(--color-text-muted)]" />
+                        <div>
+                          <span className="text-sm font-medium text-[var(--color-text-primary)]">开发者模式</span>
+                          <p className="text-[11px] text-[var(--color-text-muted)]">显示世界书高级设置、递归控制、分组评分等</p>
+                        </div>
+                      </div>
+                      <DeveloperModeToggle />
+                    </label>
                   </div>
                 )}
               </div>
@@ -231,5 +239,30 @@ function Field({ label, icon, children }: { label: string; icon: React.ReactNode
       </label>
       {children}
     </div>
+  )
+}
+
+function DeveloperModeToggle() {
+  const developerMode = useSettingsStore((s) => s.developerMode)
+  const setDeveloperMode = useSettingsStore((s) => s.setDeveloperMode)
+
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={developerMode}
+      onClick={() => setDeveloperMode(!developerMode)}
+      className={cn(
+        'relative inline-flex h-5 w-9 items-center rounded-full transition-colors',
+        developerMode ? 'bg-[var(--color-accent)]' : 'bg-[var(--color-border-default)]'
+      )}
+    >
+      <span
+        className={cn(
+          'inline-block h-3.5 w-3.5 rounded-full bg-white transition-transform',
+          developerMode ? 'translate-x-[18px]' : 'translate-x-[3px]'
+        )}
+      />
+    </button>
   )
 }

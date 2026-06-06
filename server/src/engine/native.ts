@@ -5,8 +5,19 @@ import type { MatchedEntry } from '../lib/world-match.js'
 import { createError, ErrorCode, AppError } from '../lib/errors.js'
 import { resolveMacros, type MacroEnv } from '../lib/macros.js'
 
-function buildWorldContent(entries: MatchedEntry[], position: 'before_char' | 'after_char', macroEnv: MacroEnv): string {
-  const filtered = entries.filter(e => e.position === position)
+// Position constants matching ST's world_info_position enum
+const WI_POSITION = {
+  BEFORE_CHAR: 0,
+  AFTER_CHAR: 1,
+  AN_TOP: 2,
+  AN_BOTTOM: 3,
+  AT_DEPTH: 4,
+  EM_TOP: 5,
+  EM_BOTTOM: 6,
+} as const
+
+function buildWorldContent(entries: MatchedEntry[], positions: number[], macroEnv: MacroEnv): string {
+  const filtered = entries.filter(e => positions.includes(e.position))
   if (filtered.length === 0) return ''
   return filtered.map(e => resolveMacros(e.content, macroEnv)).join('\n')
 }
@@ -26,7 +37,7 @@ function buildOpenAIMessages(
   }
 
   if (worldEntries?.length) {
-    const before = buildWorldContent(worldEntries, 'before_char', macroEnv)
+    const before = buildWorldContent(worldEntries, [WI_POSITION.BEFORE_CHAR, WI_POSITION.AN_TOP], macroEnv)
     if (before) systemPrompt += before + '\n\n'
   }
 
@@ -39,17 +50,33 @@ function buildOpenAIMessages(
   }
 
   if (worldEntries?.length) {
-    const after = buildWorldContent(worldEntries, 'after_char', macroEnv)
+    const after = buildWorldContent(worldEntries, [WI_POSITION.AFTER_CHAR, WI_POSITION.AN_BOTTOM], macroEnv)
     if (after) systemPrompt += `\n\n${after}`
   }
 
   if (character.mes_example) {
-    systemPrompt += `\n\n对话风格参考:\n${r(character.mes_example)}`
+    let exampleBlock = ''
+    const emTop = worldEntries?.length ? buildWorldContent(worldEntries, [WI_POSITION.EM_TOP], macroEnv) : ''
+    if (emTop) exampleBlock += emTop + '\n'
+    exampleBlock += r(character.mes_example)
+    const emBottom = worldEntries?.length ? buildWorldContent(worldEntries, [WI_POSITION.EM_BOTTOM], macroEnv) : ''
+    if (emBottom) exampleBlock += '\n' + emBottom
+    systemPrompt += `\n\n对话风格参考:\n${exampleBlock}`
   }
 
   result.push({ role: 'system', content: systemPrompt })
+
+  // at_depth entries: inject as system messages at specified depth in conversation
+  const atDepthEntries = worldEntries?.filter(e => e.position === WI_POSITION.AT_DEPTH) ?? []
+
   for (const msg of messages) {
     result.push(msg)
+  }
+
+  for (const entry of atDepthEntries) {
+    const content = resolveMacros(entry.content, macroEnv)
+    const insertIdx = Math.max(1, result.length - entry.depth)
+    result.splice(insertIdx, 0, { role: 'system', content })
   }
   return result
 }
@@ -66,7 +93,7 @@ function buildCompletionPrompt(
   if (character.system_prompt) parts.push(r(character.system_prompt))
 
   if (worldEntries?.length) {
-    const before = buildWorldContent(worldEntries, 'before_char', macroEnv)
+    const before = buildWorldContent(worldEntries, [WI_POSITION.BEFORE_CHAR, WI_POSITION.AN_TOP], macroEnv)
     if (before) parts.push(before)
   }
 
@@ -75,11 +102,29 @@ function buildCompletionPrompt(
   if (character.scenario) parts.push(`[场景]\n${r(character.scenario)}`)
 
   if (worldEntries?.length) {
-    const after = buildWorldContent(worldEntries, 'after_char', macroEnv)
+    const after = buildWorldContent(worldEntries, [WI_POSITION.AFTER_CHAR, WI_POSITION.AN_BOTTOM], macroEnv)
     if (after) parts.push(after)
   }
 
-  if (character.mes_example) parts.push(`[对话示例]\n${r(character.mes_example)}`)
+  if (character.mes_example) {
+    let exampleBlock = ''
+    const emTop = worldEntries?.length ? buildWorldContent(worldEntries, [WI_POSITION.EM_TOP], macroEnv) : ''
+    if (emTop) exampleBlock += emTop + '\n'
+    exampleBlock += r(character.mes_example)
+    const emBottom = worldEntries?.length ? buildWorldContent(worldEntries, [WI_POSITION.EM_BOTTOM], macroEnv) : ''
+    if (emBottom) exampleBlock += '\n' + emBottom
+    parts.push(`[对话示例]\n${exampleBlock}`)
+  }
+
+  // at_depth entries: inject at specified depth in message history
+  if (worldEntries?.length) {
+    const atDepthEntries = worldEntries.filter(e => e.position === WI_POSITION.AT_DEPTH)
+    for (const entry of atDepthEntries) {
+      const insertIdx = Math.max(0, messages.length - entry.depth)
+      const content = resolveMacros(entry.content, macroEnv)
+      messages.splice(insertIdx, 0, { role: 'system', content })
+    }
+  }
 
   for (const msg of messages) {
     if (msg.role === 'user') parts.push(`用户: ${msg.content}`)

@@ -100,11 +100,26 @@ export interface WorldBookEntry {
   selective: boolean
   insertion_order: number
   enabled: boolean
-  position: 'before_char' | 'after_char'
+  position: number
   depth: number
   order: number
+  use_regexp: boolean
   probability: number
   group: string
+  group_override: boolean
+  exclude_recursion: boolean
+  prevent_recursion: boolean
+  delay_until_recursion: boolean
+  scan_depth: number
+  match_whole_words: boolean
+  use_group_scoring: boolean
+  case_sensitive: boolean
+  automation_id: string
+  role: number
+  sticky: number
+  cooldown: number
+  delay: number
+  display_index: number
 }
 
 export interface WorldBook {

@@ -77,10 +77,12 @@ export async function getChatInfo(filePath: string): Promise<{
     const fileStream = createReadStream(filePath)
     const rl = readline.createInterface({ input: fileStream, crlfDelay: Infinity })
 
+    let firstLine = ''
     let lastLine = ''
     let itemCounter = 0
 
     rl.on('line', (line) => {
+      if (itemCounter === 0) firstLine = line
       itemCounter++
       lastLine = line
     })
@@ -88,9 +90,16 @@ export async function getChatInfo(filePath: string): Promise<{
     rl.on('close', () => {
       try {
         const jsonData = JSON.parse(lastLine)
+        let displayName = parsed.base
+        try {
+          const meta = JSON.parse(firstLine)
+          if (meta.chat_metadata?.chat_name) {
+            displayName = meta.chat_metadata.chat_name
+          }
+        } catch { /* use default */ }
         resolve({
           file_id: parsed.name,
-          file_name: parsed.base,
+          file_name: displayName,
           chat_items: itemCounter - 1,
           mes: jsonData.mes || '[空消息]',
           last_mes: jsonData.send_date || stats.mtimeMs,

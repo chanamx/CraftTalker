@@ -84,7 +84,7 @@ export function ChatArea({ character, messages, isStreaming, onSend, onStop, onD
             <h2 className="text-lg font-semibold text-[var(--color-text-primary)] mb-1">
               {character.name}
             </h2>
-            <p className="text-sm text-[var(--color-text-secondary)] max-w-sm">
+            <p className="text-sm text-[var(--color-text-secondary)] max-w-sm line-clamp-3">
               {character.description}
             </p>
           </motion.div>

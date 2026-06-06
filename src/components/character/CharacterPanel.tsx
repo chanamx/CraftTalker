@@ -58,12 +58,12 @@ export function CharacterPanel({
         <h2 className="text-base font-semibold text-[var(--color-text-primary)]">
           {character.name}
         </h2>
-        <p className="text-xs text-[var(--color-text-secondary)] mt-1 leading-relaxed">
+        <p className="text-xs text-[var(--color-text-secondary)] mt-1 leading-relaxed line-clamp-2">
           {character.description}
         </p>
       </div>
 
-      <div className="flex-1 overflow-y-auto px-2">
+      <div className="flex-1 overflow-y-auto px-2 min-h-0">
         <motion.div
           variants={staggerContainer}
           initial="hidden"
@@ -198,17 +198,17 @@ export function CharacterPanel({
               transition={{ duration: 0.2 }}
               className="overflow-hidden"
             >
-              <div className="space-y-2 px-3 py-2">
+              <div className="space-y-2 px-3 py-2 max-h-60 overflow-y-auto">
                 <InfoRow label="角色名称" value={character.name} />
                 <InfoRow label="模型" value={character.model || '默认'} />
                 <InfoRow label="文件标识" value={character.file_name} />
                 {character.description && (
-                  <InfoRow
-                    label="简介"
-                    value={character.description.length > 60
-                      ? character.description.slice(0, 60) + '...'
-                      : character.description}
-                  />
+                  <div className="flex flex-col gap-1">
+                    <span className="text-[10px] text-[var(--color-text-muted)]">简介</span>
+                    <p className="text-[11px] text-[var(--color-text-primary)] leading-relaxed break-words">
+                      {character.description}
+                    </p>
+                  </div>
                 )}
               </div>
             </motion.div>
@@ -236,8 +236,8 @@ export function CharacterPanel({
               transition={{ duration: 0.2 }}
               className="overflow-hidden"
             >
-              <div className="space-y-2 px-3 py-2">
-                <p className="text-xs text-[var(--color-text-secondary)] leading-relaxed">
+              <div className="space-y-2 px-3 py-2 max-h-60 overflow-y-auto">
+                <p className="text-xs text-[var(--color-text-secondary)] leading-relaxed break-words">
                   {character.description || '暂无角色描述信息。'}
                 </p>
                 <div className="border-t border-[var(--color-border-subtle)] pt-2">

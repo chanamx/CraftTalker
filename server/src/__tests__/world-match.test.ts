@@ -6,7 +6,7 @@ function makeEntry(overrides: Partial<WorldBookEntry>): WorldBookEntry {
   return {
     uid: 1, key: [], keysecondary: [], comment: '', content: '',
     constant: false, selective: false, insertion_order: 0, enabled: true,
-    position: 'before_char', depth: 4, order: 0, use_regexp: false,
+    position: 0, depth: 4, order: 0, use_regexp: false,
     probability: 100, group: '', group_override: false,
     exclude_recursion: false, prevent_recursion: false,
     delay_until_recursion: false, scan_depth: 100, match_whole_words: false,

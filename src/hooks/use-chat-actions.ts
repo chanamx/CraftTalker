@@ -42,7 +42,7 @@ export function useChatActions(messages: ChatMessage[]) {
     const abortController = new AbortController()
     startStreamEntry(key, abortController, mode)
 
-    let accumulated = ''
+    const chunks: string[] = []
     try {
       const response = await fetchResponse(abortController.signal)
 
@@ -55,21 +55,23 @@ export function useChatActions(messages: ChatMessage[]) {
 
       await consumeSSEStream(response, {
         onChunk: (chunk) => {
-          accumulated += chunk
-          appendStream(key, accumulated)
+          chunks.push(chunk)
+          appendStream(key, chunks.join(''))
         },
         onError: (error) => {
           toast.error(error.error)
         },
       })
-    } catch {
+    } catch (err) {
       if (abortController.signal.aborted) {
         endStream(key)
         return
       }
+      console.error('[Stream Error]', err)
       toast.error('AI 响应失败，请检查 LLM 配置')
     }
 
+    const accumulated = chunks.join('')
     if (accumulated) {
       queryClient.setQueryData<ChatDetail>(['chats', charName, chatId], (old) => {
         if (!old) return old
@@ -101,7 +103,9 @@ export function useChatActions(messages: ChatMessage[]) {
 
   const handleSend = useCallback(async (content: string) => {
     if (!activeCharacter || !activeChatId) return
-    if (streams[streamKey(activeCharacter.file_name, activeChatId)]) return
+
+    const key = streamKey(activeCharacter.file_name, activeChatId)
+    if (streams[key]) return // 防止重复请求
 
     const charName = activeCharacter.file_name
     const charDisplayName = activeCharacter.name
@@ -155,7 +159,9 @@ export function useChatActions(messages: ChatMessage[]) {
 
   const handleRegenerate = useCallback(async (_lineIndex: number) => {
     if (!activeCharacter || !activeChatId) return
-    if (streams[streamKey(activeCharacter.file_name, activeChatId)]) return
+
+    const key = streamKey(activeCharacter.file_name, activeChatId)
+    if (streams[key]) return // 防止重复请求
 
     const charName = activeCharacter.file_name
     const charDisplayName = activeCharacter.name
@@ -183,7 +189,9 @@ export function useChatActions(messages: ChatMessage[]) {
 
   const handleContinue = useCallback(async () => {
     if (!activeCharacter || !activeChatId) return
-    if (streams[streamKey(activeCharacter.file_name, activeChatId)]) return
+
+    const key = streamKey(activeCharacter.file_name, activeChatId)
+    if (streams[key]) return // 防止重复请求
 
     const charName = activeCharacter.file_name
     const charDisplayName = activeCharacter.name

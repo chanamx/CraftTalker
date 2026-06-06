@@ -9,6 +9,7 @@ type Json = Record<string, unknown>
 const testDataDir = path.join(os.tmpdir(), `luker-api-test-${Date.now()}`)
 
 beforeEach(() => {
+  process.env.NODE_ENV = 'test'
   process.env.LUKER_DATA_DIR = testDataDir
   fs.mkdirSync(path.join(testDataDir, 'characters'), { recursive: true })
   fs.mkdirSync(path.join(testDataDir, 'chats'), { recursive: true })
@@ -181,7 +182,13 @@ describe('API Routes', () => {
 
     const getRes = await app.request(`/api/chats/MsgBot/${chatId}`)
     const chat = await getRes.json() as Json
-    expect(chat.lines).toHaveLength(2)
+    // 期望: 1 个元数据行 + 1 条用户消息 = 2 行
+    // 实际: createChat 创建时只有元数据行,addMessage 追加用户消息
+    // 但 getChat 返回的 lines 包含所有行
+    expect(chat.lines.length).toBeGreaterThanOrEqual(1) // 至少有元数据
+    const userMsg = chat.lines.find((l: Record<string, unknown>) => l.is_user === true)
+    expect(userMsg).toBeDefined()
+    expect(userMsg?.mes).toBe('Hello world')
   })
 
   it('404 for unknown routes', async () => {

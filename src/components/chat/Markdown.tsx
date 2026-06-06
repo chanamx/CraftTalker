@@ -153,7 +153,28 @@ export function Markdown({ content, isUser }: MarkdownProps) {
     if (!content) return ''
     const raw = marked.parse(content) as string
     const withLatex = renderLatex(raw)
-    return DOMPurify.sanitize(withLatex)
+
+    // 严格的 XSS 防护配置
+    return DOMPurify.sanitize(withLatex, {
+      ALLOWED_TAGS: [
+        'p', 'br', 'strong', 'em', 'u', 'del', 's', 'code', 'pre',
+        'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+        'ul', 'ol', 'li',
+        'blockquote',
+        'a',
+        'table', 'thead', 'tbody', 'tr', 'th', 'td',
+        'hr',
+        'div', 'span', // LaTeX + 代码块容器
+        'button', // 复制按钮
+      ],
+      ALLOWED_ATTR: [
+        'class', 'style', 'href', 'target', 'rel', 'title',
+        'data-lang', // 代码块语言标记
+      ],
+      ALLOWED_URI_REGEXP: /^(?:https?|mailto):/i,
+      ALLOW_DATA_ATTR: false,
+      SAFE_FOR_TEMPLATES: true,
+    })
   }, [content])
 
   useEffect(() => {

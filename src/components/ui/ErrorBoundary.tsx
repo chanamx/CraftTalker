@@ -23,7 +23,12 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
   }
 
   componentDidCatch(error: Error, info: ErrorInfo) {
-    console.error('[ErrorBoundary]', error, info.componentStack)
+    console.error('[ErrorBoundary] Caught error:', error, info.componentStack)
+
+    // 生产环境可集成错误上报服务（Sentry/LogRocket 等）
+    if (import.meta.env.PROD) {
+      // 示例：window.errorReporter?.captureException(error, { extra: info })
+    }
   }
 
   handleReset = () => {

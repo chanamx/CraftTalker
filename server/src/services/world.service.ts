@@ -3,6 +3,7 @@ import { existsSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createError, ErrorCode } from '../lib/errors.js'
+import { safePath } from '../lib/path-utils.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const DEFAULT_DATA_DIR = path.resolve(__dirname, '../../data')
@@ -20,7 +21,7 @@ export interface WorldBookEntry {
   selective: boolean
   insertion_order: number
   enabled: boolean
-  position: 'before_char' | 'after_char'
+  position: number
   depth: number
   order: number
   use_regexp: boolean
@@ -57,7 +58,7 @@ export interface WorldBook {
 }
 
 function getWorldPath(name: string): string {
-  return path.join(getWorldsDir(), `${name}.json`)
+  return safePath(getWorldsDir(), `${name}.json`)
 }
 
 async function readJsonFile(filePath: string): Promise<Record<string, unknown>> {

@@ -7,6 +7,7 @@ import { worldsRoute } from './routes/worlds.js'
 import { presetsRoute } from './routes/presets.js'
 import { engineRoute } from './routes/engine.js'
 import { appErrorHandler } from './middleware/errorHandler.js'
+import { applyCsrf } from './middleware/csrf.js'
 
 export function createApp() {
   const app = new Hono()
@@ -20,11 +21,16 @@ export function createApp() {
     credentials: true,
   }))
 
-  app.route('/api/characters', charactersRoute)
-  app.route('/api/chats', chatsRoute)
-  app.route('/api/worlds', worldsRoute)
-  app.route('/api/presets', presetsRoute)
-  app.route('/api/engine', engineRoute)
+  // CSRF 保护：仅应用到状态变更路由（POST/PATCH/DELETE）
+  const protectedApp = new Hono()
+  applyCsrf(protectedApp)
+  protectedApp.route('/api/characters', charactersRoute)
+  protectedApp.route('/api/chats', chatsRoute)
+  protectedApp.route('/api/worlds', worldsRoute)
+  protectedApp.route('/api/presets', presetsRoute)
+  protectedApp.route('/api/engine', engineRoute)
+
+  app.route('/', protectedApp)
 
   app.get('/api/health', (c) => c.json({ status: 'ok', timestamp: Date.now() }))
 

@@ -13,11 +13,11 @@ import {
   deleteLineAt,
   updateLineAt,
   deleteLastAssistantLine,
-  updateChatMetadataLine,
   type ChatLine,
   type ChatMessage,
 } from '../lib/jsonl.js'
 import { createError, ErrorCode } from '../lib/errors.js'
+import { safePath } from '../lib/path-utils.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const DEFAULT_DATA_DIR = path.resolve(__dirname, '../../data')
@@ -26,7 +26,7 @@ function getDataDir() { return process.env.LUKER_DATA_DIR ?? DEFAULT_DATA_DIR }
 function getChatsDir() { return path.join(getDataDir(), 'chats') }
 
 function getChatPath(characterName: string, chatId: string): string {
-  return path.join(getChatsDir(), characterName, `${chatId}.jsonl`)
+  return safePath(getChatsDir(), characterName, `${chatId}.jsonl`)
 }
 
 export interface ChatInfo {
@@ -44,7 +44,7 @@ export interface ChatDetail {
 }
 
 export async function listChats(characterName: string): Promise<ChatInfo[]> {
-  const charChatDir = path.join(getChatsDir(), characterName)
+  const charChatDir = safePath(getChatsDir(), characterName)
   const files = await listChatFiles(charChatDir)
 
   const results = await Promise.all(
@@ -136,12 +136,12 @@ export async function renameChatFile(characterName: string, chatId: string, newN
   const filePath = getChatPath(characterName, chatId)
   const lines = await readChatFile(filePath)
   if (lines.length === 0 || !('chat_metadata' in lines[0])) return false
-  const meta = lines[0] as Record<string, unknown>
+  const meta = lines[0] as unknown as Record<string, unknown>
   const chatMeta = (meta.chat_metadata ?? {}) as Record<string, unknown>
   chatMeta.chat_name = newName
   chatMeta.modified = new Date().toISOString()
   meta.chat_metadata = chatMeta
-  lines[0] = meta as any
+  lines[0] = meta as unknown as ChatLine
   await writeChatFile(filePath, lines)
   return true
 }

@@ -1,6 +1,7 @@
 import { create } from 'zustand'
-import { persist } from 'zustand/middleware'
+import { persist, createJSONStorage } from 'zustand/middleware'
 import type { LLMConfig } from '@/types'
+import { secureStorage } from '@/lib/secure-storage'
 
 interface GenConfig {
   temperature: number
@@ -26,12 +27,14 @@ const DEFAULT_GEN_CONFIG: GenConfig = {
 interface SettingsState {
   llmConfig: LLMConfig
   genConfig: GenConfig
+  developerMode: boolean
   setLlmConfig: (config: LLMConfig) => void
   setGenConfig: (config: Partial<GenConfig>) => void
   setTemperature: (v: number) => void
   setTopP: (v: number) => void
   setContextLength: (v: number) => void
   setMaxReplyLength: (v: number) => void
+  setDeveloperMode: (v: boolean) => void
 }
 
 export const useSettingsStore = create<SettingsState>()(
@@ -39,6 +42,7 @@ export const useSettingsStore = create<SettingsState>()(
     (set) => ({
       llmConfig: DEFAULT_LLM_CONFIG,
       genConfig: DEFAULT_GEN_CONFIG,
+      developerMode: false,
       setLlmConfig: (config) => set({ llmConfig: config }),
       setGenConfig: (partial) =>
         set((s) => ({ genConfig: { ...s.genConfig, ...partial } })),
@@ -50,9 +54,11 @@ export const useSettingsStore = create<SettingsState>()(
         set((s) => ({ genConfig: { ...s.genConfig, contextLength: v } })),
       setMaxReplyLength: (v) =>
         set((s) => ({ genConfig: { ...s.genConfig, maxReplyLength: v } })),
+      setDeveloperMode: (v) => set({ developerMode: v }),
     }),
     {
       name: 'luker-settings-store',
+      storage: createJSONStorage(() => secureStorage),
     }
   )
 )

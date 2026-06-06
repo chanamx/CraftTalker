@@ -46,7 +46,9 @@ chatsRoute.post('/:characterName/:chatId/messages', zValidator('json', messageSc
   const characterName = decodeURIComponent(c.req.param('characterName'))
   const chatId = c.req.param('chatId')
   const { content, name, is_system, extra } = c.req.valid('json')
-  const message = await chatService.addMessage(characterName, chatId, !is_system, content, name, is_system, extra)
+  // is_system 为 true 时是系统消息，否则默认为用户消息
+  const isUser = !is_system
+  const message = await chatService.addMessage(characterName, chatId, isUser, content, name, is_system ?? false, extra)
   return c.json(message, 201)
 })
 

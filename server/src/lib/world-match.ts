@@ -2,7 +2,8 @@ import type { WorldBookEntry } from '../services/world.service.js'
 
 export interface MatchedEntry {
   content: string
-  position: 'before_char' | 'after_char'
+  position: number
+  depth: number
   insertion_order: number
 }
 
@@ -19,7 +20,7 @@ export function matchWorldEntries(
     if (entry.probability < 100 && Math.random() * 100 > entry.probability) continue
 
     if (entry.constant) {
-      matched.push({ content: entry.content, position: entry.position, insertion_order: entry.insertion_order })
+      matched.push({ content: entry.content, position: entry.position, depth: entry.depth, insertion_order: entry.insertion_order })
       continue
     }
 
@@ -31,7 +32,7 @@ export function matchWorldEntries(
       if (!secondaryHit) continue
     }
 
-    matched.push({ content: entry.content, position: entry.position, insertion_order: entry.insertion_order })
+    matched.push({ content: entry.content, position: entry.position, depth: entry.depth, insertion_order: entry.insertion_order })
   }
 
   return matched.sort((a, b) => a.insertion_order - b.insertion_order)
