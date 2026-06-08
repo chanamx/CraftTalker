@@ -15,6 +15,8 @@ export enum ErrorCode {
   CHAT_NOT_FOUND = 4001,
   WORLD_NOT_FOUND = 4002,
   PRESET_NOT_FOUND = 4003,
+
+  GENERATION_IN_PROGRESS = 5000,
 }
 
 export class AppError extends Error {
@@ -48,6 +50,9 @@ export function getStatusCode(code: ErrorCode): number {
 
     case ErrorCode.VALIDATION_ERROR:
       return 400
+
+    case ErrorCode.GENERATION_IN_PROGRESS:
+      return 409
 
     case ErrorCode.LLM_API_ERROR:
     case ErrorCode.LLM_CONNECTION_ERROR:
