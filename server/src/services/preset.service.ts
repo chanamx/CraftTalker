@@ -3,15 +3,30 @@ import { existsSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createError, ErrorCode } from '../lib/errors.js'
+import { safePath } from '../lib/path-utils.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const DEFAULT_DATA_DIR = path.resolve(__dirname, '../../data')
 
 function getDataDir() { return process.env.LUKER_DATA_DIR ?? DEFAULT_DATA_DIR }
-const KOBOLD_DIR = () => path.join(getDataDir(), 'koboldAI_Settings')
-const OPENAI_DIR = () => path.join(getDataDir(), 'openAI_Settings')
-const TEXTGEN_DIR = () => path.join(getDataDir(), 'textGen_Settings')
-const NOVEL_DIR = () => path.join(getDataDir(), 'novelAI_Settings')
+
+const PRESET_CONFIG = {
+  kobold: { dir: 'koboldAI_Settings', extension: '.settings' },
+  openai: { dir: 'openAI_Settings', extension: '.settings' },
+  textgen: { dir: 'textGen_Settings', extension: '.settings' },
+  novel: { dir: 'novelAI_Settings', extension: '.settings' },
+  instruct: { dir: 'instruct', extension: '.json' },
+  context: { dir: 'context', extension: '.json' },
+  sysprompt: { dir: 'sysprompt', extension: '.json' },
+  reasoning: { dir: 'reasoning', extension: '.json' },
+} as const
+
+export type PresetType = keyof typeof PRESET_CONFIG
+export const PRESET_TYPES = Object.keys(PRESET_CONFIG) as PresetType[]
+
+export function isPresetType(type: string): type is PresetType {
+  return Object.hasOwn(PRESET_CONFIG, type)
+}
 
 export interface GenerationPreset {
   name: string
@@ -46,7 +61,10 @@ export interface GenerationPreset {
   dry_sequence_breakers: string
   xtc_threshold: number
   xtc_probability: number
+  [key: string]: unknown
 }
+
+export type PresetData = { name: string; [key: string]: unknown }
 
 const DEFAULT_PRESET: GenerationPreset = {
   name: '默认',
@@ -83,40 +101,34 @@ const DEFAULT_PRESET: GenerationPreset = {
   xtc_probability: 0,
 }
 
-export type PresetType = 'kobold' | 'openai' | 'textgen' | 'novel'
-
 function getPresetDir(type: PresetType): string {
-  switch (type) {
-    case 'kobold': return KOBOLD_DIR()
-    case 'openai': return OPENAI_DIR()
-    case 'textgen': return TEXTGEN_DIR()
-    case 'novel': return NOVEL_DIR()
-  }
+  return path.join(getDataDir(), PRESET_CONFIG[type].dir)
 }
 
 function getPresetPath(type: PresetType, name: string): string {
-  return path.join(getPresetDir(type), `${name}.settings`)
+  return safePath(getPresetDir(type), `${name}${PRESET_CONFIG[type].extension}`)
 }
 
 export async function listPresets(type: PresetType): Promise<string[]> {
   const dir = getPresetDir(type)
   if (!existsSync(dir)) return []
   const entries = await fs.readdir(dir)
+  const extension = PRESET_CONFIG[type].extension
   return entries
-    .filter(f => f.endsWith('.settings'))
-    .map(f => f.replace('.settings', ''))
+    .filter(f => f.endsWith(extension))
+    .map(f => f.slice(0, -extension.length))
 }
 
-export async function getPreset(type: PresetType, name: string): Promise<GenerationPreset> {
+export async function getPreset(type: PresetType, name: string): Promise<PresetData> {
   const filePath = getPresetPath(type, name)
   if (!existsSync(filePath)) {
     throw createError(ErrorCode.PRESET_NOT_FOUND, `预设 "${type}/${name}" 不存在`, { presetType: type, presetName: name })
   }
   const raw = await fs.readFile(filePath, 'utf8')
-  return JSON.parse(raw) as GenerationPreset
+  return JSON.parse(raw) as PresetData
 }
 
-export async function savePreset(type: PresetType, name: string, preset: GenerationPreset): Promise<GenerationPreset> {
+export async function savePreset(type: PresetType, name: string, preset: PresetData): Promise<PresetData> {
   const dir = getPresetDir(type)
   await fs.mkdir(dir, { recursive: true })
   const filePath = getPresetPath(type, name)

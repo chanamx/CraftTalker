@@ -2,9 +2,9 @@ import fs from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { readCharacterCard, parseCharacterJson, type CharacterCard } from '../lib/png-parser.js'
+import { readCharacterCard, parseCharacterJson, serializeCharacterJson, toStoredCharacterJson, type CharacterCard } from '../lib/png-parser.js'
 import { createError, ErrorCode } from '../lib/errors.js'
-import { saveWorldBook, type WorldBook, type WorldBookEntry } from './world.service.js'
+import { normalizeWorld, normalizeWorldEntry, saveWorldBook, type WorldBook } from './world.service.js'
 import { safePath } from '../lib/path-utils.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -59,62 +59,31 @@ async function readJsonFile(filePath: string): Promise<Record<string, unknown>> 
   return JSON.parse(text) as Record<string, unknown>
 }
 
+async function readCharacterJsonFile(filePath: string): Promise<CharacterCard> {
+  const raw = await readJsonFile(filePath)
+  return parseCharacterJson(JSON.stringify(raw))
+}
+
 async function extractAndSaveWorldBook(rawJson: string, worldName: string): Promise<void> {
   const data = JSON.parse(rawJson)
   const charData = data.data || data
   const book = charData.character_book
   if (!book || !book.entries) return
 
-  const entries: Record<string, WorldBookEntry> = {}
+  const entries: Record<string, ReturnType<typeof normalizeWorldEntry>> = {}
   for (const [key, entry] of Object.entries(book.entries)) {
     const e = entry as Record<string, unknown>
     const uid = (e.uid as number) ?? Number(key) ?? Date.now()
-    entries[String(uid)] = {
-      uid,
-      key: (e.keys as string[]) ?? (e.key as string[]) ?? [],
-      keysecondary: (e.secondary_keys as string[]) ?? (e.keysecondary as string[]) ?? [],
-      comment: (e.comment as string) ?? (e.name as string) ?? '',
-      content: (e.content as string) ?? '',
-      constant: (e.constant as boolean) ?? false,
-      selective: (e.selective as boolean) ?? false,
-      insertion_order: (e.insertion_order as number) ?? 100,
-      enabled: (e.enabled as boolean) ?? true,
-      position: typeof e.position === 'number' ? e.position : (e.position === 'after_char' ? 1 : 0),
-      depth: (e.depth as number) ?? 4,
-      order: (e.order as number) ?? (e.insertion_order as number) ?? 100,
-      use_regexp: (e.use_regex as boolean) ?? (e.use_regexp as boolean) ?? false,
-      probability: (e.probability as number) ?? 100,
-      group: (e.group as string) ?? '',
-      group_override: (e.group_override as boolean) ?? false,
-      exclude_recursion: (e.exclude_recursion as boolean) ?? false,
-      prevent_recursion: (e.prevent_recursion as boolean) ?? false,
-      delay_until_recursion: (e.delay_until_recursion as boolean) ?? false,
-      scan_depth: (e.scan_depth as number) ?? 100,
-      match_whole_words: (e.match_whole_words as boolean) ?? false,
-      use_group_scoring: (e.use_group_scoring as boolean) ?? false,
-      case_sensitive: (e.case_sensitive as boolean) ?? false,
-      automation_id: (e.automation_id as string) ?? '',
-      role: (e.role as number) ?? 0,
-      sticky: (e.sticky as number) ?? 0,
-      cooldown: (e.cooldown as number) ?? 0,
-      delay: (e.delay as number) ?? 0,
-      display_index: (e.display_index as number) ?? uid,
-    }
+    entries[String(uid)] = normalizeWorldEntry({ ...e, uid })
   }
 
-  const world: WorldBook = {
+  const world = normalizeWorld({
+    ...book,
     name: worldName,
     description: (book.description as string) ?? '',
     entries,
     enabled: true,
-    global_selective: (book.global_selective as boolean) ?? false,
-    selective_default: (book.selective_default as boolean) ?? false,
-    recursive_scanning: (book.recursive_scanning as boolean) ?? false,
-    scan_depth: (book.scan_depth as number) ?? 100,
-    token_budget: (book.token_budget as number) ?? 500,
-    recursive_scanning_depth: (book.recursive_scanning_depth as number) ?? 2,
-    extensions: (book.extensions as Record<string, unknown>) ?? {},
-  }
+  }) as WorldBook
 
   await saveWorldBook(world)
 }
@@ -131,7 +100,7 @@ export async function listCharacters(): Promise<CharacterIndexEntry[]> {
         const jsonPath = getJsonPath(d.name)
         if (!existsSync(jsonPath)) return null
         try {
-          const card = await readJsonFile(jsonPath) as unknown as CharacterCard
+          const card = await readCharacterJsonFile(jsonPath)
           const stat = await fs.stat(jsonPath)
           const hasAvatar = existsSync(getAvatarPath(d.name)) || existsSync(getPngPath(d.name))
           return {
@@ -162,7 +131,7 @@ export async function getCharacter(name: string): Promise<CharacterDetail> {
     throw createError(ErrorCode.CHARACTER_NOT_FOUND, `角色 "${name}" 不存在`, { characterName: name })
   }
 
-  const card = await readJsonFile(jsonPath) as unknown as CharacterCard
+  const card = await readCharacterJsonFile(jsonPath)
   const stat = await fs.stat(jsonPath)
   const hasAvatar = existsSync(getAvatarPath(name)) || existsSync(getPngPath(name))
 
@@ -204,7 +173,7 @@ export async function createCharacter(data: Partial<CharacterCard>): Promise<Cha
   }
 
   const jsonPath = getJsonPath(safeName)
-  await fs.writeFile(jsonPath, JSON.stringify(card, null, 2), 'utf8')
+  await fs.writeFile(jsonPath, serializeCharacterJson(card), 'utf8')
 
   return getCharacter(safeName)
 }
@@ -215,7 +184,7 @@ export async function updateCharacter(name: string, data: Partial<CharacterCard>
   const { avatar, file_name, created_at, updated_at, ...card } = updated
 
   const jsonPath = getJsonPath(name)
-  await fs.writeFile(jsonPath, JSON.stringify(card, null, 2), 'utf8')
+  await fs.writeFile(jsonPath, serializeCharacterJson(card), 'utf8')
 
   return getCharacter(name)
 }
@@ -229,7 +198,7 @@ export async function importCharacterFromPng(filePath: string): Promise<Characte
   await fs.mkdir(charDir, { recursive: true })
 
   const jsonPath = getJsonPath(safeName)
-  await fs.writeFile(jsonPath, JSON.stringify(card, null, 2), 'utf8')
+  await fs.writeFile(jsonPath, serializeCharacterJson(card), 'utf8')
 
   const pngBuffer = await fs.readFile(filePath)
   const pngPath = getPngPath(safeName)
@@ -245,7 +214,7 @@ export async function importCharacterFromPng(filePath: string): Promise<Characte
     const charData = raw.data || raw
     if (charData.character_book?.entries && Object.keys(charData.character_book.entries).length > 0) {
       card.extensions = { ...card.extensions, world: worldName }
-      await fs.writeFile(jsonPath, JSON.stringify(card, null, 2), 'utf8')
+      await fs.writeFile(jsonPath, serializeCharacterJson(card), 'utf8')
     }
   }
 
@@ -275,7 +244,7 @@ export async function importCharacterJson(jsonStr: string, fileName: string): Pr
     }
   }
 
-  await fs.writeFile(jsonPath, JSON.stringify(card, null, 2), 'utf8')
+  await fs.writeFile(jsonPath, serializeCharacterJson(card), 'utf8')
   return getCharacter(safeName)
 }
 
@@ -287,7 +256,7 @@ export async function duplicateCharacter(name: string, newName: string): Promise
   const safeName = newName.replace(/[/\\?%*:|"<>]/g, '_')
   const jsonPath = getJsonPath(safeName)
   await fs.mkdir(path.dirname(jsonPath), { recursive: true })
-  await fs.writeFile(jsonPath, JSON.stringify(card, null, 2), 'utf8')
+  await fs.writeFile(jsonPath, serializeCharacterJson(card), 'utf8')
 
   const avPath = getAvatarPath(name)
   if (existsSync(avPath)) {
@@ -304,10 +273,10 @@ export async function cloneCharacter(name: string): Promise<CharacterDetail> {
   return duplicateCharacter(name, `${existing.name} (副本)`)
 }
 
-export async function exportCharacter(name: string): Promise<CharacterCard> {
+export async function exportCharacter(name: string): Promise<Record<string, unknown>> {
   const existing = await getCharacter(name)
   const { avatar, file_name, created_at, updated_at, ...card } = existing
-  return card as CharacterCard
+  return toStoredCharacterJson(card as CharacterCard)
 }
 
 export async function deleteCharacter(name: string): Promise<boolean> {

@@ -49,6 +49,29 @@ describe('matchWorldEntries', () => {
     expect(matchWorldEntries(entries, 'dragon')).toHaveLength(0)
   })
 
+  it('respects ST disable when enabled is not present', () => {
+    const disabled = {
+      '1': {
+        uid: 1,
+        key: ['dragon'],
+        content: 'Hidden.',
+        disable: true,
+      } as WorldBookEntry,
+    }
+
+    const enabled = {
+      '1': {
+        uid: 1,
+        key: ['dragon'],
+        content: 'Visible.',
+        disable: false,
+      } as WorldBookEntry,
+    }
+
+    expect(matchWorldEntries(disabled, 'dragon')).toHaveLength(0)
+    expect(matchWorldEntries(enabled, 'dragon')).toHaveLength(1)
+  })
+
   it('respects selective mode with secondary keys', () => {
     const entries = {
       '1': makeEntry({

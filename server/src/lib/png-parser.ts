@@ -96,18 +96,23 @@ export function writeCharacterCard(imagePath: string, jsonData: string, outputPa
   })
 
   const base64Data = Buffer.from(jsonData, 'utf8').toString('base64')
-  const charaText = Buffer.concat([Buffer.from('chara\0'), Buffer.from(base64Data, 'latin1')])
-  const charaChunk = createChunk('tEXt', charaText)
+  const cardSpec = getCharacterCardSpec(jsonData)
+  const textKeywords = cardSpec === 'chara_card_v3' ? ['chara', 'ccv3'] : ['chara']
+  const textChunks = textKeywords.map((keyword) => {
+    const text = Buffer.concat([Buffer.from(`${keyword}\0`), Buffer.from(base64Data, 'latin1')])
+    const chunk = createChunk('tEXt', text)
+    return {
+      length: chunk.length - 12,
+      type: 'tEXt',
+      data: text,
+      crc: chunk.readUInt32BE(chunk.length - 4),
+    }
+  })
 
   const iendIndex = filtered.findIndex(c => c.type === 'IEND')
   const insertIndex = iendIndex === -1 ? filtered.length : iendIndex
 
-  const newChunks = [...filtered.slice(0, insertIndex), {
-    length: charaChunk.length - 12,
-    type: 'tEXt',
-    data: charaText,
-    crc: charaChunk.readUInt32BE(charaChunk.length - 4),
-  }, ...filtered.slice(insertIndex)]
+  const newChunks = [...filtered.slice(0, insertIndex), ...textChunks, ...filtered.slice(insertIndex)]
 
   const output = Buffer.alloc(8 + newChunks.reduce((acc, c) => acc + 12 + c.length, 0))
   PNG_SIGNATURE.copy(output, 0)
@@ -125,41 +130,123 @@ export function writeCharacterCard(imagePath: string, jsonData: string, outputPa
 export function parseCharacterJson(raw: string): CharacterCard {
   const data = JSON.parse(raw)
   if (data.spec === 'chara_card_v2' || data.spec === 'chara_card_v3') {
-    return {
+    const hasNestedData = isRecord(data.data)
+    const cardData = hasNestedData ? data.data : data
+    const extensions = isRecord(cardData.extensions) ? cardData.extensions : {}
+    const card: CharacterCard = {
+      ...data,
       spec: data.spec,
       spec_version: data.spec_version,
-      name: data.data?.name ?? '',
-      description: data.data?.description ?? '',
-      personality: data.data?.personality ?? '',
-      scenario: data.data?.scenario ?? '',
-      first_mes: data.data?.first_mes ?? '',
-      mes_example: data.data?.mes_example ?? '',
-      creator_notes: data.data?.creator_notes ?? '',
-      system_prompt: data.data?.system_prompt ?? '',
-      post_history_instructions: data.data?.post_history_instructions ?? '',
-      alternate_greetings: data.data?.alternate_greetings ?? [],
-      tags: data.data?.tags ?? [],
-      creator: data.data?.creator ?? '',
-      character_version: data.data?.character_version ?? '',
-      extensions: data.data?.extensions ?? {},
+      name: asString(cardData.name),
+      description: asString(cardData.description),
+      personality: asString(cardData.personality),
+      scenario: asString(cardData.scenario),
+      first_mes: asString(cardData.first_mes),
+      mes_example: asString(cardData.mes_example),
+      creator_notes: asString(cardData.creator_notes),
+      system_prompt: asString(cardData.system_prompt),
+      post_history_instructions: asString(cardData.post_history_instructions),
+      alternate_greetings: asStringArray(cardData.alternate_greetings),
+      tags: asStringArray(cardData.tags),
+      creator: asString(cardData.creator),
+      character_version: asString(cardData.character_version),
+      extensions,
     }
+    if (hasNestedData) {
+      card.data = { ...cardData, extensions }
+    }
+    return card
   }
 
+  const extensions = isRecord(data.extensions) ? data.extensions : {}
   return {
+    ...data,
     spec: 'chara_card_v2',
     spec_version: '2.0',
-    name: data.name ?? '',
-    description: data.description ?? '',
-    personality: data.personality ?? '',
-    scenario: data.scenario ?? '',
-    first_mes: data.first_mes ?? '',
-    mes_example: data.mes_example ?? '',
-    creator_notes: data.creatorcomment ?? '',
-    tags: data.tags ?? [],
-    creator: data.creator ?? '',
-    character_version: data.character_version ?? '',
-    extensions: data.extensions ?? {},
+    name: asString(data.name),
+    description: asString(data.description),
+    personality: asString(data.personality),
+    scenario: asString(data.scenario),
+    first_mes: asString(data.first_mes),
+    mes_example: asString(data.mes_example),
+    creator_notes: asString(data.creatorcomment ?? data.creator_notes),
+    system_prompt: asString(data.system_prompt),
+    post_history_instructions: asString(data.post_history_instructions),
+    alternate_greetings: asStringArray(data.alternate_greetings),
+    tags: asStringArray(data.tags),
+    creator: asString(data.creator),
+    character_version: asString(data.character_version),
+    extensions,
   }
+}
+
+export function serializeCharacterJson(card: CharacterCard, space: number = 2): string {
+  return JSON.stringify(toStoredCharacterJson(card), null, space)
+}
+
+export function toStoredCharacterJson(card: CharacterCard): Record<string, unknown> {
+  if (isRecord(card.data) || card.spec === 'chara_card_v2' || card.spec === 'chara_card_v3') {
+    const stored: Record<string, unknown> = {}
+    for (const [key, value] of Object.entries(card)) {
+      if (!CHARACTER_DATA_KEYS.has(key) && value !== undefined) {
+        stored[key] = value
+      }
+    }
+
+    stored.spec = card.spec || 'chara_card_v2'
+    stored.spec_version = card.spec_version || '2.0'
+
+    const data = isRecord(card.data) ? { ...card.data } : {}
+    for (const key of CHARACTER_DATA_KEYS) {
+      const value = card[key]
+      if (value !== undefined) {
+        data[key] = value
+      }
+    }
+    data.extensions = card.extensions ?? {}
+    stored.data = data
+    return stored
+  }
+
+  return { ...card }
+}
+
+const CHARACTER_DATA_KEYS = new Set([
+  'name',
+  'description',
+  'personality',
+  'scenario',
+  'first_mes',
+  'mes_example',
+  'creator_notes',
+  'system_prompt',
+  'post_history_instructions',
+  'alternate_greetings',
+  'tags',
+  'creator',
+  'character_version',
+  'extensions',
+])
+
+function getCharacterCardSpec(jsonData: string): string | undefined {
+  try {
+    const parsed = JSON.parse(jsonData) as { spec?: unknown }
+    return typeof parsed.spec === 'string' ? parsed.spec : undefined
+  } catch {
+    return undefined
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value)
+}
+
+function asString(value: unknown): string {
+  return typeof value === 'string' ? value : ''
+}
+
+function asStringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : []
 }
 
 export interface CharacterCard {
@@ -179,4 +266,6 @@ export interface CharacterCard {
   creator: string
   character_version: string
   extensions: Record<string, unknown>
+  data?: Record<string, unknown>
+  [key: string]: unknown
 }

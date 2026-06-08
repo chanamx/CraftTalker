@@ -7,21 +7,27 @@ export interface ChatMessage {
   name: string
   is_user: boolean
   is_system: boolean
-  send_date: number
+  send_date: string | number
   mes: string
   extra: Record<string, unknown>
   swipe_id?: number
   swipes?: string[]
-  swipe_info?: Array<{ send_date: number; gen_started?: number; gen_finished?: number }>
+  swipe_info?: Array<{ send_date: string | number; gen_started?: number; gen_finished?: number; [key: string]: unknown }>
+  [key: string]: unknown
 }
 
 export interface ChatMetadata {
   chat_metadata: Record<string, unknown>
   user_name: string
   character_name: string
+  [key: string]: unknown
 }
 
 export type ChatLine = ChatMetadata | ChatMessage
+
+function isChatMessage(line: ChatLine): line is ChatMessage {
+  return 'mes' in line
+}
 
 export async function readChatFile(filePath: string): Promise<ChatLine[]> {
   if (!existsSync(filePath)) return []
@@ -102,7 +108,7 @@ export async function getChatInfo(filePath: string): Promise<{
           file_name: displayName,
           chat_items: itemCounter - 1,
           mes: jsonData.mes || '[空消息]',
-          last_mes: jsonData.send_date || stats.mtimeMs,
+          last_mes: parseChatTimestamp(jsonData.send_date, stats.mtimeMs),
         })
       } catch (err) {
         console.error('Failed to parse last chat line:', err)
@@ -132,6 +138,19 @@ export function createChatMetadata(characterName: string, userName: string = '�
     user_name: userName,
     character_name: characterName,
   }
+}
+
+export function createStTimestamp(): string {
+  return new Date().toISOString()
+}
+
+export function parseChatTimestamp(value: unknown, fallback: number = Date.now()): number {
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  if (typeof value === 'string') {
+    const parsed = Date.parse(value)
+    if (Number.isFinite(parsed)) return parsed
+  }
+  return fallback
 }
 
 export async function updateChatMetadataLine(filePath: string, updates: Partial<ChatMetadata>): Promise<boolean> {
@@ -173,7 +192,7 @@ export async function deleteLastAssistantLine(filePath: string): Promise<ChatMes
   const lines = await readChatFile(filePath)
   for (let i = lines.length - 1; i > 0; i--) {
     const line = lines[i]
-    if ('mes' in line && !line.is_user && !line.is_system) {
+    if (isChatMessage(line) && !line.is_user && !line.is_system) {
       lines.splice(i, 1)
       await writeChatFile(filePath, lines)
       return line
@@ -193,7 +212,7 @@ export function createMessage(
     name,
     is_user: isUser,
     is_system: isSystem,
-    send_date: Date.now(),
+    send_date: createStTimestamp(),
     mes: content,
     extra,
   }

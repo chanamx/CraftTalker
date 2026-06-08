@@ -10,6 +10,7 @@ import {
   listChatFiles,
   createChatMetadata,
   createMessage,
+  createStTimestamp,
   deleteLineAt,
   updateLineAt,
   deleteLastAssistantLine,
@@ -124,7 +125,7 @@ export async function deleteMessage(characterName: string, chatId: string, lineI
 
 export async function editMessage(characterName: string, chatId: string, lineIndex: number, content: string): Promise<ChatLine | null> {
   const filePath = getChatPath(characterName, chatId)
-  return updateLineAt(filePath, lineIndex, { mes: content, send_date: Date.now() })
+  return updateLineAt(filePath, lineIndex, { mes: content, send_date: createStTimestamp() })
 }
 
 export async function regenerateLast(characterName: string, chatId: string): Promise<boolean> {
@@ -159,11 +160,12 @@ export async function addSwipe(characterName: string, chatId: string, lineIndex:
     line.swipe_id = 0
   }
 
+  const sendDate = createStTimestamp()
   line.swipes.push(content)
-  line.swipe_info!.push({ send_date: Date.now() })
+  line.swipe_info!.push({ send_date: sendDate })
   line.swipe_id = line.swipes.length - 1
   line.mes = content
-  line.send_date = Date.now()
+  line.send_date = sendDate
 
   await writeChatFile(filePath, lines)
   return line
@@ -178,7 +180,7 @@ export async function switchSwipe(characterName: string, chatId: string, lineInd
 
   line.swipe_id = swipeId
   line.mes = line.swipes[swipeId]
-  line.send_date = line.swipe_info?.[swipeId]?.send_date ?? Date.now()
+  line.send_date = line.swipe_info?.[swipeId]?.send_date ?? createStTimestamp()
 
   await writeChatFile(filePath, lines)
   return line
