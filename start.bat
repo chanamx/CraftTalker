@@ -1,15 +1,15 @@
 @echo off
 chcp 65001 >nul 2>&1
 setlocal enabledelayedexpansion
-title Luker UI - Launcher
+title CraftTalker - Launcher
 
 set "ROOT=%~dp0"
 set "SERVER=%ROOT%server"
-set "NODE_MIN=18"
+set "NODE_REQUIRED=20.19+ or 22.12+"
 
 echo.
 echo ================================================
-echo          Luker UI - One-Click Launcher
+echo          CraftTalker - One-Click Launcher
 echo.
 echo   Frontend : http://localhost:5173
 echo   Backend  : http://localhost:3000
@@ -37,7 +37,7 @@ if %errorlevel% neq 0 (
         )
     )
     if !FOUND! equ 0 (
-        echo        [ERROR] Node.js not found. Install 18+
+        echo        [ERROR] Node.js not found. Install Node.js !NODE_REQUIRED!.
         echo        https://nodejs.org
         pause
         exit /b 1
@@ -45,9 +45,19 @@ if %errorlevel% neq 0 (
 )
 
 for /f "tokens=1 delims=v" %%V in ('node -v 2^>nul') do set "NODE_VER=%%V"
-for /f "tokens=1 delims=." %%M in ("!NODE_VER!") do set "NODE_MAJ=%%M"
-if !NODE_MAJ! lss %NODE_MIN% (
-    echo        [ERROR] Node.js too old ^(%NODE_MIN%+, got !NODE_VER!^)
+set "NODE_MAJ=0"
+set "NODE_MINOR=0"
+for /f "tokens=1,2 delims=." %%M in ("!NODE_VER!") do (
+    set "NODE_MAJ=%%M"
+    set "NODE_MINOR=%%N"
+)
+set "NODE_OK=0"
+if !NODE_MAJ! gtr 22 set "NODE_OK=1"
+if !NODE_MAJ! equ 22 if !NODE_MINOR! geq 12 set "NODE_OK=1"
+if !NODE_MAJ! equ 20 if !NODE_MINOR! geq 19 set "NODE_OK=1"
+if !NODE_OK! neq 1 (
+    echo        [ERROR] Node.js too old ^(requires !NODE_REQUIRED!, got !NODE_VER!^)
+    echo        Please install the current LTS from https://nodejs.org
     pause
     exit /b 1
 )
@@ -66,9 +76,30 @@ echo.
 :: ===== Step 2: Frontend deps =====
 echo [2/5] Checking frontend dependencies...
 cd /d "%ROOT%"
-if not exist "node_modules" (
-    echo        First run - installing frontend deps...
-    call npm install --prefer-offline --no-audit --no-fund
+set "FRONTEND_DEPS_OK=1"
+if not exist "node_modules" set "FRONTEND_DEPS_OK=0"
+if !FRONTEND_DEPS_OK! equ 1 (
+    for %%D in (
+        "node_modules\@tailwindcss\vite"
+        "node_modules\@vitejs\plugin-react"
+        "node_modules\i18next"
+        "node_modules\i18next-browser-languagedetector"
+        "node_modules\katex"
+        "node_modules\react-i18next"
+        "node_modules\react-router"
+        "node_modules\shiki"
+        "node_modules\vite"
+        "node_modules\zustand"
+    ) do (
+        if not exist "%%~D" (
+            echo        Missing %%~D
+            set "FRONTEND_DEPS_OK=0"
+        )
+    )
+)
+if !FRONTEND_DEPS_OK! equ 0 (
+    echo        Installing or repairing frontend deps...
+    call npm install --include=dev --prefer-offline --no-audit --no-fund
     if !errorlevel! neq 0 (
         echo        [ERROR] Frontend install failed.
         pause
@@ -83,9 +114,25 @@ echo.
 :: ===== Step 3: Backend deps =====
 echo [3/5] Checking backend dependencies...
 cd /d "%SERVER%"
-if not exist "node_modules" (
-    echo        First run - installing backend deps...
-    call npm install --prefer-offline --no-audit --no-fund
+set "BACKEND_DEPS_OK=1"
+if not exist "node_modules" set "BACKEND_DEPS_OK=0"
+if !BACKEND_DEPS_OK! equ 1 (
+    for %%D in (
+        "node_modules\@hono\node-server"
+        "node_modules\@hono\zod-validator"
+        "node_modules\.bin\tsx.cmd"
+        "node_modules\hono"
+        "node_modules\zod"
+    ) do (
+        if not exist "%%~D" (
+            echo        Missing %%~D
+            set "BACKEND_DEPS_OK=0"
+        )
+    )
+)
+if !BACKEND_DEPS_OK! equ 0 (
+    echo        Installing or repairing backend deps...
+    call npm install --include=dev --prefer-offline --no-audit --no-fund
     if !errorlevel! neq 0 (
         echo        [ERROR] Backend install failed.
         pause
@@ -131,7 +178,7 @@ for /f "tokens=5" %%P in ('netstat -aon 2^>nul ^| findstr ":5173 .*LISTENING"') 
 :: Start backend in a new minimized window
 cd /d "%SERVER%"
 echo        Starting backend...
-start "Luker Backend" /min cmd /c "npx tsx src/index.ts & pause"
+start "CraftTalker Backend" /min cmd /c "npx tsx src/index.ts & pause"
 
 :: Wait for backend to listen on port 3000
 set "BACKEND_READY=0"
@@ -156,7 +203,7 @@ echo.
 :: Start frontend (blocking - this is the main process)
 cd /d "%ROOT%"
 echo ================================================
-echo   Luker UI - Frontend Dev Server (:5173)
+echo   CraftTalker - Frontend Dev Server (:5173)
 echo ================================================
 echo.
 echo   Open http://localhost:5173 in your browser.
@@ -172,5 +219,5 @@ for /f "tokens=5" %%P in ('netstat -aon 2^>nul ^| findstr ":3000 .*LISTENING"') 
     taskkill /pid %%P /f >nul 2>&1
 )
 echo.
-echo Luker UI stopped.
+echo CraftTalker stopped.
 pause

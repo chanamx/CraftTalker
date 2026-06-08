@@ -87,7 +87,7 @@
     "done": "完成",
     "cancel": "取消",
     "dropHint": "拖放角色卡文件到此处",
-    "supportedFormats": "支持 PNG / JSON / WebP 格式",
+    "supportedFormats": "支持 PNG / JSON 格式",
     "importing": "导入中...",
     "import": "导入角色"
   },

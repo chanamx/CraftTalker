@@ -2,13 +2,13 @@ import { Hono } from 'hono'
 import { zValidator } from '@hono/zod-validator'
 import { z } from 'zod'
 import * as presetService from '../services/preset.service.js'
-import type { PresetType } from '../services/preset.service.js'
+import { isPresetType } from '../services/preset.service.js'
 
 const presetsRoute = new Hono()
 
 presetsRoute.get('/:type', async (c) => {
-  const type = c.req.param('type') as PresetType
-  if (!['kobold', 'openai', 'textgen', 'novel'].includes(type)) {
+  const type = c.req.param('type')
+  if (!isPresetType(type)) {
     return c.json({ error: 'Invalid preset type' }, 400)
   }
   const presets = await presetService.listPresets(type)
@@ -16,9 +16,9 @@ presetsRoute.get('/:type', async (c) => {
 })
 
 presetsRoute.get('/:type/:name', async (c) => {
-  const type = c.req.param('type') as PresetType
+  const type = c.req.param('type')
   const name = decodeURIComponent(c.req.param('name'))
-  if (!['kobold', 'openai', 'textgen', 'novel'].includes(type)) {
+  if (!isPresetType(type)) {
     return c.json({ error: 'Invalid preset type' }, 400)
   }
   const preset = await presetService.getPreset(type, name)
@@ -61,8 +61,8 @@ const presetSchema = z.object({
 })
 
 presetsRoute.post('/:type', zValidator('json', presetSchema), async (c) => {
-  const type = c.req.param('type') as PresetType
-  if (!['kobold', 'openai', 'textgen', 'novel'].includes(type)) {
+  const type = c.req.param('type')
+  if (!isPresetType(type)) {
     return c.json({ error: 'Invalid preset type' }, 400)
   }
   const data = c.req.valid('json')
@@ -74,9 +74,9 @@ presetsRoute.post('/:type', zValidator('json', presetSchema), async (c) => {
 })
 
 presetsRoute.delete('/:type/:name', async (c) => {
-  const type = c.req.param('type') as PresetType
+  const type = c.req.param('type')
   const name = decodeURIComponent(c.req.param('name'))
-  if (!['kobold', 'openai', 'textgen', 'novel'].includes(type)) {
+  if (!isPresetType(type)) {
     return c.json({ error: 'Invalid preset type' }, 400)
   }
   await presetService.deletePreset(type, name)

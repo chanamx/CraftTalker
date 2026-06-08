@@ -1,10 +1,10 @@
-import { useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
-import { X, Globe, Key, Cpu, Zap, Check, Loader2, Code } from 'lucide-react'
+import { X, Globe, Key, Cpu, Zap, Check, Loader2, Code, Braces, Route } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { api } from '@/lib/api'
 import { useSettingsStore } from '@/stores/settings-store'
-import type { LLMConfig } from '@/types'
+import type { ChatCompletionSource, CustomAPIFormat, LLMConfig } from '@/types'
 
 export type { LLMConfig }
 
@@ -23,22 +23,140 @@ const API_TYPES: { value: LLMConfig['type']; label: string }[] = [
   { value: 'custom', label: '自定义' },
 ]
 
+interface ProviderOption {
+  value: ChatCompletionSource
+  label: string
+  endpoint: string
+  type: LLMConfig['type']
+  format: CustomAPIFormat
+  model: string
+  description: string
+}
+
+const PROVIDERS: ProviderOption[] = [
+  { value: 'lmstudio', label: 'LM Studio', endpoint: 'http://localhost:1234/v1', type: 'openai', format: 'openai_chat', model: 'local-model', description: '本地 OpenAI-compatible 服务' },
+  { value: 'ollama', label: 'Ollama', endpoint: 'http://localhost:11434/v1', type: 'openai', format: 'openai_chat', model: 'llama3.1', description: '本地 Ollama OpenAI-compatible API' },
+  { value: 'openai', label: 'OpenAI', endpoint: 'https://api.openai.com/v1', type: 'openai', format: 'openai_chat', model: 'gpt-4o-mini', description: '官方 OpenAI Chat Completions' },
+  { value: 'openrouter', label: 'OpenRouter', endpoint: 'https://openrouter.ai/api/v1', type: 'openai', format: 'openai_chat', model: 'openai/gpt-4o-mini', description: '多模型路由与中转' },
+  { value: 'anthropic', label: 'Claude / Anthropic', endpoint: 'https://api.anthropic.com/v1', type: 'openai', format: 'anthropic_messages', model: 'claude-3-5-haiku-latest', description: 'Claude Messages API' },
+  { value: 'google', label: 'Gemini', endpoint: 'https://generativelanguage.googleapis.com/v1beta', type: 'openai', format: 'gemini_generate_content', model: 'gemini-2.0-flash', description: 'Google Gemini generateContent API' },
+  { value: 'groq', label: 'Groq', endpoint: 'https://api.groq.com/openai/v1', type: 'openai', format: 'openai_chat', model: 'llama-3.1-8b-instant', description: '高速 OpenAI-compatible 托管' },
+  { value: 'deepseek', label: 'DeepSeek', endpoint: 'https://api.deepseek.com/v1', type: 'openai', format: 'openai_chat', model: 'deepseek-chat', description: 'DeepSeek OpenAI-compatible API' },
+  { value: 'moonshot', label: 'Moonshot / Kimi', endpoint: 'https://api.moonshot.cn/v1', type: 'openai', format: 'openai_chat', model: 'moonshot-v1-8k', description: 'Kimi OpenAI-compatible API' },
+  { value: 'siliconflow', label: 'SiliconFlow', endpoint: 'https://api.siliconflow.cn/v1', type: 'openai', format: 'openai_chat', model: 'deepseek-ai/DeepSeek-V3', description: '国内模型聚合与托管' },
+  { value: 'togetherai', label: 'Together AI', endpoint: 'https://api.together.xyz/v1', type: 'openai', format: 'openai_chat', model: 'meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo', description: '开源模型托管' },
+  { value: 'fireworks', label: 'Fireworks AI', endpoint: 'https://api.fireworks.ai/inference/v1', type: 'openai', format: 'openai_chat', model: 'accounts/fireworks/models/llama-v3p1-8b-instruct', description: 'OpenAI-compatible 模型服务' },
+  { value: 'perplexity', label: 'Perplexity', endpoint: 'https://api.perplexity.ai', type: 'openai', format: 'openai_chat', model: 'sonar', description: 'Perplexity OpenAI-compatible API' },
+  { value: 'xai', label: 'xAI', endpoint: 'https://api.x.ai/v1', type: 'openai', format: 'openai_chat', model: 'grok-2-latest', description: 'xAI OpenAI-compatible API' },
+  { value: 'vllm', label: 'vLLM', endpoint: 'http://localhost:8000/v1', type: 'openai', format: 'openai_chat', model: 'local-model', description: '本地/服务器 vLLM OpenAI-compatible API' },
+  { value: 'llamacpp', label: 'llama.cpp', endpoint: 'http://localhost:8080/v1', type: 'openai', format: 'openai_chat', model: 'local-model', description: 'llama.cpp server OpenAI-compatible API' },
+  { value: 'custom_openai_chat', label: '自定义 OpenAI Chat', endpoint: 'https://example.com/v1', type: 'custom', format: 'openai_chat', model: 'model-name', description: '官方/小众厂商/中转站通用入口' },
+  { value: 'custom_claude', label: '自定义 Claude', endpoint: 'https://example.com/v1', type: 'custom', format: 'anthropic_messages', model: 'claude-compatible-model', description: 'Claude Messages 格式兼容入口' },
+  { value: 'custom_gemini', label: '自定义 Gemini', endpoint: 'https://example.com/v1beta', type: 'custom', format: 'gemini_generate_content', model: 'gemini-compatible-model', description: 'Gemini generateContent 格式兼容入口' },
+]
+
+const PROVIDER_BY_SOURCE = new Map(PROVIDERS.map(provider => [provider.value, provider]))
+
+const API_FORMATS: { value: CustomAPIFormat; label: string }[] = [
+  { value: 'openai_chat', label: 'OpenAI Chat Completions' },
+  { value: 'openai_completion', label: 'OpenAI Legacy Completions' },
+  { value: 'anthropic_messages', label: 'Claude Messages' },
+  { value: 'gemini_generate_content', label: 'Gemini generateContent' },
+  { value: 'openai_responses', label: 'OpenAI Responses（实验）' },
+]
+
+function headersToText(headers: Record<string, string> | undefined): string {
+  if (!headers) return ''
+  return Object.entries(headers).map(([key, value]) => `${key}: ${value}`).join('\n')
+}
+
+function textToHeaders(text: string): Record<string, string> | undefined {
+  const headers: Record<string, string> = {}
+  for (const line of text.split('\n')) {
+    const trimmed = line.trim()
+    if (!trimmed) continue
+    const index = trimmed.indexOf(':')
+    if (index <= 0) continue
+    const key = trimmed.slice(0, index).trim()
+    const value = trimmed.slice(index + 1).trim()
+    if (key && value) headers[key] = value
+  }
+  return Object.keys(headers).length > 0 ? headers : undefined
+}
+
 export function SettingsDialog({ open, onClose, config, onSave }: SettingsDialogProps) {
   const [local, setLocal] = useState(config)
+  const [headersText, setHeadersText] = useState(headersToText(config.customHeaders))
   const [testing, setTesting] = useState(false)
+  const [saving, setSaving] = useState(false)
   const [testResult, setTestResult] = useState<'success' | 'fail' | null>(null)
   const [tab, setTab] = useState<'llm' | 'ui'>('llm')
+  const developerMode = useSettingsStore((s) => s.developerMode)
+  const activeProvider = useMemo(() => PROVIDER_BY_SOURCE.get(local.source ?? 'lmstudio'), [local.source])
 
-  const handleSave = () => {
-    onSave(local)
-    onClose()
+  useEffect(() => {
+    if (!open) return
+    setLocal(config)
+    setHeadersText(headersToText(config.customHeaders))
+  }, [config, open])
+
+  const withParsedHeaders = (configToSave: LLMConfig): LLMConfig => ({
+    ...configToSave,
+    customHeaders: textToHeaders(headersText),
+  })
+
+  const prepareConfigForSave = async (configToSave: LLMConfig): Promise<LLMConfig> => {
+    const normalized = withParsedHeaders(configToSave)
+    const apiKey = normalized.apiKey.trim()
+    if (!apiKey) return normalized
+
+    const session = await api.llmSessions.create({
+      apiKey,
+      label: `${normalized.source ?? normalized.type}:${normalized.model}`,
+    })
+    return {
+      ...normalized,
+      apiKey: '',
+      apiKeySessionId: session.sessionId,
+    }
+  }
+
+  const handleProviderChange = (source: ChatCompletionSource) => {
+    const provider = PROVIDER_BY_SOURCE.get(source)
+    if (!provider) {
+      setLocal(s => ({ ...s, source }))
+      return
+    }
+
+    setLocal(s => ({
+      ...s,
+      source,
+      apiUrl: s.apiUrl === activeProvider?.endpoint || !s.apiUrl.trim() ? provider.endpoint : s.apiUrl,
+      type: provider.type,
+      customApiFormat: provider.format,
+      model: s.model === activeProvider?.model || !s.model.trim() ? provider.model : s.model,
+    }))
+  }
+
+  const handleSave = async () => {
+    setSaving(true)
+    try {
+      const safeConfig = await prepareConfigForSave(local)
+      onSave(safeConfig)
+      setLocal(safeConfig)
+      onClose()
+    } finally {
+      setSaving(false)
+    }
   }
 
   const handleTest = async () => {
     setTesting(true)
     setTestResult(null)
     try {
-      const res = await api.testConnection(local)
+      const safeConfig = await prepareConfigForSave(local)
+      const res = await api.testConnection(safeConfig)
+      setLocal(safeConfig)
       setTestResult(res.success ? 'success' : 'fail')
     } catch {
       setTestResult('fail')
@@ -124,6 +242,21 @@ export function SettingsDialog({ open, onClose, config, onSave }: SettingsDialog
                       </select>
                     </Field>
 
+                    <Field label="服务商 / 接口源" icon={<Route size={15} />}>
+                      <select
+                        value={local.source ?? 'lmstudio'}
+                        onChange={e => handleProviderChange(e.target.value as ChatCompletionSource)}
+                        className="w-full h-9 px-3 rounded-lg bg-[var(--color-bg-surface)] border border-[var(--color-border-subtle)] text-sm text-[var(--color-text-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)]/20 focus:border-[var(--color-accent)]/30"
+                      >
+                        {PROVIDERS.map(provider => (
+                          <option key={provider.value} value={provider.value}>{provider.label}</option>
+                        ))}
+                      </select>
+                      {activeProvider && (
+                        <p className="mt-1 text-[11px] text-[var(--color-text-muted)]">{activeProvider.description}</p>
+                      )}
+                    </Field>
+
                     <Field label="API 地址" icon={<Globe size={15} />}>
                       <input
                         type="text"
@@ -139,9 +272,14 @@ export function SettingsDialog({ open, onClose, config, onSave }: SettingsDialog
                         type="password"
                         value={local.apiKey}
                         onChange={e => setLocal(s => ({ ...s, apiKey: e.target.value }))}
-                        placeholder="留空则无需密钥"
+                        placeholder={local.apiKeySessionId ? '已托管到服务端会话，输入新密钥可替换' : '留空则无需密钥'}
                         className="w-full h-9 px-3 rounded-lg bg-[var(--color-bg-surface)] border border-[var(--color-border-subtle)] text-sm text-[var(--color-text-primary)] placeholder:text-[var(--color-text-muted)] focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)]/20 focus:border-[var(--color-accent)]/30"
                       />
+                      {local.apiKeySessionId && !local.apiKey && (
+                        <p className="mt-1 text-[11px] text-[var(--color-text-muted)]">
+                          密钥已托管到本次服务端会话；服务端重启后需要重新保存密钥。
+                        </p>
+                      )}
                     </Field>
 
                     <Field label="模型名称" icon={<Cpu size={15} />}>
@@ -154,12 +292,51 @@ export function SettingsDialog({ open, onClose, config, onSave }: SettingsDialog
                       />
                     </Field>
 
+                    {developerMode && (
+                      <>
+                        <Field label="接口格式" icon={<Braces size={15} />}>
+                          <select
+                            value={local.customApiFormat ?? activeProvider?.format ?? 'openai_chat'}
+                            onChange={e => setLocal(s => ({ ...s, customApiFormat: e.target.value as CustomAPIFormat }))}
+                            className="w-full h-9 px-3 rounded-lg bg-[var(--color-bg-surface)] border border-[var(--color-border-subtle)] text-sm text-[var(--color-text-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)]/20 focus:border-[var(--color-accent)]/30"
+                          >
+                            {API_FORMATS.map(format => (
+                              <option key={format.value} value={format.value}>{format.label}</option>
+                            ))}
+                          </select>
+                        </Field>
+
+                        <Field label="反向代理地址" icon={<Route size={15} />}>
+                          <input
+                            type="text"
+                            value={local.reverseProxyUrl ?? ''}
+                            onChange={e => setLocal(s => ({
+                              ...s,
+                              reverseProxyUrl: e.target.value,
+                              useReverseProxy: e.target.value.trim().length > 0,
+                            }))}
+                            placeholder="https://proxy.example.com/v1"
+                            className="w-full h-9 px-3 rounded-lg bg-[var(--color-bg-surface)] border border-[var(--color-border-subtle)] text-sm text-[var(--color-text-primary)] placeholder:text-[var(--color-text-muted)] focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)]/20 focus:border-[var(--color-accent)]/30"
+                          />
+                        </Field>
+
+                        <Field label="自定义请求头" icon={<Braces size={15} />}>
+                          <textarea
+                            value={headersText}
+                            onChange={e => setHeadersText(e.target.value)}
+                            placeholder={'Header-Name: value\nX-Provider-App: CraftTalker'}
+                            className="w-full min-h-20 px-3 py-2 rounded-lg bg-[var(--color-bg-surface)] border border-[var(--color-border-subtle)] text-sm text-[var(--color-text-primary)] placeholder:text-[var(--color-text-muted)] focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)]/20 focus:border-[var(--color-accent)]/30 resize-y"
+                          />
+                        </Field>
+                      </>
+                    )}
+
                     <div className="flex items-center gap-2 pt-2">
                       <motion.button
                         whileHover={{ scale: 1.02 }}
                         whileTap={{ scale: 0.98 }}
                         onClick={handleTest}
-                        disabled={testing}
+                        disabled={testing || saving}
                         className={cn(
                           'flex items-center gap-2 h-9 px-4 rounded-lg border text-sm font-medium transition-all',
                           'border-[var(--color-border-subtle)] text-[var(--color-text-secondary)] hover:border-[var(--color-border-default)]',
@@ -217,9 +394,10 @@ export function SettingsDialog({ open, onClose, config, onSave }: SettingsDialog
                   whileHover={{ scale: 1.02 }}
                   whileTap={{ scale: 0.98 }}
                   onClick={handleSave}
-                  className="h-9 px-5 rounded-lg text-sm font-medium bg-[var(--color-accent)] text-white hover:bg-[var(--color-accent-hover)] transition-all"
+                  disabled={saving}
+                  className="h-9 px-5 rounded-lg text-sm font-medium bg-[var(--color-accent)] text-white hover:bg-[var(--color-accent-hover)] transition-all disabled:opacity-60"
                 >
-                  保存设置
+                  {saving ? '保存中...' : '保存设置'}
                 </motion.button>
               </div>
             </div>

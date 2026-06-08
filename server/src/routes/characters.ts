@@ -4,9 +4,39 @@ import { z } from 'zod'
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import os from 'node:os'
+import { randomUUID } from 'node:crypto'
 import * as characterService from '../services/character.service.js'
+import { createError, ErrorCode } from '../lib/errors.js'
+import { safePath, validatePathInBase } from '../lib/path-utils.js'
 
 const charactersRoute = new Hono()
+
+function getImportDir(): string {
+  return path.resolve(process.env.LUKER_IMPORT_DIR ?? path.join(os.tmpdir(), 'luker-import'))
+}
+
+function resolveImportPath(filePath: string): string {
+  const IMPORT_DIR = getImportDir()
+  const candidate = path.isAbsolute(filePath) ? filePath : path.join(IMPORT_DIR, filePath)
+  return validatePathInBase(candidate, IMPORT_DIR)
+}
+
+function getSupportedExtension(fileName: string): '.png' | '.json' {
+  const ext = path.extname(fileName).toLowerCase()
+  if (ext !== '.png' && ext !== '.json') {
+    throw createError(ErrorCode.VALIDATION_ERROR, 'Unsupported character import file type', { fileName })
+  }
+  return ext
+}
+
+async function importCharacterFile(filePath: string, fileName = path.basename(filePath)) {
+  const ext = getSupportedExtension(fileName)
+  if (ext === '.json') {
+    const json = await fs.readFile(filePath, 'utf8')
+    return characterService.importCharacterJson(json, fileName)
+  }
+  return characterService.importCharacterFromPng(filePath)
+}
 
 charactersRoute.get('/', async (c) => {
   const characters = await characterService.listCharacters()
@@ -47,7 +77,8 @@ const importSchema = z.object({
 
 charactersRoute.post('/import', zValidator('json', importSchema), async (c) => {
   const { filePath } = c.req.valid('json')
-  const character = await characterService.importCharacterFromPng(filePath)
+  const importPath = resolveImportPath(filePath)
+  const character = await importCharacterFile(importPath)
   return c.json(character, 201)
 })
 
@@ -58,19 +89,25 @@ const uploadSchema = z.object({
 
 charactersRoute.post('/upload', zValidator('json', uploadSchema), async (c) => {
   const { fileName, data } = c.req.valid('json')
-  const tmpDir = path.join(os.tmpdir(), 'luker-import')
+  const ext = getSupportedExtension(fileName)
+  const tmpDir = getImportDir()
   await fs.mkdir(tmpDir, { recursive: true })
-  const tmpPath = path.join(tmpDir, fileName)
+  const tmpPath = safePath(tmpDir, `${randomUUID()}-${fileName}`)
   const buffer = Buffer.from(data, 'base64')
-  await fs.writeFile(tmpPath, buffer)
 
   try {
+    if (ext === '.json') {
+      const character = await characterService.importCharacterJson(buffer.toString('utf8'), fileName)
+      return c.json(character, 201)
+    }
+
+    await fs.writeFile(tmpPath, buffer)
     const character = await characterService.importCharacterFromPng(tmpPath)
-    await fs.unlink(tmpPath)
     return c.json(character, 201)
   } catch (err) {
-    try { await fs.unlink(tmpPath) } catch {}
     return c.json({ error: String(err) }, 400)
+  } finally {
+    try { await fs.unlink(tmpPath) } catch {}
   }
 })
 

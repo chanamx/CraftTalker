@@ -1,12 +1,12 @@
-import { useRef, useEffect } from 'react'
+import { useRef, useEffect, useState } from 'react'
 import { motion } from 'framer-motion'
-import { ArrowRight } from 'lucide-react'
+import { ArrowRight, RotateCcw, X } from 'lucide-react'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { MessageBubble } from './MessageBubble'
 import { ChatInput } from './ChatInput'
 import type { ChatAreaProps, ChatMessage } from '@/types'
 
-export function ChatArea({ character, messages, isStreaming, onSend, onStop, onDeleteMessage, onEditMessage, onRegenerate, onSwipe, onContinue }: ChatAreaProps) {
+export function ChatArea({ character, messages, isStreaming, onSend, onStop, onDeleteMessage, onEditMessage, onRegenerate, onSwipe, onContinue, recoverableRun, onCommitRun, onDiscardRun }: ChatAreaProps) {
   const scrollRef = useRef<HTMLDivElement>(null)
   const prevLenRef = useRef(messages.length)
   const isAtBottomRef = useRef(true)
@@ -76,11 +76,7 @@ export function ChatArea({ character, messages, isStreaming, onSend, onStop, onD
             transition={{ duration: 0.4, ease: [0.25, 0.46, 0.45, 0.94] }}
             className="flex flex-col items-center justify-center h-full text-center"
           >
-            <div className="w-16 h-16 rounded-2xl bg-[var(--color-accent-muted)] flex items-center justify-center mb-4">
-              <span className="text-2xl font-bold text-[var(--color-accent)]">
-                {character.name[0]}
-              </span>
-            </div>
+            <EmptyCharacterAvatar name={character.name} avatar={character.avatar} />
             <h2 className="text-lg font-semibold text-[var(--color-text-primary)] mb-1">
               {character.name}
             </h2>
@@ -158,6 +154,38 @@ export function ChatArea({ character, messages, isStreaming, onSend, onStop, onD
       </div>
 
       <div className="flex-shrink-0">
+        {recoverableRun && !isStreaming && onCommitRun && onDiscardRun && (
+          <div className="px-2 sm:px-4 pb-2">
+            <div className="mx-auto max-w-3xl rounded-lg border border-[var(--color-border-default)] bg-[var(--color-bg-elevated)] px-3 py-2 shadow-sm">
+              <div className="flex items-center gap-3">
+                <div className="min-w-0 flex-1">
+                  <div className="text-xs font-medium text-[var(--color-text-primary)]">发现未保存回复</div>
+                  <div className="mt-0.5 truncate text-[11px] text-[var(--color-text-secondary)]">
+                    {recoverableRun.partialContent}
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => onCommitRun(recoverableRun.runId)}
+                  className="inline-flex h-8 items-center gap-1.5 rounded-md bg-[var(--color-accent)] px-2.5 text-xs font-medium text-white transition-colors hover:opacity-90"
+                  title="恢复到聊天"
+                  aria-label="恢复到聊天"
+                >
+                  <RotateCcw size={13} /> 恢复
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onDiscardRun(recoverableRun.runId)}
+                  className="inline-flex h-8 w-8 items-center justify-center rounded-md text-[var(--color-text-secondary)] transition-colors hover:bg-[var(--color-bg-surface)] hover:text-[var(--color-text-primary)]"
+                  title="忽略"
+                  aria-label="忽略未保存回复"
+                >
+                  <X size={14} />
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
         {onContinue && !isStreaming && messages.length > 0 && messages[messages.length - 1].role === 'assistant' && (
           <div className="flex justify-center pb-1">
             <motion.button
@@ -172,6 +200,32 @@ export function ChatArea({ character, messages, isStreaming, onSend, onStop, onD
         )}
         <ChatInput onSend={onSend} onStop={onStop} disabled={isStreaming} isStreaming={isStreaming} />
       </div>
+    </div>
+  )
+}
+
+function EmptyCharacterAvatar({ name, avatar }: { name: string; avatar: string | null }) {
+  const [imageFailed, setImageFailed] = useState(false)
+  const initial = name[0] ?? '?'
+
+  if (avatar && !imageFailed) {
+    return (
+      <div className="w-16 h-16 rounded-2xl overflow-hidden bg-[var(--color-accent-muted)] ring-1 ring-[var(--color-border-subtle)] shadow-sm mb-4">
+        <img
+          src={avatar}
+          alt={name}
+          className="w-full h-full object-cover"
+          onError={() => setImageFailed(true)}
+        />
+      </div>
+    )
+  }
+
+  return (
+    <div className="w-16 h-16 rounded-2xl bg-[var(--color-accent-muted)] flex items-center justify-center mb-4">
+      <span className="text-2xl font-bold text-[var(--color-accent)]">
+        {initial}
+      </span>
     </div>
   )
 }

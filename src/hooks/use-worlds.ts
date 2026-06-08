@@ -90,8 +90,9 @@ export function useBindWorld() {
   return useMutation({
     mutationFn: ({ worldName, characterName }: { worldName: string; characterName: string }) =>
       api.worlds.bind(worldName, characterName),
-    onSuccess: () => {
+    onSuccess: (_, { worldName }) => {
       qc.invalidateQueries({ queryKey: ['worlds'] })
+      qc.invalidateQueries({ queryKey: ['worlds', worldName] })
       qc.invalidateQueries({ queryKey: ['characters'] })
     },
   })
@@ -102,8 +103,9 @@ export function useUnbindWorld() {
   return useMutation({
     mutationFn: ({ worldName, characterName }: { worldName: string; characterName: string }) =>
       api.worlds.unbind(worldName, characterName),
-    onSuccess: () => {
+    onSuccess: (_, { worldName }) => {
       qc.invalidateQueries({ queryKey: ['worlds'] })
+      qc.invalidateQueries({ queryKey: ['worlds', worldName] })
       qc.invalidateQueries({ queryKey: ['characters'] })
     },
   })

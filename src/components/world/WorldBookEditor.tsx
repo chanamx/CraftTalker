@@ -10,7 +10,7 @@ import { useWorlds, useWorld, useCreateWorld, useUpdateWorld, useDeleteWorld,
   useBindWorld, useUnbindWorld } from '@/hooks/use-worlds'
 import { useCharacters } from '@/hooks/use-characters'
 import { useSettingsStore } from '@/stores/settings-store'
-import type { WorldBookEntry } from '@/lib/api'
+import type { WorldBookEntry, WorldIndex } from '@/lib/api'
 
 const POSITION_LABELS: Record<number, string> = {
   0: '角色定义前',
@@ -106,6 +106,10 @@ export function WorldBookEditor({ open, onClose, initialWorld }: WorldBookEditor
   }
 
   const entries = world ? Object.values(world.entries).sort((a, b) => a.order - b.order) : []
+  const selectedInfo = worldList?.find(w => w.name === selectedWorld)
+  const unboundCharacters = (characters ?? []).filter(ch => !selectedInfo?.bound_to.includes(ch.file_name))
+  const worldEnabled = selectedInfo?.enabled ?? world?.enabled ?? true
+  const worldGlobalEnabled = selectedInfo?.global_enabled ?? world?.global_enabled ?? false
 
   return (
     <AnimatePresence>
@@ -155,70 +159,27 @@ export function WorldBookEditor({ open, onClose, initialWorld }: WorldBookEditor
                     </h3>
                   </div>
                   <div className="flex-1 overflow-y-auto p-2 space-y-1">
-                    {(() => {
-                      const bound = (worldList ?? []).filter(w => w.bound_to.length > 0)
-                      const global = (worldList ?? []).filter(w => w.bound_to.length === 0)
-                      return (
-                        <>
-                          {bound.length > 0 && (
-                            <div className="mb-2">
-                              <div className="flex items-center gap-1.5 px-2 py-1 text-[10px] font-semibold text-[var(--color-text-muted)] uppercase tracking-wider">
-                                <User size={10} /> 角色绑定
-                              </div>
-                              {bound.map(w => (
-                                <WorldListItem
-                                  key={w.name}
-                                  name={w.name}
-                                  entryCount={w.entry_count}
-                                  subtitle={w.bound_to.join(', ')}
-                                  selected={selectedWorld === w.name}
-                                  enabled={w.enabled}
-                                  onSelect={() => setSelectedWorld(w.name)}
-                                  onToggleEnabled={() => updateWorld.mutate({ name: w.name, data: { enabled: !w.enabled } })}
-                                  onDelete={() => {
-                                    if (confirm(`确定要删除世界书 "${w.name}" 吗？`)) {
-                                      deleteWorld.mutate(w.name, {
-                                        onSuccess: () => { if (selectedWorld === w.name) setSelectedWorld(null) },
-                                      })
-                                    }
-                                  }}
-                                />
-                              ))}
-                            </div>
-                          )}
-                          {global.length > 0 && (
-                            <div>
-                              <div className="flex items-center gap-1.5 px-2 py-1 text-[10px] font-semibold text-[var(--color-text-muted)] uppercase tracking-wider">
-                                <Globe size={10} /> 通用
-                              </div>
-                              {global.map(w => (
-                                <WorldListItem
-                                  key={w.name}
-                                  name={w.name}
-                                  entryCount={w.entry_count}
-                                  selected={selectedWorld === w.name}
-                                  enabled={w.enabled}
-                                  onSelect={() => setSelectedWorld(w.name)}
-                                  onToggleEnabled={() => updateWorld.mutate({ name: w.name, data: { enabled: !w.enabled } })}
-                                  onDelete={() => {
-                                    if (confirm(`确定要删除世界书 "${w.name}" 吗？`)) {
-                                      deleteWorld.mutate(w.name, {
-                                        onSuccess: () => { if (selectedWorld === w.name) setSelectedWorld(null) },
-                                      })
-                                    }
-                                  }}
-                                />
-                              ))}
-                            </div>
-                          )}
-                          {(worldList ?? []).length === 0 && (
-                            <div className="text-center text-xs text-[var(--color-text-muted)] py-4">
-                              暂无世界书
-                            </div>
-                          )}
-                        </>
-                      )
-                    })()}
+                    {(worldList ?? []).map(w => (
+                      <WorldListItem
+                        key={w.name}
+                        world={w}
+                        selected={selectedWorld === w.name}
+                        onSelect={() => setSelectedWorld(w.name)}
+                        onToggleEnabled={() => updateWorld.mutate({ name: w.name, data: { enabled: !w.enabled } })}
+                        onDelete={() => {
+                          if (confirm(`确定要删除世界书 "${w.name}" 吗？`)) {
+                            deleteWorld.mutate(w.name, {
+                              onSuccess: () => { if (selectedWorld === w.name) setSelectedWorld(null) },
+                            })
+                          }
+                        }}
+                      />
+                    ))}
+                    {(worldList ?? []).length === 0 && (
+                      <div className="text-center text-xs text-[var(--color-text-muted)] py-4">
+                        暂无世界书
+                      </div>
+                    )}
                   </div>
 
                   <div className="p-2 border-t border-[var(--color-border-subtle)]">
@@ -265,49 +226,72 @@ export function WorldBookEditor({ open, onClose, initialWorld }: WorldBookEditor
                     </div>
                   ) : (
                     <>
-                      <div className="flex items-center justify-between px-4 py-2 border-b border-[var(--color-border-subtle)] flex-shrink-0">
-                        <div className="flex items-center gap-2">
-                          <span className="text-sm font-medium text-[var(--color-text-primary)]">
-                            {selectedWorld}
-                          </span>
-                          {(() => {
-                            const selectedInfo = worldList?.find(w => w.name === selectedWorld)
-                            const isBound = selectedInfo && selectedInfo.bound_to.length > 0
+                      <div className="px-4 py-3 border-b border-[var(--color-border-subtle)] flex-shrink-0 space-y-3">
+                        <div className="flex items-center justify-between gap-3">
+                          <div className="min-w-0">
+                            <div className="flex items-center gap-2">
+                              <span className="text-sm font-medium text-[var(--color-text-primary)] truncate">
+                                {selectedWorld}
+                              </span>
+                              {selectedInfo && <ScopeBadges world={selectedInfo} />}
+                            </div>
+                          </div>
+                          <div className="flex items-center gap-1 flex-shrink-0">
+                            <ScopeToggle
+                              icon={<Power size={12} />}
+                              label={worldEnabled ? '关闭' : '启用'}
+                              active={worldEnabled}
+                              onClick={() => selectedWorld && selectedInfo && updateWorld.mutate({
+                                name: selectedWorld,
+                                data: { enabled: !selectedInfo.enabled },
+                              })}
+                              title={worldEnabled ? '关闭整本世界书' : '启用整本世界书'}
+                            />
+                            <ScopeToggle
+                              icon={<Globe size={12} />}
+                              label="全局"
+                              active={worldGlobalEnabled}
+                              onClick={() => selectedWorld && selectedInfo && updateWorld.mutate({
+                                name: selectedWorld,
+                                data: {
+                                  global_enabled: !selectedInfo.global_enabled,
+                                  enabled: !selectedInfo.global_enabled || selectedInfo.bound_to.length > 0,
+                                },
+                              })}
+                              title={worldGlobalEnabled ? '取消全局生效' : '设为全局生效'}
+                            />
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <select
+                            value=""
+                            onChange={e => {
+                              if (e.target.value && selectedWorld) {
+                                bindWorld.mutate({ worldName: selectedWorld, characterName: e.target.value })
+                              }
+                            }}
+                            className="h-7 px-2 rounded-md text-[11px] bg-[var(--color-bg-surface)] border border-[var(--color-border-subtle)] text-[var(--color-text-secondary)]"
+                          >
+                            <option value="">绑定到角色...</option>
+                            {unboundCharacters.map(ch => (
+                              <option key={ch.file_name} value={ch.file_name}>{ch.name}</option>
+                            ))}
+                          </select>
+                          {selectedInfo?.bound_to.map(charName => {
+                            const character = characters?.find(ch => ch.file_name === charName)
                             return (
-                              <div className="flex items-center gap-1">
-                                {isBound ? (
-                                  <button
-                                    onClick={() => {
-                                      if (confirm(`解除 "${selectedWorld}" 与 ${selectedInfo.bound_to.join(', ')} 的绑定？`)) {
-                                        selectedInfo.bound_to.forEach(charName =>
-                                          unbindWorld.mutate({ worldName: selectedWorld!, characterName: charName })
-                                        )
-                                      }
-                                    }}
-                                    className="flex items-center gap-1 h-6 px-2 rounded-md text-[10px] font-medium bg-[var(--color-accent-muted)] text-[var(--color-accent)] hover:bg-[var(--color-accent)]/20"
-                                    title="点击解绑"
-                                  >
-                                    <Unlink size={10} /> {selectedInfo.bound_to.join(', ')}
-                                  </button>
-                                ) : (
-                                  <select
-                                    value=""
-                                    onChange={e => {
-                                      if (e.target.value && selectedWorld) {
-                                        bindWorld.mutate({ worldName: selectedWorld, characterName: e.target.value })
-                                      }
-                                    }}
-                                    className="h-6 px-1.5 rounded-md text-[10px] bg-[var(--color-bg-surface)] border border-[var(--color-border-subtle)] text-[var(--color-text-muted)]"
-                                  >
-                                    <option value="">绑定到角色...</option>
-                                    {(characters ?? []).map(ch => (
-                                      <option key={ch.file_name} value={ch.file_name}>{ch.name}</option>
-                                    ))}
-                                  </select>
-                                )}
-                              </div>
+                              <button
+                                key={charName}
+                                onClick={() => selectedWorld && unbindWorld.mutate({ worldName: selectedWorld, characterName: charName })}
+                                className="inline-flex items-center gap-1 h-7 px-2 rounded-md text-[11px] bg-[var(--color-accent-muted)] text-[var(--color-accent)] hover:bg-[var(--color-accent)]/20"
+                                title="解除角色绑定"
+                              >
+                                <User size={11} />
+                                <span className="max-w-28 truncate">{character?.name ?? charName}</span>
+                                <Unlink size={10} />
+                              </button>
                             )
-                          })()}
+                          })}
                         </div>
                         <div className="flex items-center gap-1">
                           <motion.button
@@ -652,16 +636,78 @@ function MiniField({ label, children }: { label: string; children: React.ReactNo
   )
 }
 
-function WorldListItem({ name, entryCount, subtitle, selected, enabled, onSelect, onDelete, onToggleEnabled }: {
-  name: string
-  entryCount: number
-  subtitle?: string
+function ScopeBadges({ world }: { world: WorldIndex }) {
+  if (!world.enabled) {
+    return (
+      <span className="inline-flex items-center gap-1 h-5 px-1.5 rounded-md text-[10px] bg-[var(--color-bg-surface)] text-[var(--color-text-muted)] border border-[var(--color-border-subtle)]">
+        <EyeOff size={10} /> 已关闭
+      </span>
+    )
+  }
+
+  const activeScopes = [
+    world.global_enabled && { key: 'global', label: '全局', icon: <Globe size={10} /> },
+    world.bound_to.length > 0 && { key: 'bound', label: `${world.bound_to.length} 角色`, icon: <User size={10} /> },
+  ].filter(Boolean) as Array<{ key: string; label: string; icon: React.ReactNode }>
+
+  if (activeScopes.length === 0) {
+    return (
+      <span className="inline-flex items-center gap-1 h-5 px-1.5 rounded-md text-[10px] bg-[var(--color-bg-surface)] text-[var(--color-text-muted)] border border-[var(--color-border-subtle)]">
+        <Eye size={10} /> 未生效
+      </span>
+    )
+  }
+
+  return (
+    <span className="inline-flex items-center gap-1">
+      {activeScopes.map(scope => (
+        <span
+          key={scope.key}
+          className="inline-flex items-center gap-1 h-5 px-1.5 rounded-md text-[10px] bg-[var(--color-accent-muted)] text-[var(--color-accent)]"
+        >
+          {scope.icon}
+          {scope.label}
+        </span>
+      ))}
+    </span>
+  )
+}
+
+function ScopeToggle({ icon, label, active, disabled, title, onClick }: {
+  icon: React.ReactNode
+  label: string
+  active: boolean
+  disabled?: boolean
+  title: string
+  onClick: () => void
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      title={title}
+      className={cn(
+        'inline-flex items-center gap-1 h-7 px-2 rounded-lg text-[11px] font-medium border transition-colors disabled:cursor-not-allowed disabled:opacity-45',
+        active
+          ? 'border-[var(--color-accent)]/30 bg-[var(--color-accent-muted)] text-[var(--color-accent)]'
+          : 'border-[var(--color-border-subtle)] text-[var(--color-text-muted)] hover:text-[var(--color-text-secondary)] hover:bg-[var(--color-bg-surface)]'
+      )}
+    >
+      {icon}
+      {label}
+    </button>
+  )
+}
+
+function WorldListItem({ world, selected, onSelect, onDelete, onToggleEnabled }: {
+  world: WorldIndex
   selected: boolean
-  enabled: boolean
   onSelect: () => void
   onDelete: () => void
   onToggleEnabled: () => void
 }) {
+  const enabled = world.enabled
   return (
     <div className="group relative">
       <motion.button
@@ -678,10 +724,13 @@ function WorldListItem({ name, entryCount, subtitle, selected, enabled, onSelect
       >
         <BookOpen size={13} className="flex-shrink-0" />
         <div className="flex-1 min-w-0 text-left">
-          <p className="font-medium truncate">{name}</p>
-          <p className="text-[10px] opacity-60">
-            {entryCount} 条目{subtitle && ` · ${subtitle}`}
-          </p>
+          <div className="flex items-center gap-1.5 min-w-0">
+            <p className="font-medium truncate">{world.name}</p>
+          </div>
+          <div className="mt-0.5 flex items-center gap-1.5 min-w-0">
+            <span className="text-[10px] opacity-60 flex-shrink-0">{world.entry_count} 条目</span>
+            <ScopeBadges world={world} />
+          </div>
         </div>
       </motion.button>
       <div className="absolute right-1 top-1/2 -translate-y-1/2 flex gap-0.5 opacity-0 group-hover:opacity-100 transition-all">
@@ -695,7 +744,7 @@ function WorldListItem({ name, entryCount, subtitle, selected, enabled, onSelect
               ? 'text-[var(--color-success)] hover:bg-[var(--color-success)]/10'
               : 'text-[var(--color-text-muted)] hover:bg-[var(--color-bg-surface)]'
           )}
-          title={enabled ? '禁用世界书' : '启用世界书'}
+          title={enabled ? '关闭整本世界书' : '启用整本世界书'}
         >
           <Power size={11} />
         </motion.button>

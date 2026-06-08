@@ -2,8 +2,9 @@ import { useState, useEffect } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { Sparkles, Key, MessageCircle } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { api } from '@/lib/api'
 import { useSettingsStore } from '@/stores/settings-store'
-import type { LLMConfig, Character } from '@/types'
+import type { ChatCompletionSource, CustomAPIFormat, LLMConfig, Character } from '@/types'
 
 interface OnboardingWizardProps {
   characters: Character[]
@@ -53,19 +54,55 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
 
 const inputCls = 'w-full px-3 py-2 rounded-lg text-sm bg-[var(--color-bg-surface)] border border-[var(--color-border-subtle)] text-[var(--color-text-primary)] focus:outline-none focus:border-[var(--color-accent)]/50'
 
+const QUICK_PROVIDERS: Array<{
+  value: ChatCompletionSource
+  label: string
+  endpoint: string
+  format: CustomAPIFormat
+  model: string
+}> = [
+  { value: 'lmstudio', label: 'LM Studio', endpoint: 'http://localhost:1234/v1', format: 'openai_chat', model: 'local-model' },
+  { value: 'ollama', label: 'Ollama', endpoint: 'http://localhost:11434/v1', format: 'openai_chat', model: 'llama3.1' },
+  { value: 'openai', label: 'OpenAI', endpoint: 'https://api.openai.com/v1', format: 'openai_chat', model: 'gpt-4o-mini' },
+  { value: 'openrouter', label: 'OpenRouter', endpoint: 'https://openrouter.ai/api/v1', format: 'openai_chat', model: 'openai/gpt-4o-mini' },
+  { value: 'anthropic', label: 'Claude', endpoint: 'https://api.anthropic.com/v1', format: 'anthropic_messages', model: 'claude-3-5-haiku-latest' },
+  { value: 'google', label: 'Gemini', endpoint: 'https://generativelanguage.googleapis.com/v1beta', format: 'gemini_generate_content', model: 'gemini-2.0-flash' },
+  { value: 'custom_openai_chat', label: '自定义', endpoint: 'https://example.com/v1', format: 'openai_chat', model: 'model-name' },
+]
+
 export function OnboardingWizard({ characters, onSelectCharacter, onComplete }: OnboardingWizardProps) {
   const [step, setStep] = useState(0)
   const [selectedChar, setSelectedChar] = useState<Character | null>(null)
+  const [finishing, setFinishing] = useState(false)
   const llmConfig = useSettingsStore((s) => s.llmConfig)
   const setLlmConfig = useSettingsStore((s) => s.setLlmConfig)
   const [localConfig, setLocalConfig] = useState<LLMConfig>(llmConfig)
 
   useEffect(() => { setLocalConfig(llmConfig) }, [llmConfig])
 
-  const handleFinish = () => {
-    setLlmConfig(localConfig)
-    if (selectedChar) onSelectCharacter(selectedChar)
-    onComplete()
+  const handleFinish = async () => {
+    setFinishing(true)
+    try {
+      let safeConfig = localConfig
+      const apiKey = localConfig.apiKey.trim()
+      if (apiKey) {
+        const session = await api.llmSessions.create({
+          apiKey,
+          label: `${localConfig.source ?? localConfig.type}:${localConfig.model}`,
+        })
+        safeConfig = {
+          ...localConfig,
+          apiKey: '',
+          apiKeySessionId: session.sessionId,
+        }
+      }
+
+      setLlmConfig(safeConfig)
+      if (selectedChar) onSelectCharacter(selectedChar)
+      onComplete()
+    } finally {
+      setFinishing(false)
+    }
   }
 
   const canNext = step === 0 ? !!selectedChar || characters.length === 0 : true
@@ -104,10 +141,36 @@ export function OnboardingWizard({ characters, onSelectCharacter, onComplete }: 
         <StepContent key="s1" icon={<Key size={20} />} title="配置 API" subtitle="设置 LLM 服务连接">
           <div className="space-y-3">
             <Field label="API 地址">
+              <select
+                value={localConfig.source ?? 'lmstudio'}
+                onChange={(e) => {
+                  const provider = QUICK_PROVIDERS.find(p => p.value === e.target.value)
+                  if (!provider) return
+                  setLocalConfig({
+                    ...localConfig,
+                    source: provider.value,
+                    apiUrl: provider.endpoint,
+                    model: provider.model,
+                    type: provider.value === 'custom_openai_chat' ? 'custom' : 'openai',
+                    customApiFormat: provider.format,
+                  })
+                }}
+                className={cn(inputCls, 'mb-2')}
+              >
+                {QUICK_PROVIDERS.map(provider => (
+                  <option key={provider.value} value={provider.value}>{provider.label}</option>
+                ))}
+              </select>
               <input value={localConfig.apiUrl} onChange={(e) => setLocalConfig({ ...localConfig, apiUrl: e.target.value })} placeholder="http://localhost:1234/v1" className={inputCls} />
             </Field>
             <Field label="API Key（可选）">
-              <input type="password" value={localConfig.apiKey} onChange={(e) => setLocalConfig({ ...localConfig, apiKey: e.target.value })} placeholder="sk-..." className={inputCls} />
+              <input
+                type="password"
+                value={localConfig.apiKey}
+                onChange={(e) => setLocalConfig({ ...localConfig, apiKey: e.target.value })}
+                placeholder={localConfig.apiKeySessionId ? '已托管到服务端会话' : 'sk-...'}
+                className={inputCls}
+              />
             </Field>
             <Field label="模型名称">
               <input value={localConfig.model} onChange={(e) => setLocalConfig({ ...localConfig, model: e.target.value })} placeholder="gpt-4o / local-model" className={inputCls} />
@@ -167,9 +230,10 @@ export function OnboardingWizard({ characters, onSelectCharacter, onComplete }: 
           ) : (
             <button
               onClick={handleFinish}
-              className="px-5 py-2 rounded-lg text-sm font-medium bg-[var(--color-accent)] text-white hover:bg-[var(--color-accent-hover)] transition-all"
+              disabled={finishing}
+              className="px-5 py-2 rounded-lg text-sm font-medium bg-[var(--color-accent)] text-white hover:bg-[var(--color-accent-hover)] transition-all disabled:opacity-60"
             >
-              开始对话
+              {finishing ? '保存中...' : '开始对话'}
             </button>
           )}
         </div>

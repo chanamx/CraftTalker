@@ -3,7 +3,8 @@ import { useQueryClient } from '@tanstack/react-query'
 import { useChatStore, streamKey } from '@/stores/chat-store'
 import { useSettingsStore } from '@/stores/settings-store'
 import { useSendMessage, useGenerateStream } from '@/hooks/use-chats'
-import { api, consumeSSEStream, type ChatDetail } from '@/lib/api'
+import { useCommitRun, useDiscardRun, useRecoverableRuns } from '@/hooks/use-runs'
+import { ApiRequestError, api, consumeSSEStream, type ChatDetail } from '@/lib/api'
 import { useToast } from '@/lib/toast'
 import type { ChatMessage } from '@/types'
 
@@ -23,6 +24,9 @@ export function useChatActions(messages: ChatMessage[]) {
   const queryClient = useQueryClient()
   const sendMessage = useSendMessage()
   const generateStream = useGenerateStream()
+  const recoverableRuns = useRecoverableRuns(activeCharacter?.file_name ?? null, activeChatId)
+  const commitRun = useCommitRun()
+  const discardRun = useDiscardRun()
 
   const currentKey = activeCharacter && activeChatId
     ? streamKey(activeCharacter.file_name, activeChatId)
@@ -68,7 +72,7 @@ export function useChatActions(messages: ChatMessage[]) {
         return
       }
       console.error('[Stream Error]', err)
-      toast.error('AI 响应失败，请检查 LLM 配置')
+      toast.error(err instanceof ApiRequestError ? err.apiError.error : 'AI 响应失败，请检查 LLM 配置')
     }
 
     const accumulated = chunks.join('')
@@ -80,7 +84,7 @@ export function useChatActions(messages: ChatMessage[]) {
           const lastIdx = lines.length - 1
           if (lastIdx > 0) {
             const last = lines[lastIdx] as Record<string, unknown>
-            lines[lastIdx] = { ...last, mes: (last.mes as string ?? '') + accumulated }
+            lines[lastIdx] = { ...last, mes: (last.mes as string ?? '') + accumulated, send_date: new Date().toISOString() }
           }
           return { ...old, lines }
         }
@@ -90,7 +94,7 @@ export function useChatActions(messages: ChatMessage[]) {
             name: charDisplayName,
             is_user: false,
             is_system: false,
-            send_date: Date.now(),
+            send_date: new Date().toISOString(),
             mes: accumulated,
             extra: {},
           }],
@@ -198,10 +202,32 @@ export function useChatActions(messages: ChatMessage[]) {
     const chatId = activeChatId
 
     await runStream(charName, charDisplayName, chatId, (signal) =>
-      api.chats.continue(charName, chatId, llmConfig, undefined, undefined, signal),
+      api.chats.continue(charName, chatId, llmConfig, undefined, undefined, signal, genConfig),
       'continue',
     )
-  }, [activeCharacter, activeChatId, streams, llmConfig, runStream])
+  }, [activeCharacter, activeChatId, streams, llmConfig, genConfig, runStream])
+
+  const latestRecoverableRun = recoverableRuns.data?.[0] ?? null
+
+  const handleCommitRun = useCallback(async (runId: string) => {
+    if (!activeCharacter || !activeChatId) return
+    try {
+      await commitRun.mutateAsync(runId)
+      await queryClient.invalidateQueries({ queryKey: ['chats', activeCharacter.file_name, activeChatId] })
+      toast.success('已恢复中断回复')
+    } catch {
+      toast.error('恢复回复失败')
+    }
+  }, [activeCharacter, activeChatId, commitRun, queryClient, toast])
+
+  const handleDiscardRun = useCallback(async (runId: string) => {
+    try {
+      await discardRun.mutateAsync(runId)
+      toast.success('已忽略中断回复')
+    } catch {
+      toast.error('忽略回复失败')
+    }
+  }, [discardRun, toast])
 
   const streamMode = currentStream?.mode ?? 'append'
 
@@ -235,5 +261,8 @@ export function useChatActions(messages: ChatMessage[]) {
     handleRegenerate,
     handleSwipe,
     handleContinue,
+    recoverableRun: latestRecoverableRun,
+    handleCommitRun,
+    handleDiscardRun,
   }
 }

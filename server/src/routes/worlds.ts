@@ -31,6 +31,7 @@ worldsRoute.post('/', zValidator('json', createSchema), async (c) => {
 const updateSchema = z.object({
   description: z.string().optional(),
   enabled: z.boolean().optional(),
+  global_enabled: z.boolean().optional(),
   global_selective: z.boolean().optional(),
   selective_default: z.boolean().optional(),
   recursive_scanning: z.boolean().optional(),
@@ -42,7 +43,12 @@ const updateSchema = z.object({
 worldsRoute.patch('/:name', zValidator('json', updateSchema), async (c) => {
   const name = decodeURIComponent(c.req.param('name'))
   const updates = c.req.valid('json')
-  const updated = await worldService.updateWorld(name, updates)
+  const normalizedUpdates = {
+    ...updates,
+    ...(updates.global_enabled === true ? { enabled: true } : {}),
+  }
+  await worldService.updateWorld(name, normalizedUpdates)
+  const updated = await syncWorldActivationForScopes(name)
   return c.json(updated)
 })
 
@@ -113,9 +119,34 @@ const bindSchema = z.object({
 worldsRoute.post('/:name/bind', zValidator('json', bindSchema), async (c) => {
   const worldName = decodeURIComponent(c.req.param('name'))
   const { characterName } = c.req.valid('json')
-  await worldService.getWorld(worldName)
+  const world = await worldService.getWorld(worldName)
+  let worldUpdates: Partial<worldService.WorldBook> = {}
+  if (typeof world.global_enabled !== 'boolean') {
+    const currentListItem = (await worldService.listWorlds()).find(item => item.name === worldName)
+    if (currentListItem?.global_enabled) {
+      worldUpdates = { ...worldUpdates, global_enabled: true }
+    }
+  }
   const char = await getCharacter(characterName)
-  const extensions = { ...char.extensions, world: worldName }
+  const existingWorlds = worldService.getWorldNamesFromExtensions(char.extensions)
+  const nextWorlds = existingWorlds.includes(worldName) ? existingWorlds : [...existingWorlds, worldName]
+  if (nextWorlds.length !== existingWorlds.length && !world.enabled) {
+    worldUpdates = { ...worldUpdates, enabled: true }
+  }
+  if (Object.keys(worldUpdates).length > 0) {
+    await worldService.updateWorld(worldName, worldUpdates)
+  }
+  const extensions: Record<string, unknown> = { ...char.extensions }
+  if (nextWorlds.length > 0) {
+    extensions.world = nextWorlds[0]
+  } else {
+    delete extensions.world
+  }
+  if (nextWorlds.length > 1) {
+    extensions.worlds = nextWorlds
+  } else {
+    delete extensions.worlds
+  }
   await updateCharacter(characterName, { extensions })
   return c.json({ success: true })
 })
@@ -124,11 +155,32 @@ worldsRoute.post('/:name/unbind', zValidator('json', bindSchema), async (c) => {
   const worldName = decodeURIComponent(c.req.param('name'))
   const { characterName } = c.req.valid('json')
   const char = await getCharacter(characterName)
-  if (char.extensions?.world === worldName) {
-    const { world: _, ...rest } = char.extensions as Record<string, unknown>
-    await updateCharacter(characterName, { extensions: rest })
+  const nextWorlds = worldService.getWorldNamesFromExtensions(char.extensions)
+    .filter(name => name !== worldName)
+  const extensions: Record<string, unknown> = { ...char.extensions }
+  if (nextWorlds.length > 0) {
+    extensions.world = nextWorlds[0]
+  } else {
+    delete extensions.world
   }
+  if (nextWorlds.length > 1) {
+    extensions.worlds = nextWorlds
+  } else {
+    delete extensions.worlds
+  }
+  await updateCharacter(characterName, { extensions })
+  await syncWorldActivationForScopes(worldName)
   return c.json({ success: true })
 })
+
+async function syncWorldActivationForScopes(worldName: string): Promise<worldService.WorldBook> {
+  const current = await worldService.getWorld(worldName)
+  const listItem = (await worldService.listWorlds()).find(item => item.name === worldName)
+  const hasActiveScope = Boolean(listItem?.global_enabled) || Boolean(listItem?.bound_to.length)
+  if (!hasActiveScope && current.enabled) {
+    return worldService.updateWorld(worldName, { enabled: false })
+  }
+  return current
+}
 
 export { worldsRoute }

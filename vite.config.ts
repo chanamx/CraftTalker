@@ -29,6 +29,11 @@ export default defineConfig({
     target: 'esnext',
     minify: 'esbuild',
     cssMinify: 'lightningcss',
+    rolldownOptions: {
+      input: {
+        main: 'index.html',
+      },
+    },
     rollupOptions: {
       output: {
         manualChunks(id) {

@@ -8,6 +8,86 @@ import katex from 'katex'
 
 let highlighterPromise: ReturnType<typeof createHighlighter> | null = null
 
+const markdownSanitizeConfig = {
+  ALLOWED_TAGS: [
+    'p', 'br', 'strong', 'em', 'u', 'del', 's', 'code', 'pre',
+    'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+    'ul', 'ol', 'li',
+    'blockquote',
+    'a',
+    'table', 'thead', 'tbody', 'tr', 'th', 'td',
+    'hr',
+    'div', 'span',
+    'button',
+  ],
+  ALLOWED_ATTR: [
+    'class', 'href', 'target', 'rel', 'title',
+    'data-lang',
+  ],
+  ALLOWED_URI_REGEXP: /^(?:https?|mailto):/i,
+  ALLOW_ARIA_ATTR: false,
+  ALLOW_DATA_ATTR: false,
+  FORBID_TAGS: [
+    'script', 'style', 'iframe', 'object', 'embed', 'svg', 'math',
+    'form', 'input', 'textarea', 'select', 'option',
+    'meta', 'link', 'base',
+  ],
+  FORBID_ATTR: ['style'],
+}
+
+const renderedSanitizeConfig = {
+  ...markdownSanitizeConfig,
+  ALLOWED_TAGS: [
+    ...markdownSanitizeConfig.ALLOWED_TAGS,
+    'annotation', 'math', 'mfrac', 'mi', 'mn', 'mo', 'msup', 'mtext',
+    'semantics',
+  ],
+  ALLOWED_ATTR: [
+    ...markdownSanitizeConfig.ALLOWED_ATTR,
+    'aria-hidden', 'encoding', 'style', 'xmlns',
+  ],
+  FORBID_TAGS: [
+    'script', 'iframe', 'object', 'embed', 'svg',
+    'form', 'input', 'textarea', 'select', 'option',
+    'meta', 'link', 'base',
+  ],
+  FORBID_ATTR: [],
+}
+
+const shikiSanitizeConfig = {
+  ALLOWED_TAGS: ['span'],
+  ALLOWED_ATTR: ['class', 'style'],
+  ALLOW_ARIA_ATTR: false,
+  ALLOW_DATA_ATTR: false,
+  FORBID_TAGS: [
+    'script', 'style', 'iframe', 'object', 'embed', 'svg', 'math',
+    'form', 'input', 'textarea', 'select', 'option',
+    'meta', 'link', 'base',
+  ],
+}
+
+function escapeHtml(value: string): string {
+  return value.replace(/[&<>"']/g, (char) => {
+    switch (char) {
+      case '&': return '&amp;'
+      case '<': return '&lt;'
+      case '>': return '&gt;'
+      case '"': return '&quot;'
+      case "'": return '&#39;'
+      default: return char
+    }
+  })
+}
+
+function normalizeCodeLanguage(lang: string | undefined): string {
+  const normalized = (lang || 'text').trim().toLowerCase()
+  return /^[\w#+.-]{1,32}$/.test(normalized) ? normalized : 'text'
+}
+
+function isSafeLink(href: string | null | undefined): href is string {
+  return /^(?:https?|mailto):/i.test((href || '').trim())
+}
+
 function getHighlighter() {
   if (!highlighterPromise) {
     highlighterPromise = createHighlighter({
@@ -36,6 +116,21 @@ function getHighlighter() {
 
 const LATEX_INLINE = /\$([^$\n]+?)\$/g
 
+type InlineRendererContext = {
+  parser: {
+    parse(tokens: Tokens.Generic[]): string
+    parseInline(tokens: Tokens.Generic[]): string
+  }
+}
+
+function renderInline(ctx: InlineRendererContext, tokens?: Tokens.Generic[], fallback = ''): string {
+  return tokens ? ctx.parser.parseInline(tokens) : fallback
+}
+
+function renderBlocks(ctx: InlineRendererContext, tokens?: Tokens.Generic[], fallback = ''): string {
+  return tokens ? ctx.parser.parse(tokens) : fallback
+}
+
 function renderLatex(html: string): string {
   return html
     .replace(/<p>\$\$([\s\S]*?)\$\$<\/p>/g, (_m, formula) => {
@@ -57,84 +152,91 @@ function renderLatex(html: string): string {
 const renderer = new marked.Renderer()
 
 renderer.code = function ({ text, lang }: Tokens.Code) {
+  const safeLang = normalizeCodeLanguage(lang)
   const langLabel = lang
-    ? `<span class="text-[10px] uppercase tracking-wider opacity-50">${lang}</span>`
+    ? `<span class="text-[10px] uppercase tracking-wider opacity-50">${escapeHtml(safeLang)}</span>`
     : ''
-  const escaped = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  const escaped = escapeHtml(text)
   return `<div class="relative my-3 rounded-lg overflow-hidden border border-[var(--color-border-subtle)] markdown-code-block">
     <div class="flex items-center justify-between px-4 py-1.5 bg-[var(--color-bg-surface)] text-[var(--color-text-muted)] text-xs">${langLabel}<button class="copy-btn text-[10px] hover:text-[var(--color-accent)] transition-colors">复制</button></div>
-    <pre class="p-4 overflow-x-auto text-xs leading-relaxed font-mono bg-[var(--color-bg-elevated)]"><code class="shiki-target" data-lang="${lang || 'text'}">${escaped}</code></pre>
+    <pre class="p-4 overflow-x-auto text-xs leading-relaxed font-mono bg-[var(--color-bg-elevated)]"><code class="shiki-target" data-lang="${safeLang}">${escaped}</code></pre>
   </div>`
 }
 
 renderer.codespan = function ({ text }: Tokens.Codespan) {
-  return `<code class="px-1.5 py-0.5 rounded-md bg-[var(--color-bg-surface)] text-[var(--color-accent)] text-xs font-mono before:content-none after:content-none">${text}</code>`
+  return `<code class="px-1.5 py-0.5 rounded-md bg-[var(--color-bg-surface)] text-[var(--color-accent)] text-xs font-mono before:content-none after:content-none">${escapeHtml(text)}</code>`
 }
 
-renderer.heading = function (token: Tokens.Heading) {
+renderer.heading = function (this: InlineRendererContext, token: Tokens.Heading) {
   const sizes: Record<number, string> = { 1: 'text-lg', 2: 'text-base', 3: 'text-sm' }
-  return `<h${token.depth} class="${sizes[token.depth] ?? 'text-sm'} font-semibold mt-4 mb-2 first:mt-0 text-[var(--color-text-primary)]">${token.text}</h${token.depth}>`
+  const text = renderInline(this, token.tokens, token.text)
+  return `<h${token.depth} class="${sizes[token.depth] ?? 'text-sm'} font-semibold mt-4 mb-2 first:mt-0 text-[var(--color-text-primary)]">${text}</h${token.depth}>`
 }
 
-renderer.list = function (token: Tokens.List) {
+renderer.list = function (this: InlineRendererContext, token: Tokens.List) {
   const tag = token.ordered ? 'ol' : 'ul'
   const listItems = token.items
     .map(
       (item) =>
-        `<li class="ml-4 my-0.5 list-inside" style="list-style-type: ${token.ordered ? 'decimal' : 'disc'}">${item.text}</li>`
+        `<li class="ml-4 my-0.5 list-inside">${renderBlocks(this, item.tokens, item.text)}</li>`
     )
     .join('')
   return `<${tag} class="my-2 space-y-0.5">${listItems}</${tag}>`
 }
 
-renderer.listitem = function ({ text }: Tokens.ListItem) {
-  return text
+renderer.listitem = function (this: InlineRendererContext, token: Tokens.ListItem) {
+  return renderBlocks(this, token.tokens, token.text)
 }
 
-renderer.paragraph = function (token: Tokens.Paragraph) {
+renderer.paragraph = function (this: InlineRendererContext, token: Tokens.Paragraph) {
   const trimmed = token.text.trim()
   if (!trimmed) return ''
-  return `<p class="my-1 leading-relaxed first:mt-0 last:mb-0">${trimmed}</p>`
+  return `<p class="my-1 leading-relaxed first:mt-0 last:mb-0">${renderInline(this, token.tokens, trimmed)}</p>`
 }
 
-renderer.strong = function (token: Tokens.Strong) {
-  return `<strong class="font-semibold text-[var(--color-text-primary)]">${token.text}</strong>`
+renderer.strong = function (this: InlineRendererContext, token: Tokens.Strong) {
+  return `<strong class="font-semibold text-[var(--color-text-primary)]">${renderInline(this, token.tokens, token.text)}</strong>`
 }
 
-renderer.em = function (token: Tokens.Em) {
-  return `<em class="italic">${token.text}</em>`
+renderer.em = function (this: InlineRendererContext, token: Tokens.Em) {
+  return `<em class="italic">${renderInline(this, token.tokens, token.text)}</em>`
 }
 
 renderer.link = function ({ href, title, text }: Tokens.Link) {
-  const titleAttr = title ? ` title="${title}"` : ''
-  return `<a href="${href}" target="_blank" rel="noopener noreferrer"${titleAttr} class="text-[var(--color-accent)] underline underline-offset-2 hover:opacity-80 transition-opacity">${text}</a>`
+  if (!isSafeLink(href)) {
+    return text
+  }
+
+  const safeHref = escapeHtml(href.trim())
+  const titleAttr = title ? ` title="${escapeHtml(title)}"` : ''
+  return `<a href="${safeHref}" target="_blank" rel="noopener noreferrer"${titleAttr} class="text-[var(--color-accent)] underline underline-offset-2 hover:opacity-80 transition-opacity">${text}</a>`
 }
 
 renderer.hr = function () {
   return `<hr class="my-4 border-[var(--color-border-subtle)]" />`
 }
 
-renderer.blockquote = function (token: Tokens.Blockquote) {
-  return `<blockquote class="border-l-3 border-[var(--color-accent)] pl-3 my-2 text-[var(--color-text-secondary)] italic">${token.text}</blockquote>`
+renderer.blockquote = function (this: InlineRendererContext, token: Tokens.Blockquote) {
+  return `<blockquote class="border-l-3 border-[var(--color-accent)] pl-3 my-2 text-[var(--color-text-secondary)] italic">${renderBlocks(this, token.tokens, token.text)}</blockquote>`
 }
 
-renderer.table = function (token: Tokens.Table) {
+renderer.table = function (this: InlineRendererContext, token: Tokens.Table) {
   const headerRow = token.header
     .map(
-      (h) => `<th class="px-3 py-2 text-left text-xs font-medium text-[var(--color-text-muted)]">${h.text}</th>`
+      (h) => `<th class="px-3 py-2 text-left text-xs font-medium text-[var(--color-text-muted)]">${renderInline(this, h.tokens, h.text)}</th>`
     )
     .join('')
   const bodyRows = token.rows
     .map(
       (row) =>
-        `<tr class="border-t border-[var(--color-border-subtle)]">${row.map((cell) => `<td class="px-3 py-2 text-xs">${cell.text}</td>`).join('')}</tr>`
+        `<tr class="border-t border-[var(--color-border-subtle)]">${row.map((cell) => `<td class="px-3 py-2 text-xs">${renderInline(this, cell.tokens, cell.text)}</td>`).join('')}</tr>`
     )
     .join('')
   return `<div class="my-3 overflow-x-auto rounded-lg border border-[var(--color-border-subtle)]"><table class="w-full border-collapse"><thead><tr class="bg-[var(--color-bg-surface)]">${headerRow}</tr></thead><tbody>${bodyRows}</tbody></table></div>`
 }
 
-renderer.del = function (token: Tokens.Del) {
-  return `<del class="line-through opacity-70">${token.text}</del>`
+renderer.del = function (this: InlineRendererContext, token: Tokens.Del) {
+  return `<del class="line-through opacity-70">${renderInline(this, token.tokens, token.text)}</del>`
 }
 
 marked.use({ renderer, breaks: true, gfm: true })
@@ -152,34 +254,28 @@ export function Markdown({ content, isUser }: MarkdownProps) {
   const html = useMemo(() => {
     if (!content) return ''
     const raw = marked.parse(content) as string
-    const withLatex = renderLatex(raw)
+    const safeMarkdown = DOMPurify.sanitize(raw, markdownSanitizeConfig)
+    const withLatex = renderLatex(safeMarkdown)
 
-    // 严格的 XSS 防护配置
-    return DOMPurify.sanitize(withLatex, {
-      ALLOWED_TAGS: [
-        'p', 'br', 'strong', 'em', 'u', 'del', 's', 'code', 'pre',
-        'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
-        'ul', 'ol', 'li',
-        'blockquote',
-        'a',
-        'table', 'thead', 'tbody', 'tr', 'th', 'td',
-        'hr',
-        'div', 'span', // LaTeX + 代码块容器
-        'button', // 复制按钮
-      ],
-      ALLOWED_ATTR: [
-        'class', 'style', 'href', 'target', 'rel', 'title',
-        'data-lang', // 代码块语言标记
-      ],
-      ALLOWED_URI_REGEXP: /^(?:https?|mailto):/i,
-      ALLOW_DATA_ATTR: false,
-      SAFE_FOR_TEMPLATES: true,
-    })
+    return DOMPurify.sanitize(withLatex, renderedSanitizeConfig)
   }, [content])
 
   useEffect(() => {
     const container = containerRef.current
     if (!container) return
+
+    container.querySelectorAll<HTMLAnchorElement>('a').forEach((link) => {
+      const href = link.getAttribute('href')
+      if (!isSafeLink(href)) {
+        link.removeAttribute('href')
+        link.removeAttribute('target')
+        link.removeAttribute('rel')
+        return
+      }
+
+      link.setAttribute('target', '_blank')
+      link.setAttribute('rel', 'noopener noreferrer')
+    })
 
     const codeElements = container.querySelectorAll<HTMLElement>('code.shiki-target')
     if (codeElements.length === 0) return
@@ -198,7 +294,7 @@ export function Markdown({ content, isUser }: MarkdownProps) {
           })
           const match = html.match(/<code[^>]*>([\s\S]*?)<\/code>/)
           if (match) {
-            el.innerHTML = match[1]
+            el.innerHTML = DOMPurify.sanitize(match[1], shikiSanitizeConfig)
           }
         } catch {
           el.textContent = code

@@ -10,11 +10,20 @@ interface GenConfig {
   maxReplyLength: number
 }
 
+type LegacyGenConfig = Partial<GenConfig> & { maxTokens?: number }
+
+type PersistedSettingsState = Partial<Omit<SettingsState, 'genConfig'>> & {
+  genConfig?: LegacyGenConfig
+}
+
 const DEFAULT_LLM_CONFIG: LLMConfig = {
+  source: 'lmstudio',
   apiUrl: 'http://localhost:1234/v1',
   apiKey: '',
+  apiKeySessionId: undefined,
   model: 'local-model',
   type: 'openai',
+  customApiFormat: 'openai_chat',
 }
 
 const DEFAULT_GEN_CONFIG: GenConfig = {
@@ -35,6 +44,54 @@ interface SettingsState {
   setContextLength: (v: number) => void
   setMaxReplyLength: (v: number) => void
   setDeveloperMode: (v: boolean) => void
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null
+}
+
+function sourceFromLegacyType(type: LLMConfig['type'] | undefined): LLMConfig['source'] {
+  switch (type) {
+    case 'kobold':
+      return 'kobold'
+    case 'textgen':
+      return 'textgen'
+    case 'novel':
+      return undefined
+    case 'custom':
+      return 'custom_openai_chat'
+    case 'openai':
+    default:
+      return 'lmstudio'
+  }
+}
+
+export function migrateSettingsState(persisted: unknown): Partial<SettingsState> {
+  const state = isRecord(persisted) ? persisted as PersistedSettingsState : {}
+  const legacyGenConfig = state.genConfig ?? {}
+  const llmConfig = {
+    ...DEFAULT_LLM_CONFIG,
+    ...(state.llmConfig ?? {}),
+  }
+  llmConfig.source = llmConfig.source ?? sourceFromLegacyType(llmConfig.type)
+  llmConfig.customApiFormat = llmConfig.customApiFormat ?? 'openai_chat'
+
+  const genConfig: LegacyGenConfig = {
+    ...DEFAULT_GEN_CONFIG,
+    ...legacyGenConfig,
+    maxReplyLength:
+      legacyGenConfig.maxReplyLength ??
+      legacyGenConfig.maxTokens ??
+      DEFAULT_GEN_CONFIG.maxReplyLength,
+  }
+  delete genConfig.maxTokens
+
+  return {
+    ...state,
+    llmConfig,
+    genConfig: genConfig as GenConfig,
+    developerMode: state.developerMode ?? false,
+  }
 }
 
 export const useSettingsStore = create<SettingsState>()(
@@ -58,7 +115,9 @@ export const useSettingsStore = create<SettingsState>()(
     }),
     {
       name: 'luker-settings-store',
+      version: 1,
       storage: createJSONStorage(() => secureStorage),
+      migrate: migrateSettingsState,
     }
   )
 )

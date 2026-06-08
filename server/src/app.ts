@@ -6,8 +6,12 @@ import { chatsRoute } from './routes/chats.js'
 import { worldsRoute } from './routes/worlds.js'
 import { presetsRoute } from './routes/presets.js'
 import { engineRoute } from './routes/engine.js'
+import { runsRoute } from './routes/runs.js'
+import { llmSessionsRoute } from './routes/llm-sessions.js'
+import { llmRoutes } from './routes/llm.routes.js'
 import { appErrorHandler } from './middleware/errorHandler.js'
 import { applyCsrf } from './middleware/csrf.js'
+import { corsOrigin } from './config/origins.js'
 
 export function createApp() {
   const app = new Hono()
@@ -15,13 +19,13 @@ export function createApp() {
   app.use(logger())
 
   app.use('/*', cors({
-    origin: ['http://localhost:5173', 'http://localhost:3000', 'http://127.0.0.1:5173'],
+    origin: corsOrigin,
     allowMethods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
     allowHeaders: ['Content-Type', 'Authorization'],
     credentials: true,
   }))
 
-  // CSRF 保护：仅应用到状态变更路由（POST/PATCH/DELETE）
+  // CSRF protection applies to this routed API app in production.
   const protectedApp = new Hono()
   applyCsrf(protectedApp)
   protectedApp.route('/api/characters', charactersRoute)
@@ -29,6 +33,9 @@ export function createApp() {
   protectedApp.route('/api/worlds', worldsRoute)
   protectedApp.route('/api/presets', presetsRoute)
   protectedApp.route('/api/engine', engineRoute)
+  protectedApp.route('/api/runs', runsRoute)
+  protectedApp.route('/api/llm-sessions', llmSessionsRoute)
+  protectedApp.route('/api/llm', llmRoutes)
 
   app.route('/', protectedApp)
 

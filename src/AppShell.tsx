@@ -40,7 +40,7 @@ export function AppShell() {
   const {
     isStreaming, displayMessages,
     handleSend, handleStop, handleDeleteMessage, handleEditMessage, handleRegenerate,
-    handleSwipe, handleContinue,
+    handleSwipe, handleContinue, recoverableRun, handleCommitRun, handleDiscardRun,
   } = useChatActions(messages)
 
   const toast = useToast()
@@ -95,6 +95,9 @@ export function AppShell() {
           onRegenerate: handleRegenerate,
           onSwipe: handleSwipe,
           onContinue: handleContinue,
+          recoverableRun,
+          onCommitRun: handleCommitRun,
+          onDiscardRun: handleDiscardRun,
         }}
         panel={{
           character: activeCharacter ?? defaultCharacter,

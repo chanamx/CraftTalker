@@ -18,7 +18,7 @@ export function ImportDialog({ open, onClose }: ImportDialogProps) {
   const toast = useToast()
 
   const handleFile = useCallback((f: File) => {
-    if (f.name.endsWith('.png') || f.name.endsWith('.json') || f.name.endsWith('.webp')) {
+    if (f.name.endsWith('.png') || f.name.endsWith('.json')) {
       setFile(f)
     }
   }, [])
@@ -150,7 +150,7 @@ export function ImportDialog({ open, onClose }: ImportDialogProps) {
                               拖放角色卡文件到此处
                             </p>
                             <p className="text-xs text-[var(--color-text-muted)]">
-                              支持 PNG / JSON / WebP 格式
+                              支持 PNG / JSON 格式
                             </p>
                           </div>
                         </>
@@ -158,7 +158,7 @@ export function ImportDialog({ open, onClose }: ImportDialogProps) {
                       <input
                         ref={inputRef}
                         type="file"
-                        accept=".png,.json,.webp"
+                        accept=".png,.json"
                         onChange={handleInput}
                         className="hidden"
                       />

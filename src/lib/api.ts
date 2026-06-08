@@ -1,5 +1,22 @@
 const BASE = '/api'
 
+export interface LlmRequestConfig {
+  source?: string
+  apiUrl: string
+  apiKey: string
+  apiKeySessionId?: string
+  model: string
+  type: string
+  useReverseProxy?: boolean
+  reverseProxyUrl?: string
+  reverseProxyPassword?: string
+  reverseProxyName?: string
+  customApiFormat?: string
+  customHeaders?: Record<string, string>
+  customBodyFields?: Record<string, unknown>
+  excludeBodyFields?: string[]
+}
+
 export interface ApiError {
   error: string
   code: number
@@ -74,7 +91,7 @@ export interface ChatLine {
   name?: string
   is_user?: boolean
   is_system?: boolean
-  send_date?: number
+  send_date?: string | number
   mes?: string
   extra?: Record<string, unknown>
   chat_metadata?: Record<string, unknown>
@@ -120,6 +137,9 @@ export interface WorldBookEntry {
   cooldown: number
   delay: number
   display_index: number
+  disable?: boolean
+  vectorized?: boolean
+  [key: string]: unknown
 }
 
 export interface WorldBook {
@@ -127,6 +147,7 @@ export interface WorldBook {
   description: string
   entries: Record<string, WorldBookEntry>
   enabled: boolean
+  global_enabled?: boolean
   global_selective: boolean
   selective_default: boolean
   recursive_scanning: boolean
@@ -134,6 +155,7 @@ export interface WorldBook {
   token_budget: number
   recursive_scanning_depth: number
   extensions: Record<string, unknown>
+  [key: string]: unknown
 }
 
 export interface WorldIndex {
@@ -141,6 +163,7 @@ export interface WorldIndex {
   description: string
   entry_count: number
   enabled: boolean
+  global_enabled: boolean
   bound_to: string[]
 }
 
@@ -177,15 +200,59 @@ export interface GenerationPreset {
   dry_sequence_breakers: string
   xtc_threshold: number
   xtc_probability: number
+  [key: string]: unknown
 }
 
-export type PresetType = 'kobold' | 'openai' | 'textgen' | 'novel'
+export type PresetData = GenerationPreset | { name: string; [key: string]: unknown }
+
+export type PresetType =
+  | 'kobold'
+  | 'openai'
+  | 'textgen'
+  | 'novel'
+  | 'instruct'
+  | 'context'
+  | 'sysprompt'
+  | 'reasoning'
 
 export interface StreamCallbacks {
   onChunk?: (chunk: string) => void
   onError?: (error: ApiError) => void
   onComplete?: () => void
   signal?: AbortSignal
+}
+
+export type GenerationRunStatus =
+  | 'running'
+  | 'completed'
+  | 'failed'
+  | 'canceled'
+  | 'interrupted'
+  | 'committed'
+  | 'discarded'
+
+export interface GenerationRunRecord {
+  runId: string
+  characterName: string
+  chatId: string
+  operation: 'generate' | 'regenerate' | 'continue'
+  status: GenerationRunStatus
+  createdAt: string
+  updatedAt: string
+  startedAt: string
+  finishedAt?: string
+  partialContent: string
+  error?: string
+  committedLineIndex?: number
+}
+
+export interface LlmKeySession {
+  sessionId: string
+  label?: string
+  createdAt: string
+  updatedAt: string
+  lastUsedAt?: string
+  hasApiKey: boolean
 }
 
 export async function consumeSSEStream(
@@ -241,11 +308,33 @@ export async function consumeSSEStream(
 }
 
 export const api = {
-  testConnection: (config: { apiUrl: string; apiKey: string; model: string; type: string }) =>
+  testConnection: (config: LlmRequestConfig) =>
     request<{ success: boolean }>('/engine/test', {
       method: 'POST',
       body: JSON.stringify(config),
     }),
+
+  llm: {
+    models: (config: LlmRequestConfig) =>
+      request<string[]>('/llm/models', {
+        method: 'POST',
+        body: JSON.stringify(config),
+      }),
+  },
+
+  llmSessions: {
+    create: (input: { apiKey: string; label?: string }) =>
+      request<LlmKeySession>('/llm-sessions', {
+        method: 'POST',
+        body: JSON.stringify(input),
+      }),
+    get: (sessionId: string) =>
+      request<LlmKeySession>(`/llm-sessions/${encodeURIComponent(sessionId)}`),
+    delete: (sessionId: string) =>
+      request<{ success: boolean }>(`/llm-sessions/${encodeURIComponent(sessionId)}`, {
+        method: 'DELETE',
+      }),
+  },
 
   characters: {
     list: () => request<CharacterIndex[]>('/characters'),
@@ -319,7 +408,7 @@ export const api = {
     generate: (
       characterName: string,
       chatId: string,
-      config: { apiUrl: string; apiKey: string; model: string; type: string },
+      config: LlmRequestConfig,
       presetType?: PresetType,
       presetName?: string,
       signal?: AbortSignal,
@@ -334,7 +423,7 @@ export const api = {
     regenerate: (
       characterName: string,
       chatId: string,
-      config: { apiUrl: string; apiKey: string; model: string; type: string },
+      config: LlmRequestConfig,
       presetType?: PresetType,
       presetName?: string,
       signal?: AbortSignal,
@@ -349,15 +438,16 @@ export const api = {
     continue: (
       characterName: string,
       chatId: string,
-      config: { apiUrl: string; apiKey: string; model: string; type: string },
+      config: LlmRequestConfig,
       presetType?: PresetType,
       presetName?: string,
       signal?: AbortSignal,
+      genOverrides?: { temperature?: number; topP?: number; contextLength?: number; maxReplyLength?: number },
     ) =>
       fetch(`${BASE}/chats/${encodeURIComponent(characterName)}/${chatId}/continue`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ config, presetType, presetName }),
+        body: JSON.stringify({ config, presetType, presetName, genOverrides }),
         signal,
       }),
     delete: (characterName: string, chatId: string) =>
@@ -382,6 +472,27 @@ export const api = {
       request<ChatLine>(`/chats/${encodeURIComponent(characterName)}/${chatId}/messages/${lineIndex}/swipe`, {
         method: 'POST',
         body: JSON.stringify({ swipeId }),
+      }),
+  },
+
+  runs: {
+    list: (filters?: { characterName?: string; chatId?: string; status?: GenerationRunStatus }) => {
+      const params = new URLSearchParams()
+      if (filters?.characterName) params.set('characterName', filters.characterName)
+      if (filters?.chatId) params.set('chatId', filters.chatId)
+      if (filters?.status) params.set('status', filters.status)
+      const query = params.toString()
+      return request<GenerationRunRecord[]>(`/runs${query ? `?${query}` : ''}`)
+    },
+    get: (runId: string) =>
+      request<GenerationRunRecord>(`/runs/${encodeURIComponent(runId)}`),
+    commit: (runId: string) =>
+      request<GenerationRunRecord>(`/runs/${encodeURIComponent(runId)}/commit`, {
+        method: 'POST',
+      }),
+    discard: (runId: string) =>
+      request<GenerationRunRecord>(`/runs/${encodeURIComponent(runId)}/discard`, {
+        method: 'POST',
       }),
   },
 
@@ -431,9 +542,9 @@ export const api = {
   presets: {
     list: (type: PresetType) => request<string[]>(`/presets/${type}`),
     get: (type: PresetType, name: string) =>
-      request<GenerationPreset>(`/presets/${type}/${encodeURIComponent(name)}`),
-    save: (type: PresetType, preset: GenerationPreset) =>
-      request<GenerationPreset>(`/presets/${type}`, {
+      request<PresetData>(`/presets/${type}/${encodeURIComponent(name)}`),
+    save: (type: PresetType, preset: PresetData) =>
+      request<PresetData>(`/presets/${type}`, {
         method: 'POST',
         body: JSON.stringify(preset),
       }),
