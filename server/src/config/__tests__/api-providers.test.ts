@@ -13,7 +13,23 @@ import {
 describe('API Provider Configuration', () => {
   describe('Provider Registry', () => {
     it('should have all required providers', () => {
-      const requiredProviders = ['openai', 'anthropic', 'google', 'cohere', 'mistral']
+      const requiredProviders = [
+        'openai',
+        'anthropic',
+        'google',
+        'gemini',
+        'openrouter',
+        'groq',
+        'deepseek',
+        'moonshot',
+        'siliconflow',
+        'ollama',
+        'lmstudio',
+        'vllm',
+        'llamacpp',
+        'cohere',
+        'mistral',
+      ]
 
       for (const provider of requiredProviders) {
         expect(API_PROVIDERS[provider]).toBeDefined()
@@ -25,6 +41,7 @@ describe('API Provider Configuration', () => {
         expect(config.id).toBeTruthy()
         expect(config.name).toBeTruthy()
         expect(config.defaultEndpoint).toMatch(/^https?:\/\//)
+        expect(config.apiFormat).toBeTruthy()
         expect(typeof config.supportsStreaming).toBe('boolean')
         expect(['bearer', 'api-key', 'custom']).toContain(config.authType)
       })
@@ -79,6 +96,28 @@ describe('API Provider Configuration', () => {
 
       expect(headers['x-api-key']).toBe('test-key')
       expect(headers['anthropic-version']).toBe('2023-06-01')
+      expect(headers['Content-Type']).toBe('application/json')
+    })
+
+    it('should build Gemini headers with x-goog-api-key', () => {
+      const headers = buildHeaders('gemini', 'test-key')
+
+      expect(headers['x-goog-api-key']).toBe('test-key')
+      expect(headers['Content-Type']).toBe('application/json')
+    })
+
+    it('should build OpenRouter attribution headers by default', () => {
+      const headers = buildHeaders('openrouter', 'test-key')
+
+      expect(headers['Authorization']).toBe('Bearer test-key')
+      expect(headers['HTTP-Referer']).toBe('https://crafttalker.app')
+      expect(headers['X-OpenRouter-Title']).toBe('CraftTalker')
+    })
+
+    it('should omit authorization for local providers without an API key', () => {
+      const headers = buildHeaders('lmstudio', '')
+
+      expect(headers['Authorization']).toBeUndefined()
       expect(headers['Content-Type']).toBe('application/json')
     })
 

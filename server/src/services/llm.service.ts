@@ -18,9 +18,12 @@ export type ChatCompletionSource =
  */
 export type CustomAPIFormat =
   | 'openai_chat'        // OpenAI Chat Completions: /chat/completions
+  | 'openai_completion'  // OpenAI-compatible legacy Completions: /completions
   | 'openai_responses'   // OpenAI Responses: /responses
-  | 'claude_messages'    // Claude Messages: /messages
-  | 'gemini_interactions' // Gemini Interactions: /interactions
+  | 'anthropic_messages' // Claude Messages: /messages
+  | 'gemini_generate_content' // Gemini generateContent: /models/{model}:generateContent
+  | 'claude_messages'    // Legacy alias accepted for saved configs
+  | 'gemini_interactions' // Legacy alias accepted for saved configs
 
 export interface LLMConfig {
   // 新增字段
@@ -28,6 +31,7 @@ export interface LLMConfig {
   useReverseProxy?: boolean
   reverseProxyUrl?: string
   reverseProxyPassword?: string
+  reverseProxyName?: string
   customApiFormat?: CustomAPIFormat
   customHeaders?: Record<string, string>
   customBodyFields?: Record<string, unknown>

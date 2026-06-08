@@ -8,6 +8,7 @@ export interface APIProviderConfig {
   id: string
   name: string
   defaultEndpoint: string
+  apiFormat: APIFormat
   supportsStreaming: boolean
   authType: 'bearer' | 'api-key' | 'custom'
   authHeader?: string
@@ -26,6 +27,16 @@ export interface APIProviderConfig {
   }
 }
 
+export const API_FORMATS = [
+  'openai_chat',
+  'openai_completion',
+  'openai_responses',
+  'anthropic_messages',
+  'gemini_generate_content',
+] as const
+
+export type APIFormat = typeof API_FORMATS[number]
+
 export interface ReverseProxyConfig {
   name: string
   endpoint: string
@@ -41,6 +52,7 @@ export const OPENAI_CONFIG: APIProviderConfig = {
   id: 'openai',
   name: 'OpenAI',
   defaultEndpoint: 'https://api.openai.com/v1',
+  apiFormat: 'openai_chat',
   supportsStreaming: true,
   authType: 'bearer',
   authHeader: 'Authorization',
@@ -55,6 +67,7 @@ export const OPENAI_CONFIG: APIProviderConfig = {
       requiresAuth: true,
       customHeaders: {
         'HTTP-Referer': 'https://crafttalker.app',
+        'X-OpenRouter-Title': 'CraftTalker',
       },
     },
     {
@@ -90,6 +103,7 @@ export const ANTHROPIC_CONFIG: APIProviderConfig = {
   id: 'anthropic',
   name: 'Anthropic',
   defaultEndpoint: 'https://api.anthropic.com/v1',
+  apiFormat: 'anthropic_messages',
   supportsStreaming: true,
   authType: 'api-key',
   authHeader: 'x-api-key',
@@ -123,6 +137,7 @@ export const GOOGLE_CONFIG: APIProviderConfig = {
   id: 'google',
   name: 'Google Gemini',
   defaultEndpoint: 'https://generativelanguage.googleapis.com/v1beta',
+  apiFormat: 'gemini_generate_content',
   supportsStreaming: true,
   authType: 'api-key',
   authHeader: 'x-goog-api-key',
@@ -147,6 +162,7 @@ export const COHERE_CONFIG: APIProviderConfig = {
   id: 'cohere',
   name: 'Cohere',
   defaultEndpoint: 'https://api.cohere.ai/v1',
+  apiFormat: 'openai_chat',
   supportsStreaming: true,
   authType: 'bearer',
   authHeader: 'Authorization',
@@ -170,6 +186,7 @@ export const MISTRAL_CONFIG: APIProviderConfig = {
   id: 'mistral',
   name: 'Mistral AI',
   defaultEndpoint: 'https://api.mistral.ai/v1',
+  apiFormat: 'openai_chat',
   supportsStreaming: true,
   authType: 'bearer',
   authHeader: 'Authorization',
@@ -186,13 +203,87 @@ export const MISTRAL_CONFIG: APIProviderConfig = {
   },
 }
 
+function openAICompatibleProvider(
+  id: string,
+  name: string,
+  defaultEndpoint: string,
+  options: Partial<Pick<APIProviderConfig, 'rateLimit' | 'modelDefaults' | 'reverseProxies' | 'requiredHeaders' | 'supportsStreaming' | 'authType' | 'authHeader' | 'apiFormat'>> = {},
+): APIProviderConfig {
+  const requiredHeaders = {
+    'Content-Type': 'application/json',
+    ...(options.requiredHeaders ?? {}),
+  }
+
+  return {
+    id,
+    name,
+    defaultEndpoint,
+    apiFormat: options.apiFormat ?? 'openai_chat',
+    supportsStreaming: options.supportsStreaming ?? true,
+    authType: options.authType ?? 'bearer',
+    authHeader: options.authHeader ?? 'Authorization',
+    ...options,
+    requiredHeaders,
+  }
+}
+
+export const OPENROUTER_CONFIG = openAICompatibleProvider(
+  'openrouter',
+  'OpenRouter',
+  'https://openrouter.ai/api/v1',
+  {
+    requiredHeaders: {
+      'HTTP-Referer': 'https://crafttalker.app',
+      'X-OpenRouter-Title': 'CraftTalker',
+    },
+    reverseProxies: [
+      {
+        name: 'OpenRouter',
+        endpoint: 'https://openrouter.ai/api/v1',
+        requiresAuth: true,
+        customHeaders: {
+          'HTTP-Referer': 'https://crafttalker.app',
+          'X-OpenRouter-Title': 'CraftTalker',
+        },
+      },
+    ],
+  },
+)
+
+export const GROQ_CONFIG = openAICompatibleProvider('groq', 'Groq', 'https://api.groq.com/openai/v1')
+export const FIREWORKS_CONFIG = openAICompatibleProvider('fireworks', 'Fireworks AI', 'https://api.fireworks.ai/inference/v1')
+export const TOGETHER_CONFIG = openAICompatibleProvider('togetherai', 'Together AI', 'https://api.together.xyz/v1')
+export const PERPLEXITY_CONFIG = openAICompatibleProvider('perplexity', 'Perplexity', 'https://api.perplexity.ai')
+export const DEEPSEEK_CONFIG = openAICompatibleProvider('deepseek', 'DeepSeek', 'https://api.deepseek.com/v1')
+export const MOONSHOT_CONFIG = openAICompatibleProvider('moonshot', 'Moonshot/Kimi', 'https://api.moonshot.cn/v1')
+export const SILICONFLOW_CONFIG = openAICompatibleProvider('siliconflow', 'SiliconFlow', 'https://api.siliconflow.cn/v1')
+export const XAI_CONFIG = openAICompatibleProvider('xai', 'xAI', 'https://api.x.ai/v1')
+export const OLLAMA_CONFIG = openAICompatibleProvider('ollama', 'Ollama', 'http://localhost:11434/v1')
+export const LMSTUDIO_CONFIG = openAICompatibleProvider('lmstudio', 'LM Studio', 'http://localhost:1234/v1')
+export const VLLM_CONFIG = openAICompatibleProvider('vllm', 'vLLM', 'http://localhost:8000/v1')
+export const LLAMACPP_CONFIG = openAICompatibleProvider('llamacpp', 'llama.cpp', 'http://localhost:8080/v1')
+
 /**
  * 所有 API 提供商配置
  */
 export const API_PROVIDERS: Record<string, APIProviderConfig> = {
   openai: OPENAI_CONFIG,
+  openrouter: OPENROUTER_CONFIG,
   anthropic: ANTHROPIC_CONFIG,
   google: GOOGLE_CONFIG,
+  gemini: GOOGLE_CONFIG,
+  groq: GROQ_CONFIG,
+  fireworks: FIREWORKS_CONFIG,
+  togetherai: TOGETHER_CONFIG,
+  perplexity: PERPLEXITY_CONFIG,
+  deepseek: DEEPSEEK_CONFIG,
+  moonshot: MOONSHOT_CONFIG,
+  siliconflow: SILICONFLOW_CONFIG,
+  xai: XAI_CONFIG,
+  ollama: OLLAMA_CONFIG,
+  lmstudio: LMSTUDIO_CONFIG,
+  vllm: VLLM_CONFIG,
+  llamacpp: LLAMACPP_CONFIG,
   cohere: COHERE_CONFIG,
   mistral: MISTRAL_CONFIG,
 }
@@ -247,9 +338,9 @@ export function buildHeaders(
 
   const headers: Record<string, string> = { ...config.requiredHeaders }
 
-  if (config.authType === 'bearer') {
+  if (apiKey && config.authType === 'bearer') {
     headers[config.authHeader!] = `Bearer ${apiKey}`
-  } else if (config.authType === 'api-key') {
+  } else if (apiKey && config.authType === 'api-key') {
     headers[config.authHeader!] = apiKey
   }
 

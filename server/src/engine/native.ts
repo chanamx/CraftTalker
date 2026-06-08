@@ -2,10 +2,16 @@ import type { Engine, EngineRequest, EngineResponse } from './types.js'
 import type { LLMConfig } from '../services/llm.service.js'
 import type { CharacterCard } from '../lib/png-parser.js'
 import type { MatchedEntry } from '../lib/world-match.js'
+import {
+  buildEndpointUrl,
+  buildHeaders,
+  getProviderConfig,
+  type APIFormat,
+} from '../config/api-providers.js'
 import { createError, ErrorCode, AppError } from '../lib/errors.js'
 import { resolveMacros, type MacroEnv } from '../lib/macros.js'
 
-// Position constants matching ST's world_info_position enum
+// Position constants matching ST's world_info_position enum.
 const WI_POSITION = {
   BEFORE_CHAR: 0,
   AFTER_CHAR: 1,
@@ -15,6 +21,26 @@ const WI_POSITION = {
   EM_TOP: 5,
   EM_BOTTOM: 6,
 } as const
+
+const OPENAI_COMPAT_SOURCES = new Set([
+  'openai',
+  'openrouter',
+  'groq',
+  'fireworks',
+  'togetherai',
+  'perplexity',
+  'deepseek',
+  'moonshot',
+  'siliconflow',
+  'xai',
+  'mistral',
+  'cohere',
+  'ollama',
+  'lmstudio',
+  'vllm',
+  'llamacpp',
+  'custom_openai_chat',
+])
 
 function buildWorldContent(entries: MatchedEntry[], positions: number[], macroEnv: MacroEnv): string {
   const filtered = entries.filter(e => positions.includes(e.position))
@@ -66,7 +92,6 @@ function buildOpenAIMessages(
 
   result.push({ role: 'system', content: systemPrompt })
 
-  // at_depth entries: inject as system messages at specified depth in conversation
   const atDepthEntries = worldEntries?.filter(e => e.position === WI_POSITION.AT_DEPTH) ?? []
 
   for (const msg of messages) {
@@ -89,6 +114,7 @@ function buildCompletionPrompt(
 ): string {
   const parts: string[] = []
   const r = (text: string) => resolveMacros(text, macroEnv)
+  const mutableMessages = [...messages]
 
   if (character.system_prompt) parts.push(r(character.system_prompt))
 
@@ -116,17 +142,16 @@ function buildCompletionPrompt(
     parts.push(`[对话示例]\n${exampleBlock}`)
   }
 
-  // at_depth entries: inject at specified depth in message history
   if (worldEntries?.length) {
     const atDepthEntries = worldEntries.filter(e => e.position === WI_POSITION.AT_DEPTH)
     for (const entry of atDepthEntries) {
-      const insertIdx = Math.max(0, messages.length - entry.depth)
+      const insertIdx = Math.max(0, mutableMessages.length - entry.depth)
       const content = resolveMacros(entry.content, macroEnv)
-      messages.splice(insertIdx, 0, { role: 'system', content })
+      mutableMessages.splice(insertIdx, 0, { role: 'system', content })
     }
   }
 
-  for (const msg of messages) {
+  for (const msg of mutableMessages) {
     if (msg.role === 'user') parts.push(`用户: ${msg.content}`)
     else if (msg.role === 'assistant') parts.push(`${character.name}: ${msg.content}`)
     else if (msg.role === 'system') parts.push(msg.content)
@@ -136,45 +161,278 @@ function buildCompletionPrompt(
   return parts.join('\n\n')
 }
 
-function normalizeApiUrl(url: string): string {
-  return url.replace(/\/v1\/?$/, '')
+function trimTrailingSlashes(value: string): string {
+  return value.replace(/\/+$/, '')
+}
+
+function joinUrl(baseUrl: string, path: string): string {
+  return `${trimTrailingSlashes(baseUrl)}${path.startsWith('/') ? path : `/${path}`}`
+}
+
+function canonicalApiFormat(format: string | undefined): APIFormat | undefined {
+  switch (format) {
+    case 'claude_messages':
+      return 'anthropic_messages'
+    case 'gemini_interactions':
+      return 'gemini_generate_content'
+    case 'openai_chat':
+    case 'openai_completion':
+    case 'openai_responses':
+    case 'anthropic_messages':
+    case 'gemini_generate_content':
+      return format
+    default:
+      return undefined
+  }
+}
+
+function legacyProviderFromType(type: LLMConfig['type']): string {
+  switch (type) {
+    case 'kobold':
+    case 'textgen':
+    case 'novel':
+      return type
+    case 'custom':
+      return 'custom_openai_chat'
+    case 'openai':
+    default:
+      return 'openai'
+  }
+}
+
+function providerFromConfig(config: LLMConfig): string {
+  if (config.source) {
+    if (config.source === 'google') return 'gemini'
+    if (config.source === 'custom_claude') return 'anthropic'
+    if (config.source === 'custom_gemini') return 'gemini'
+    if (config.source === 'custom_openai_responses') return 'openai'
+    return config.source
+  }
+  return legacyProviderFromType(config.type)
+}
+
+function apiFormatFromConfig(config: LLMConfig): APIFormat {
+  const customFormat = canonicalApiFormat(config.customApiFormat)
+  if (customFormat) return customFormat
+
+  if (config.source === 'custom_claude') return 'anthropic_messages'
+  if (config.source === 'custom_gemini') return 'gemini_generate_content'
+  if (config.source === 'custom_openai_responses') return 'openai_responses'
+  if (config.type !== 'openai' && config.type !== 'custom') return 'openai_completion'
+
+  const provider = providerFromConfig(config)
+  return getProviderConfig(provider)?.apiFormat ?? (OPENAI_COMPAT_SOURCES.has(provider) ? 'openai_chat' : 'openai_chat')
+}
+
+function baseUrlFromConfig(config: LLMConfig, provider: string): string {
+  if (config.useReverseProxy && config.reverseProxyUrl) return trimTrailingSlashes(config.reverseProxyUrl)
+  if (config.source?.startsWith('custom_')) return trimTrailingSlashes(config.apiUrl)
+
+  const providerConfig = getProviderConfig(provider)
+  if (!providerConfig) return trimTrailingSlashes(config.apiUrl)
+
+  return trimTrailingSlashes(buildEndpointUrl(
+    provider,
+    config.apiUrl,
+    config.reverseProxyName,
+  ))
+}
+
+function headersFromConfig(config: LLMConfig, provider: string): Record<string, string> {
+  const providerConfig = getProviderConfig(provider)
+  if (!providerConfig) {
+    return {
+      'Content-Type': 'application/json',
+      ...(config.apiKey ? { Authorization: `Bearer ${config.apiKey}` } : {}),
+      ...(config.customHeaders ?? {}),
+    }
+  }
+
+  return buildHeaders(
+    provider,
+    config.apiKey,
+    config.customHeaders,
+    config.reverseProxyName,
+  )
+}
+
+function openAICompatibleBody(
+  config: LLMConfig,
+  preset: any,
+  messages: Array<{ role: string; content: string }>,
+  stream: boolean,
+): Record<string, unknown> {
+  return applyBodyCustomizations(config, {
+    model: config.model,
+    messages,
+    temperature: preset.temperature,
+    top_p: preset.top_p,
+    max_tokens: preset.max_tokens,
+    frequency_penalty: preset.frequency_penalty,
+    presence_penalty: preset.presence_penalty,
+    stream,
+  })
+}
+
+function completionBody(
+  config: LLMConfig,
+  preset: any,
+  prompt: string,
+  stream: boolean,
+): Record<string, unknown> {
+  return applyBodyCustomizations(config, {
+    model: config.model,
+    prompt,
+    temperature: preset.temperature,
+    top_p: preset.top_p,
+    max_tokens: preset.max_tokens,
+    repetition_penalty: preset.repetition_penalty,
+    stream,
+  })
+}
+
+function anthropicBody(
+  config: LLMConfig,
+  preset: any,
+  messages: Array<{ role: string; content: string }>,
+  stream: boolean,
+): Record<string, unknown> {
+  const system = messages
+    .filter(message => message.role === 'system')
+    .map(message => message.content)
+    .join('\n\n')
+  const chatMessages = messages
+    .filter(message => message.role !== 'system')
+    .map(message => ({
+      role: message.role === 'assistant' ? 'assistant' : 'user',
+      content: message.content,
+    }))
+
+  return applyBodyCustomizations(config, {
+    model: config.model,
+    ...(system ? { system } : {}),
+    messages: chatMessages,
+    temperature: preset.temperature,
+    top_p: preset.top_p,
+    max_tokens: preset.max_tokens,
+    stream,
+  })
+}
+
+function geminiBody(
+  config: LLMConfig,
+  preset: any,
+  messages: Array<{ role: string; content: string }>,
+): Record<string, unknown> {
+  const systemInstruction = messages
+    .filter(message => message.role === 'system')
+    .map(message => message.content)
+    .join('\n\n')
+
+  const contents = messages
+    .filter(message => message.role !== 'system')
+    .map(message => ({
+      role: message.role === 'assistant' ? 'model' : 'user',
+      parts: [{ text: message.content }],
+    }))
+
+  return applyBodyCustomizations(config, {
+    contents,
+    ...(systemInstruction ? { systemInstruction: { parts: [{ text: systemInstruction }] } } : {}),
+    generationConfig: {
+      temperature: preset.temperature,
+      topP: preset.top_p,
+      maxOutputTokens: preset.max_tokens,
+    },
+  })
+}
+
+function applyBodyCustomizations(config: LLMConfig, body: Record<string, unknown>): Record<string, unknown> {
+  const next = {
+    ...body,
+    ...(config.customBodyFields ?? {}),
+  }
+  for (const field of config.excludeBodyFields ?? []) {
+    delete next[field]
+  }
+  return next
+}
+
+function parseUsage(data: {
+  usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number }
+  usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number; totalTokenCount?: number }
+}): EngineResponse['usage'] {
+  if (data.usage) {
+    return {
+      promptTokens: data.usage.prompt_tokens ?? 0,
+      completionTokens: data.usage.completion_tokens ?? 0,
+      totalTokens: data.usage.total_tokens ?? 0,
+    }
+  }
+  if (data.usageMetadata) {
+    return {
+      promptTokens: data.usageMetadata.promptTokenCount ?? 0,
+      completionTokens: data.usageMetadata.candidatesTokenCount ?? 0,
+      totalTokens: data.usageMetadata.totalTokenCount ?? 0,
+    }
+  }
+  return undefined
+}
+
+function geminiTextFromCandidate(candidate: { content?: { parts?: Array<{ text?: string }> }; finishReason?: string }): string {
+  return candidate.content?.parts?.map(part => part.text ?? '').join('') ?? ''
 }
 
 export class NativeEngine implements Engine {
   readonly name = 'native'
 
   async generate(request: EngineRequest): Promise<EngineResponse> {
-    const { config, preset, character, messages, userName, worldEntries } = request
-    const baseUrl = normalizeApiUrl(config.apiUrl)
-    const macroEnv: MacroEnv = { user: userName || '用户', char: character.name }
+    const context = this.buildRequestContext(request)
 
-    if (config.type === 'openai' || config.type === 'custom') {
-      return this.generateChatCompletion(baseUrl, config, preset, character, messages, macroEnv, worldEntries)
+    switch (context.apiFormat) {
+      case 'anthropic_messages':
+        return this.generateAnthropic(context)
+      case 'gemini_generate_content':
+        return this.generateGemini(context)
+      case 'openai_completion':
+        return this.generateCompletion(context)
+      case 'openai_responses':
+      case 'openai_chat':
+      default:
+        return this.generateChatCompletion(context)
     }
-    return this.generateCompletion(baseUrl, config, preset, character, messages, macroEnv, worldEntries)
   }
 
   async *generateStream(request: EngineRequest): AsyncGenerator<string, void, unknown> {
-    const { config, preset, character, messages, signal, userName, worldEntries } = request
-    const baseUrl = normalizeApiUrl(config.apiUrl)
-    const macroEnv: MacroEnv = { user: userName || '用户', char: character.name }
+    const context = this.buildRequestContext(request)
 
-    if (config.type === 'openai' || config.type === 'custom') {
-      yield* this.streamChatCompletion(baseUrl, config, preset, character, messages, macroEnv, signal, worldEntries)
-    } else {
-      yield* this.streamCompletion(baseUrl, config, preset, character, messages, macroEnv, signal, worldEntries)
+    switch (context.apiFormat) {
+      case 'anthropic_messages':
+        yield* this.streamAnthropic(context)
+        break
+      case 'gemini_generate_content':
+        yield* this.streamGemini(context)
+        break
+      case 'openai_completion':
+        yield* this.streamCompletion(context)
+        break
+      case 'openai_responses':
+      case 'openai_chat':
+      default:
+        yield* this.streamChatCompletion(context)
     }
   }
 
   async testConnection(config: LLMConfig): Promise<boolean> {
-    const baseUrl = normalizeApiUrl(config.apiUrl)
-    const url = `${baseUrl}/v1/models`
-    console.log('[LLM] test →', url)
+    const provider = providerFromConfig(config)
+    const baseUrl = baseUrlFromConfig(config, provider)
+    const headers = headersFromConfig(config, provider)
+    const url = joinUrl(baseUrl, '/models')
+
+    console.log('[LLM] test ->', url)
     try {
-      const response = await fetch(url, {
-        headers: { 'Authorization': `Bearer ${config.apiKey}` },
-      })
-      console.log('[LLM] test ←', response.status)
+      const response = await fetch(url, { headers })
+      console.log('[LLM] test <-', response.status)
       return response.ok
     } catch (e) {
       console.error('[LLM] test failed:', String(e))
@@ -182,120 +440,135 @@ export class NativeEngine implements Engine {
     }
   }
 
-  private async generateChatCompletion(
-    baseUrl: string, config: LLMConfig, preset: any,
-    character: CharacterCard, messages: Array<{ role: string; content: string }>,
-    macroEnv: MacroEnv, worldEntries?: MatchedEntry[],
-  ): Promise<EngineResponse> {
-    const openaiMessages = buildOpenAIMessages(messages, character, macroEnv, worldEntries)
-    const body = {
-      model: config.model,
-      messages: openaiMessages,
-      temperature: preset.temperature,
-      top_p: preset.top_p,
-      max_tokens: preset.max_tokens,
-      frequency_penalty: preset.frequency_penalty,
-      presence_penalty: preset.presence_penalty,
-      stream: false,
-    }
+  private buildRequestContext(request: EngineRequest) {
+    const { config, preset, character, messages, userName, worldEntries, signal } = request
+    const provider = providerFromConfig(config)
+    const apiFormat = apiFormatFromConfig(config)
+    const baseUrl = baseUrlFromConfig(config, provider)
+    const headers = headersFromConfig(config, provider)
+    const macroEnv: MacroEnv = { user: userName || '用户', char: character.name }
+    const chatMessages = buildOpenAIMessages(messages, character, macroEnv, worldEntries)
+    const prompt = buildCompletionPrompt(messages, character, macroEnv, worldEntries)
 
-    const response = await this.fetchLLM(`${baseUrl}/v1/chat/completions`, config.apiKey, body)
+    return {
+      config,
+      preset,
+      baseUrl,
+      headers,
+      apiFormat,
+      chatMessages,
+      prompt,
+      signal,
+    }
+  }
+
+  private async generateChatCompletion(context: ReturnType<NativeEngine['buildRequestContext']>): Promise<EngineResponse> {
+    const body = openAICompatibleBody(context.config, context.preset, context.chatMessages, false)
+    const response = await this.fetchLLM(joinUrl(context.baseUrl, '/chat/completions'), context.headers, body, context.signal)
     const data = await response.json() as {
-      choices: Array<{ message: { content: string }; finish_reason: string }>
-      usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number }
+      choices: Array<{ message?: { content?: string }; finish_reason?: string }>
+      usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number }
     }
 
     return {
       content: data.choices[0]?.message?.content ?? '',
       finishReason: data.choices[0]?.finish_reason ?? 'stop',
-      usage: data.usage ? {
-        promptTokens: data.usage.prompt_tokens,
-        completionTokens: data.usage.completion_tokens,
-        totalTokens: data.usage.total_tokens,
-      } : undefined,
+      usage: parseUsage(data),
     }
   }
 
-  private async generateCompletion(
-    baseUrl: string, config: LLMConfig, preset: any,
-    character: CharacterCard, messages: Array<{ role: string; content: string }>,
-    macroEnv: MacroEnv, worldEntries?: MatchedEntry[],
-  ): Promise<EngineResponse> {
-    const prompt = buildCompletionPrompt(messages, character, macroEnv, worldEntries)
-    const body = {
-      model: config.model,
-      prompt,
-      temperature: preset.temperature,
-      top_p: preset.top_p,
-      max_tokens: preset.max_tokens,
-      repetition_penalty: preset.repetition_penalty,
-      stream: false,
-    }
-
-    const response = await this.fetchLLM(`${baseUrl}/v1/completions`, config.apiKey, body)
+  private async generateCompletion(context: ReturnType<NativeEngine['buildRequestContext']>): Promise<EngineResponse> {
+    const body = completionBody(context.config, context.preset, context.prompt, false)
+    const response = await this.fetchLLM(joinUrl(context.baseUrl, '/completions'), context.headers, body, context.signal)
     const data = await response.json() as {
-      choices: Array<{ text: string; finish_reason: string }>
+      choices: Array<{ text?: string; finish_reason?: string }>
+      usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number }
     }
 
     return {
       content: data.choices[0]?.text ?? '',
       finishReason: data.choices[0]?.finish_reason ?? 'stop',
+      usage: parseUsage(data),
     }
   }
 
-  private async *streamChatCompletion(
-    baseUrl: string, config: LLMConfig, preset: any,
-    character: CharacterCard, messages: Array<{ role: string; content: string }>,
-    macroEnv: MacroEnv,
-    signal?: AbortSignal, worldEntries?: MatchedEntry[],
-  ): AsyncGenerator<string, void, unknown> {
-    const openaiMessages = buildOpenAIMessages(messages, character, macroEnv, worldEntries)
-    const body = {
-      model: config.model,
-      messages: openaiMessages,
-      temperature: preset.temperature,
-      top_p: preset.top_p,
-      max_tokens: preset.max_tokens,
-      frequency_penalty: preset.frequency_penalty,
-      presence_penalty: preset.presence_penalty,
-      stream: true,
+  private async generateAnthropic(context: ReturnType<NativeEngine['buildRequestContext']>): Promise<EngineResponse> {
+    const body = anthropicBody(context.config, context.preset, context.chatMessages, false)
+    const response = await this.fetchLLM(joinUrl(context.baseUrl, '/messages'), context.headers, body, context.signal)
+    const data = await response.json() as {
+      content?: Array<{ type?: string; text?: string }>
+      stop_reason?: string
+      usage?: { input_tokens?: number; output_tokens?: number }
     }
 
-    const response = await this.fetchLLM(`${baseUrl}/v1/chat/completions`, config.apiKey, body, signal)
+    const content = data.content?.map(block => block.text ?? '').join('') ?? ''
+    return {
+      content,
+      finishReason: data.stop_reason ?? 'stop',
+      usage: data.usage ? {
+        promptTokens: data.usage.input_tokens ?? 0,
+        completionTokens: data.usage.output_tokens ?? 0,
+        totalTokens: (data.usage.input_tokens ?? 0) + (data.usage.output_tokens ?? 0),
+      } : undefined,
+    }
+  }
+
+  private async generateGemini(context: ReturnType<NativeEngine['buildRequestContext']>): Promise<EngineResponse> {
+    const body = geminiBody(context.config, context.preset, context.chatMessages)
+    const model = encodeURIComponent(context.config.model)
+    const response = await this.fetchLLM(joinUrl(context.baseUrl, `/models/${model}:generateContent`), context.headers, body, context.signal)
+    const data = await response.json() as {
+      candidates?: Array<{ content?: { parts?: Array<{ text?: string }> }; finishReason?: string }>
+      usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number; totalTokenCount?: number }
+    }
+    const candidate = data.candidates?.[0]
+
+    return {
+      content: candidate ? geminiTextFromCandidate(candidate) : '',
+      finishReason: candidate?.finishReason ?? 'stop',
+      usage: parseUsage(data),
+    }
+  }
+
+  private async *streamChatCompletion(context: ReturnType<NativeEngine['buildRequestContext']>): AsyncGenerator<string, void, unknown> {
+    const body = openAICompatibleBody(context.config, context.preset, context.chatMessages, true)
+    const response = await this.fetchLLM(joinUrl(context.baseUrl, '/chat/completions'), context.headers, body, context.signal)
     yield* this.consumeSSE(response, (parsed) => parsed.choices?.[0]?.delta?.content)
   }
 
-  private async *streamCompletion(
-    baseUrl: string, config: LLMConfig, preset: any,
-    character: CharacterCard, messages: Array<{ role: string; content: string }>,
-    macroEnv: MacroEnv,
-    signal?: AbortSignal, worldEntries?: MatchedEntry[],
-  ): AsyncGenerator<string, void, unknown> {
-    const prompt = buildCompletionPrompt(messages, character, macroEnv, worldEntries)
-    const body = {
-      model: config.model,
-      prompt,
-      temperature: preset.temperature,
-      top_p: preset.top_p,
-      max_tokens: preset.max_tokens,
-      repetition_penalty: preset.repetition_penalty,
-      stream: true,
-    }
-
-    const response = await this.fetchLLM(`${baseUrl}/v1/completions`, config.apiKey, body, signal)
+  private async *streamCompletion(context: ReturnType<NativeEngine['buildRequestContext']>): AsyncGenerator<string, void, unknown> {
+    const body = completionBody(context.config, context.preset, context.prompt, true)
+    const response = await this.fetchLLM(joinUrl(context.baseUrl, '/completions'), context.headers, body, context.signal)
     yield* this.consumeSSE(response, (parsed) => parsed.choices?.[0]?.text)
   }
 
-  private async fetchLLM(url: string, apiKey: string, body: unknown, signal?: AbortSignal): Promise<Response> {
-    console.log('[LLM] →', url, JSON.stringify(body))
+  private async *streamAnthropic(context: ReturnType<NativeEngine['buildRequestContext']>): AsyncGenerator<string, void, unknown> {
+    const body = anthropicBody(context.config, context.preset, context.chatMessages, true)
+    const response = await this.fetchLLM(joinUrl(context.baseUrl, '/messages'), context.headers, body, context.signal)
+    yield* this.consumeSSE(response, (parsed) => {
+      if (parsed.type === 'content_block_delta') return parsed.delta?.text
+      if (parsed.type === 'message_delta') return undefined
+      return undefined
+    })
+  }
+
+  private async *streamGemini(context: ReturnType<NativeEngine['buildRequestContext']>): AsyncGenerator<string, void, unknown> {
+    const body = geminiBody(context.config, context.preset, context.chatMessages)
+    const model = encodeURIComponent(context.config.model)
+    const response = await this.fetchLLM(joinUrl(context.baseUrl, `/models/${model}:streamGenerateContent?alt=sse`), context.headers, body, context.signal)
+    yield* this.consumeSSE(response, (parsed) => {
+      const candidate = parsed.candidates?.[0]
+      return candidate ? geminiTextFromCandidate(candidate) : undefined
+    })
+  }
+
+  private async fetchLLM(url: string, headers: Record<string, string>, body: unknown, signal?: AbortSignal): Promise<Response> {
+    console.log('[LLM] ->', url)
     let response: Response
     try {
       response = await fetch(url, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${apiKey}`,
-        },
+        headers,
         body: JSON.stringify(body),
         signal,
       })
@@ -307,7 +580,7 @@ export class NativeEngine implements Engine {
 
     if (!response.ok) {
       const errorText = await response.text()
-      console.error('[LLM] API error:', url, response.status, errorText)
+      console.error('[LLM] API error:', url, response.status, errorText.slice(0, 500))
       let detail = errorText
       try {
         const parsed = JSON.parse(errorText)
