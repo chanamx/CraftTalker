@@ -1,6 +1,5 @@
 import { AppError, ErrorCode } from './errors.js'
 import { resolveLlmSessionApiKey } from '../services/llm-session.service.js'
-import type { ChatCompletionSource } from '../services/llm.service.js'
 import { z } from 'zod'
 
 const legacyTypeSchema = z.enum(['openai', 'kobold', 'textgen', 'novel', 'custom'])
@@ -9,8 +8,10 @@ export const llmApiFormatSchema = z.enum([
   'openai_chat',
   'openai_completion',
   'openai_responses',
+  'azure_openai_chat',
   'anthropic_messages',
   'gemini_generate_content',
+  'ollama_native_chat',
   // Legacy names accepted from earlier ST/TauriTavern mapping work.
   'claude_messages',
   'gemini_interactions',
@@ -40,8 +41,10 @@ const llmSourceSchema = z.enum([
   'kobold',
   'textgen',
   'ollama',
+  'ollama_native',
   'llamacpp',
   'vllm',
+  'lmstudio',
   'custom_openai_chat',
   'custom_openai_responses',
   'custom_claude',
@@ -76,22 +79,10 @@ export const llmConfigSchema = z.object({
   regionEndpoint: z.string().optional(),
 })
 
-export interface LlmConfigWithSession {
-  source?: ChatCompletionSource
-  apiUrl: string
-  apiKey: string
-  apiKeySessionId?: string
-  model: string
-  type: 'openai' | 'kobold' | 'textgen' | 'novel' | 'custom'
-  useReverseProxy?: boolean
-  reverseProxyUrl?: string
-  reverseProxyPassword?: string
-  reverseProxyName?: string
-  customApiFormat?: z.infer<typeof llmApiFormatSchema>
-  customHeaders?: Record<string, string>
-  customBodyFields?: Record<string, unknown>
-  excludeBodyFields?: string[]
-}
+export type ChatCompletionSource = z.infer<typeof llmSourceSchema>
+export type CustomAPIFormat = z.infer<typeof llmApiFormatSchema>
+export type LLMConfig = z.infer<typeof llmConfigSchema>
+export type LlmConfigWithSession = LLMConfig
 
 export function resolveLlmConfigApiKey<T extends LlmConfigWithSession>(config: T): T {
   if (!config.apiKeySessionId) return config

@@ -15,6 +15,7 @@ describe('API Provider Configuration', () => {
     it('should have all required providers', () => {
       const requiredProviders = [
         'openai',
+        'azure_openai',
         'anthropic',
         'google',
         'gemini',
@@ -24,6 +25,7 @@ describe('API Provider Configuration', () => {
         'moonshot',
         'siliconflow',
         'ollama',
+        'ollama_native',
         'lmstudio',
         'vllm',
         'llamacpp',
@@ -103,6 +105,14 @@ describe('API Provider Configuration', () => {
       const headers = buildHeaders('gemini', 'test-key')
 
       expect(headers['x-goog-api-key']).toBe('test-key')
+      expect(headers['Content-Type']).toBe('application/json')
+    })
+
+    it('should build Azure OpenAI headers with api-key auth', () => {
+      const headers = buildHeaders('azure_openai', 'test-key')
+
+      expect(headers['api-key']).toBe('test-key')
+      expect(headers['Authorization']).toBeUndefined()
       expect(headers['Content-Type']).toBe('application/json')
     })
 

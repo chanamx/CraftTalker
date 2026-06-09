@@ -1,59 +1,10 @@
 import type { GenerationPreset } from './preset.service.js'
 import type { CharacterCard } from '../lib/png-parser.js'
+import type { LLMConfig as SharedLLMConfig } from '../lib/llm-config.js'
 import { createError, ErrorCode, AppError } from '../lib/errors.js'
 
-/**
- * Chat Completion API 源类型
- */
-export type ChatCompletionSource =
-  | 'openai' | 'anthropic' | 'google' | 'azure_openai' | 'vertexai'
-  | 'openrouter' | 'groq' | 'fireworks' | 'togetherai' | 'perplexity'
-  | 'deepseek' | 'moonshot' | 'siliconflow' | 'minimax' | 'zhipu'
-  | 'mistral' | 'cohere' | 'ai21' | 'xai' | 'pollinations'
-  | 'kobold' | 'textgen' | 'ollama' | 'llamacpp' | 'vllm'
-  | 'custom_openai_chat' | 'custom_openai_responses' | 'custom_claude' | 'custom_gemini'
-
-/**
- * 自定义 API 格式
- */
-export type CustomAPIFormat =
-  | 'openai_chat'        // OpenAI Chat Completions: /chat/completions
-  | 'openai_completion'  // OpenAI-compatible legacy Completions: /completions
-  | 'openai_responses'   // OpenAI Responses: /responses
-  | 'anthropic_messages' // Claude Messages: /messages
-  | 'gemini_generate_content' // Gemini generateContent: /models/{model}:generateContent
-  | 'claude_messages'    // Legacy alias accepted for saved configs
-  | 'gemini_interactions' // Legacy alias accepted for saved configs
-
-export interface LLMConfig {
-  // 新增字段
-  source?: ChatCompletionSource
-  useReverseProxy?: boolean
-  reverseProxyUrl?: string
-  reverseProxyPassword?: string
-  reverseProxyName?: string
-  customApiFormat?: CustomAPIFormat
-  customHeaders?: Record<string, string>
-  customBodyFields?: Record<string, unknown>
-  excludeBodyFields?: string[]
-  azureConfig?: {
-    resourceName: string
-    deploymentName: string
-    apiVersion: string
-  }
-  vertexConfig?: {
-    projectId: string
-    region: string
-    authMode: 'express' | 'service_account'
-  }
-  regionEndpoint?: string
-
-  // 核心字段（保持兼容）
-  apiUrl: string
-  apiKey: string
-  model: string
-  type: 'openai' | 'kobold' | 'textgen' | 'novel' | 'custom'
-}
+export type { ChatCompletionSource, CustomAPIFormat } from '../lib/llm-config.js'
+export type LLMConfig = SharedLLMConfig
 
 export interface GenerateRequest {
   messages: Array<{ role: string; content: string }>
@@ -157,6 +108,14 @@ async function handleLlmFetchError(error: unknown, baseUrl: string): Promise<nev
   )
 }
 
+async function fetchLlm(url: string, init: RequestInit, baseUrl: string): Promise<Response> {
+  try {
+    return await fetch(url, init)
+  } catch (error) {
+    return await handleLlmFetchError(error, baseUrl)
+  }
+}
+
 export async function generateText(request: GenerateRequest): Promise<GenerateResponse> {
   const { config, preset, character, messages } = request
   const baseUrl = normalizeApiUrl(config.apiUrl)
@@ -175,30 +134,25 @@ export async function generateText(request: GenerateRequest): Promise<GenerateRe
       stream: false,
     }
 
-    let response: Response
-    try {
-      response = await fetch(`${baseUrl}/v1/chat/completions`, {
+    const response = await fetchLlm(`${baseUrl}/v1/chat/completions`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${config.apiKey}`,
         },
         body: JSON.stringify(body),
-      })
-    } catch (error) {
-      await handleLlmFetchError(error, baseUrl)
-    }
+      }, baseUrl)
 
-    if (!response!.ok) {
-      const errorText = await response!.text()
+    if (!response.ok) {
+      const errorText = await response.text()
       throw createError(
         ErrorCode.LLM_API_ERROR,
         'LLM API 请求失败',
-        { status: response!.status, errorText, apiUrl: baseUrl }
+        { status: response.status, errorText, apiUrl: baseUrl }
       )
     }
 
-    const data = await response!.json() as {
+    const data = await response.json() as {
       choices: Array<{ message: { content: string }; finish_reason: string }>
       usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number }
     }
@@ -226,30 +180,25 @@ export async function generateText(request: GenerateRequest): Promise<GenerateRe
     stop: ['\n用户:', '\nUser:', ''],
   }
 
-  let response: Response
-  try {
-    response = await fetch(`${baseUrl}/v1/completions`, {
+  const response = await fetchLlm(`${baseUrl}/v1/completions`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${config.apiKey}`,
       },
       body: JSON.stringify(body),
-    })
-  } catch (error) {
-    await handleLlmFetchError(error, baseUrl)
-  }
+    }, baseUrl)
 
-  if (!response!.ok) {
-    const errorText = await response!.text()
+  if (!response.ok) {
+    const errorText = await response.text()
     throw createError(
       ErrorCode.LLM_API_ERROR,
       'LLM API 请求失败',
-      { status: response!.status, errorText, apiUrl: baseUrl }
+      { status: response.status, errorText, apiUrl: baseUrl }
     )
   }
 
-  const data = await response!.json() as {
+  const data = await response.json() as {
     choices: Array<{ text: string; finish_reason: string }>
     usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number }
   }
@@ -283,24 +232,14 @@ export async function* generateTextStream(request: GenerateRequest): AsyncGenera
       stream: true,
     }
 
-    let response: Response
-    try {
-      response = await fetch(`${baseUrl}/v1/chat/completions`, {
+    const response = await fetchLlm(`${baseUrl}/v1/chat/completions`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${config.apiKey}`,
         },
         body: JSON.stringify(body),
-      })
-    } catch (error) {
-      if (error instanceof AppError) throw error
-      throw createError(
-        ErrorCode.LLM_CONNECTION_ERROR,
-        'LLM 服务连接失败',
-        { originalError: String(error), apiUrl: baseUrl }
-      )
-    }
+      }, baseUrl)
 
     if (!response.ok) {
       const errorText = await response.text()

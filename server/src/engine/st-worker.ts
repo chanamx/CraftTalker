@@ -3,6 +3,10 @@ import { buildSTPrompt } from '../lib/prompt-builder.js'
 import type { EngineRequest, EngineResponse } from './types.js'
 
 const { stPath: _stPath } = workerData as { stPath: string | null }
+if (!parentPort) {
+  throw new Error('ST worker must be started from a worker thread')
+}
+const workerPort = parentPort
 
 interface WorkerMsg {
   id: string
@@ -10,7 +14,19 @@ interface WorkerMsg {
   payload: unknown
 }
 
-parentPort!.on('message', async (msg: WorkerMsg) => {
+interface ChatCompletionResponse {
+  choices?: Array<{
+    message?: { content?: string }
+    finish_reason?: string
+  }>
+  usage?: {
+    prompt_tokens?: number
+    completion_tokens?: number
+    total_tokens?: number
+  }
+}
+
+workerPort.on('message', async (msg: WorkerMsg) => {
   const { id, type, payload } = msg
 
   try {
@@ -22,7 +38,7 @@ parentPort!.on('message', async (msg: WorkerMsg) => {
           messages: req.messages,
         })
         const response = await callLLM(req, messages)
-        parentPort!.postMessage({ id, type: 'result', payload: response })
+        workerPort.postMessage({ id, type: 'result', payload: response })
         break
       }
 
@@ -33,24 +49,24 @@ parentPort!.on('message', async (msg: WorkerMsg) => {
           messages: req.messages,
         })
         await streamLLM(req, messages, (chunk) => {
-          parentPort!.postMessage({ id, type: 'stream-chunk', payload: chunk })
+          workerPort.postMessage({ id, type: 'stream-chunk', payload: chunk })
         })
-        parentPort!.postMessage({ id, type: 'stream-end' })
+        workerPort.postMessage({ id, type: 'stream-end' })
         break
       }
 
       case 'test': {
         const req = payload as { apiUrl: string; apiKey: string; model: string; type: string }
         const ok = await testConnection(req)
-        parentPort!.postMessage({ id, type: 'result', payload: ok })
+        workerPort.postMessage({ id, type: 'result', payload: ok })
         break
       }
 
       default:
-        parentPort!.postMessage({ id, type: 'error', payload: `未知请求类型: ${type}` })
+        workerPort.postMessage({ id, type: 'error', payload: `未知请求类型: ${type}` })
     }
   } catch (err) {
-    parentPort!.postMessage({ id, type: 'error', payload: String(err) })
+    workerPort.postMessage({ id, type: 'error', payload: String(err) })
   }
 })
 
@@ -87,15 +103,15 @@ async function callLLM(
     throw new Error(`LLM API error ${res.status}: ${text}`)
   }
 
-  const data = await res.json() as any
+  const data = await res.json() as ChatCompletionResponse
   const choice = data.choices?.[0]
   return {
     content: choice?.message?.content ?? '',
     finishReason: choice?.finish_reason ?? 'stop',
     usage: data.usage ? {
-      promptTokens: data.usage.prompt_tokens,
-      completionTokens: data.usage.completion_tokens,
-      totalTokens: data.usage.total_tokens,
+      promptTokens: data.usage.prompt_tokens ?? 0,
+      completionTokens: data.usage.completion_tokens ?? 0,
+      totalTokens: data.usage.total_tokens ?? 0,
     } : undefined,
   }
 }

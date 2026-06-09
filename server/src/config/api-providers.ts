@@ -31,8 +31,10 @@ export const API_FORMATS = [
   'openai_chat',
   'openai_completion',
   'openai_responses',
+  'azure_openai_chat',
   'anthropic_messages',
   'gemini_generate_content',
+  'ollama_native_chat',
 ] as const
 
 export type APIFormat = typeof API_FORMATS[number]
@@ -259,15 +261,43 @@ export const MOONSHOT_CONFIG = openAICompatibleProvider('moonshot', 'Moonshot/Ki
 export const SILICONFLOW_CONFIG = openAICompatibleProvider('siliconflow', 'SiliconFlow', 'https://api.siliconflow.cn/v1')
 export const XAI_CONFIG = openAICompatibleProvider('xai', 'xAI', 'https://api.x.ai/v1')
 export const OLLAMA_CONFIG = openAICompatibleProvider('ollama', 'Ollama', 'http://localhost:11434/v1')
+export const OLLAMA_NATIVE_CONFIG = openAICompatibleProvider(
+  'ollama_native',
+  'Ollama Native',
+  'http://localhost:11434',
+  {
+    apiFormat: 'ollama_native_chat',
+  },
+)
 export const LMSTUDIO_CONFIG = openAICompatibleProvider('lmstudio', 'LM Studio', 'http://localhost:1234/v1')
 export const VLLM_CONFIG = openAICompatibleProvider('vllm', 'vLLM', 'http://localhost:8000/v1')
 export const LLAMACPP_CONFIG = openAICompatibleProvider('llamacpp', 'llama.cpp', 'http://localhost:8080/v1')
+
+export const AZURE_OPENAI_CONFIG: APIProviderConfig = {
+  id: 'azure_openai',
+  name: 'Azure OpenAI',
+  defaultEndpoint: 'https://{resource}.openai.azure.com',
+  apiFormat: 'azure_openai_chat',
+  supportsStreaming: true,
+  authType: 'api-key',
+  authHeader: 'api-key',
+  requiredHeaders: {
+    'Content-Type': 'application/json',
+  },
+  reverseProxies: [],
+  modelDefaults: {
+    temperature: 0.7,
+    maxTokens: 4096,
+    topP: 1,
+  },
+}
 
 /**
  * 所有 API 提供商配置
  */
 export const API_PROVIDERS: Record<string, APIProviderConfig> = {
   openai: OPENAI_CONFIG,
+  azure_openai: AZURE_OPENAI_CONFIG,
   openrouter: OPENROUTER_CONFIG,
   anthropic: ANTHROPIC_CONFIG,
   google: GOOGLE_CONFIG,
@@ -281,6 +311,7 @@ export const API_PROVIDERS: Record<string, APIProviderConfig> = {
   siliconflow: SILICONFLOW_CONFIG,
   xai: XAI_CONFIG,
   ollama: OLLAMA_CONFIG,
+  ollama_native: OLLAMA_NATIVE_CONFIG,
   lmstudio: LMSTUDIO_CONFIG,
   vllm: VLLM_CONFIG,
   llamacpp: LLAMACPP_CONFIG,

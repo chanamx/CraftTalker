@@ -2,7 +2,7 @@ import { Worker } from 'node:worker_threads'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { Engine, EngineRequest, EngineResponse } from './types.js'
-import type { LLMConfig } from '../services/llm.service.js'
+import type { LLMConfig } from '../lib/llm-config.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
@@ -21,7 +21,7 @@ export class STEngine implements Engine {
   private worker: Worker | null = null
   private stPath: string | null = null
   private pendingRequests = new Map<string, {
-    resolve: (value: any) => void
+    resolve: (value: unknown) => void
     reject: (error: Error) => void
     chunks?: string[]
     onChunk?: (chunk: string) => void
@@ -81,7 +81,10 @@ export class STEngine implements Engine {
   private sendRequest<T>(type: string, payload: unknown): Promise<T> {
     const id = crypto.randomUUID()
     return new Promise(async (resolve, reject) => {
-      this.pendingRequests.set(id, { resolve, reject })
+      this.pendingRequests.set(id, {
+        resolve: (value) => { resolve(value as T) },
+        reject,
+      })
       const worker = await this.ensureWorker()
       worker.postMessage({ id, type, payload })
     })

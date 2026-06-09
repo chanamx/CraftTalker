@@ -36,7 +36,9 @@ interface ProviderOption {
 const PROVIDERS: ProviderOption[] = [
   { value: 'lmstudio', label: 'LM Studio', endpoint: 'http://localhost:1234/v1', type: 'openai', format: 'openai_chat', model: 'local-model', description: '本地 OpenAI-compatible 服务' },
   { value: 'ollama', label: 'Ollama', endpoint: 'http://localhost:11434/v1', type: 'openai', format: 'openai_chat', model: 'llama3.1', description: '本地 Ollama OpenAI-compatible API' },
+  { value: 'ollama_native', label: 'Ollama Native', endpoint: 'http://localhost:11434', type: 'openai', format: 'ollama_native_chat', model: 'llama3.1', description: 'Ollama 原生 /api/chat 与 /api/tags' },
   { value: 'openai', label: 'OpenAI', endpoint: 'https://api.openai.com/v1', type: 'openai', format: 'openai_chat', model: 'gpt-4o-mini', description: '官方 OpenAI Chat Completions' },
+  { value: 'azure_openai', label: 'Azure OpenAI', endpoint: 'https://{resource}.openai.azure.com', type: 'openai', format: 'azure_openai_chat', model: 'deployment-name', description: 'Azure deployment Chat Completions' },
   { value: 'openrouter', label: 'OpenRouter', endpoint: 'https://openrouter.ai/api/v1', type: 'openai', format: 'openai_chat', model: 'openai/gpt-4o-mini', description: '多模型路由与中转' },
   { value: 'anthropic', label: 'Claude / Anthropic', endpoint: 'https://api.anthropic.com/v1', type: 'openai', format: 'anthropic_messages', model: 'claude-3-5-haiku-latest', description: 'Claude Messages API' },
   { value: 'google', label: 'Gemini', endpoint: 'https://generativelanguage.googleapis.com/v1beta', type: 'openai', format: 'gemini_generate_content', model: 'gemini-2.0-flash', description: 'Google Gemini generateContent API' },
@@ -60,8 +62,10 @@ const PROVIDER_BY_SOURCE = new Map(PROVIDERS.map(provider => [provider.value, pr
 const API_FORMATS: { value: CustomAPIFormat; label: string }[] = [
   { value: 'openai_chat', label: 'OpenAI Chat Completions' },
   { value: 'openai_completion', label: 'OpenAI Legacy Completions' },
+  { value: 'azure_openai_chat', label: 'Azure OpenAI Chat Completions' },
   { value: 'anthropic_messages', label: 'Claude Messages' },
   { value: 'gemini_generate_content', label: 'Gemini generateContent' },
+  { value: 'ollama_native_chat', label: 'Ollama Native Chat' },
   { value: 'openai_responses', label: 'OpenAI Responses（实验）' },
 ]
 
@@ -82,6 +86,14 @@ function textToHeaders(text: string): Record<string, string> | undefined {
     if (key && value) headers[key] = value
   }
   return Object.keys(headers).length > 0 ? headers : undefined
+}
+
+function defaultAzureConfig(config: LLMConfig): NonNullable<LLMConfig['azureConfig']> {
+  return {
+    resourceName: config.azureConfig?.resourceName ?? '',
+    deploymentName: config.azureConfig?.deploymentName || config.model || 'deployment-name',
+    apiVersion: config.azureConfig?.apiVersion || '2024-10-21',
+  }
 }
 
 export function SettingsDialog({ open, onClose, config, onSave }: SettingsDialogProps) {
@@ -128,14 +140,20 @@ export function SettingsDialog({ open, onClose, config, onSave }: SettingsDialog
       return
     }
 
-    setLocal(s => ({
-      ...s,
-      source,
-      apiUrl: s.apiUrl === activeProvider?.endpoint || !s.apiUrl.trim() ? provider.endpoint : s.apiUrl,
-      type: provider.type,
-      customApiFormat: provider.format,
-      model: s.model === activeProvider?.model || !s.model.trim() ? provider.model : s.model,
-    }))
+    setLocal(s => {
+      const model = s.model === activeProvider?.model || !s.model.trim() ? provider.model : s.model
+      return {
+        ...s,
+        source,
+        apiUrl: s.apiUrl === activeProvider?.endpoint || !s.apiUrl.trim() ? provider.endpoint : s.apiUrl,
+        type: provider.type,
+        customApiFormat: provider.format,
+        model,
+        azureConfig: source === 'azure_openai'
+          ? defaultAzureConfig({ ...s, model })
+          : s.azureConfig,
+      }
+    })
   }
 
   const handleSave = async () => {
@@ -305,6 +323,59 @@ export function SettingsDialog({ open, onClose, config, onSave }: SettingsDialog
                             ))}
                           </select>
                         </Field>
+
+                        {(local.source === 'azure_openai' || local.customApiFormat === 'azure_openai_chat') && (
+                          <>
+                            <Field label="Azure Resource" icon={<Globe size={15} />}>
+                              <input
+                                type="text"
+                                value={local.azureConfig?.resourceName ?? ''}
+                                onChange={e => setLocal(s => ({
+                                  ...s,
+                                  azureConfig: {
+                                    ...defaultAzureConfig(s),
+                                    resourceName: e.target.value,
+                                  },
+                                }))}
+                                placeholder="my-resource"
+                                className="w-full h-9 px-3 rounded-lg bg-[var(--color-bg-surface)] border border-[var(--color-border-subtle)] text-sm text-[var(--color-text-primary)] placeholder:text-[var(--color-text-muted)] focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)]/20 focus:border-[var(--color-accent)]/30"
+                              />
+                            </Field>
+
+                            <Field label="Azure Deployment" icon={<Cpu size={15} />}>
+                              <input
+                                type="text"
+                                value={local.azureConfig?.deploymentName ?? local.model}
+                                onChange={e => setLocal(s => ({
+                                  ...s,
+                                  model: e.target.value,
+                                  azureConfig: {
+                                    ...defaultAzureConfig(s),
+                                    deploymentName: e.target.value,
+                                  },
+                                }))}
+                                placeholder="gpt-4o-mini-deployment"
+                                className="w-full h-9 px-3 rounded-lg bg-[var(--color-bg-surface)] border border-[var(--color-border-subtle)] text-sm text-[var(--color-text-primary)] placeholder:text-[var(--color-text-muted)] focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)]/20 focus:border-[var(--color-accent)]/30"
+                              />
+                            </Field>
+
+                            <Field label="Azure API Version" icon={<Braces size={15} />}>
+                              <input
+                                type="text"
+                                value={local.azureConfig?.apiVersion ?? '2024-10-21'}
+                                onChange={e => setLocal(s => ({
+                                  ...s,
+                                  azureConfig: {
+                                    ...defaultAzureConfig(s),
+                                    apiVersion: e.target.value,
+                                  },
+                                }))}
+                                placeholder="2024-10-21"
+                                className="w-full h-9 px-3 rounded-lg bg-[var(--color-bg-surface)] border border-[var(--color-border-subtle)] text-sm text-[var(--color-text-primary)] placeholder:text-[var(--color-text-muted)] focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)]/20 focus:border-[var(--color-accent)]/30"
+                              />
+                            </Field>
+                          </>
+                        )}
 
                         <Field label="反向代理地址" icon={<Route size={15} />}>
                           <input

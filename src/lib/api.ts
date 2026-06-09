@@ -1,21 +1,8 @@
+import type { LLMConfig } from '@/types'
+
 const BASE = '/api'
 
-export interface LlmRequestConfig {
-  source?: string
-  apiUrl: string
-  apiKey: string
-  apiKeySessionId?: string
-  model: string
-  type: string
-  useReverseProxy?: boolean
-  reverseProxyUrl?: string
-  reverseProxyPassword?: string
-  reverseProxyName?: string
-  customApiFormat?: string
-  customHeaders?: Record<string, string>
-  customBodyFields?: Record<string, unknown>
-  excludeBodyFields?: string[]
-}
+export type LlmRequestConfig = LLMConfig
 
 export interface ApiError {
   error: string
@@ -35,6 +22,36 @@ export class ApiRequestError extends Error {
   }
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+async function readJson(response: Response): Promise<unknown> {
+  return await response.json()
+}
+
+function toApiError(value: unknown, fallback: ApiError): ApiError {
+  if (!isRecord(value) || typeof value.error !== 'string') return fallback
+  return {
+    error: value.error,
+    code: typeof value.code === 'number' ? value.code : fallback.code,
+    details: isRecord(value.details) ? value.details : undefined,
+  }
+}
+
+function parseStreamPayload(value: unknown): { content?: string; error?: ApiError } {
+  if (!isRecord(value)) return {}
+  if (isRecord(value.error) || typeof value.error === 'string') {
+    return {
+      error: toApiError(value.error, {
+        error: typeof value.error === 'string' ? value.error : 'Stream error',
+        code: -1,
+      }),
+    }
+  }
+  return typeof value.content === 'string' ? { content: value.content } : {}
+}
+
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE}${url}`, {
     headers: { 'Content-Type': 'application/json' },
@@ -42,14 +59,14 @@ async function request<T>(url: string, options?: RequestInit): Promise<T> {
   })
 
   if (!res.ok) {
-    const err = await res.json().catch(() => ({
+    const err = toApiError(await readJson(res).catch(() => null), {
       error: res.statusText,
       code: -1,
-    })) as ApiError
+    })
     throw new ApiRequestError(err, res.status)
   }
 
-  return res.json()
+  return await readJson(res) as T
 }
 
 export interface CharacterIndex {
@@ -288,9 +305,9 @@ export async function consumeSSEStream(
         }
 
         try {
-          const parsed = JSON.parse(data)
+          const parsed = parseStreamPayload(JSON.parse(data) as unknown)
           if (parsed.error) {
-            callbacks.onError?.(parsed as ApiError)
+            callbacks.onError?.(parsed.error)
             return
           }
           if (parsed.content) {

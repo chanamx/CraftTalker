@@ -1,12 +1,18 @@
 import { Hono } from 'hono'
 import { zValidator } from '@hono/zod-validator'
-import { buildEndpointUrl, buildHeaders, getProviderConfig } from '../config/api-providers.js'
 import { llmConfigSchema, resolveLlmConfigApiKey } from '../lib/llm-config.js'
-import type { LLMConfig } from '../services/llm.service.js'
+import {
+  apiFormatFromConfig,
+  headersFromConfig,
+  modelListUrlFromConfig,
+  providerFromConfig,
+} from '../lib/llm-provider.js'
+import type { LLMConfig } from '../lib/llm-config.js'
 
 interface ModelListResponse {
   data?: Array<{ id?: string; object?: string; created?: number; owned_by?: string }>
   models?: Array<{ id?: string; name?: string }>
+  value?: Array<{ id?: string; model?: string }>
   [key: string]: unknown
 }
 
@@ -28,67 +34,15 @@ llmRoutes.post(
   },
 )
 
-function trimTrailingSlashes(value: string): string {
-  return value.replace(/\/+$/, '')
-}
-
-function joinUrl(baseUrl: string, path: string): string {
-  return `${trimTrailingSlashes(baseUrl)}${path.startsWith('/') ? path : `/${path}`}`
-}
-
-function providerFromConfig(config: { source?: string; type: string }): string {
-  if (config.source) {
-    if (config.source === 'google') return 'gemini'
-    if (config.source === 'custom_claude') return 'anthropic'
-    if (config.source === 'custom_gemini') return 'gemini'
-    if (config.source === 'custom_openai_responses') return 'openai'
-    return config.source
-  }
-  if (config.type === 'kobold' || config.type === 'textgen' || config.type === 'novel') return config.type
-  if (config.type === 'custom') return 'custom_openai_chat'
-  return 'openai'
-}
-
-function baseUrlFromConfig(config: {
-  source?: string
-  apiUrl: string
-  useReverseProxy?: boolean
-  reverseProxyUrl?: string
-  reverseProxyName?: string
-}, provider: string): string {
-  if (config.useReverseProxy && config.reverseProxyUrl) return trimTrailingSlashes(config.reverseProxyUrl)
-  if (config.source?.startsWith('custom_')) return trimTrailingSlashes(config.apiUrl)
-
-  const providerConfig = getProviderConfig(provider)
-  if (!providerConfig) return trimTrailingSlashes(config.apiUrl)
-  return trimTrailingSlashes(buildEndpointUrl(provider, config.apiUrl, config.reverseProxyName))
-}
-
-function headersFromConfig(config: {
-  apiKey: string
-  customHeaders?: Record<string, string>
-  reverseProxyName?: string
-}, provider: string): Record<string, string> {
-  if (!getProviderConfig(provider)) {
-    return {
-      'Content-Type': 'application/json',
-      ...(config.apiKey ? { Authorization: `Bearer ${config.apiKey}` } : {}),
-      ...(config.customHeaders ?? {}),
-    }
-  }
-
-  return buildHeaders(provider, config.apiKey, config.customHeaders, config.reverseProxyName)
-}
-
 async function fetchModelsFromAPI(config: LLMConfig): Promise<string[]> {
   const provider = providerFromConfig(config)
-  const baseUrl = baseUrlFromConfig(config, provider)
-  const providerConfig = getProviderConfig(provider)
-  const endpoint = provider === 'ollama' && !providerConfig ? '/api/tags' : '/models'
-  const url = joinUrl(baseUrl, endpoint)
+  const apiFormat = apiFormatFromConfig(config)
+  const url = modelListUrlFromConfig(config)
   const headers = headersFromConfig(config, provider)
 
-  console.log('[LLM] Fetching models from:', url)
+  if (process.env.DEBUG_LLM === 'true') {
+    console.info('[LLM] Fetching models from:', url)
+  }
 
   const response = await fetch(url, {
     method: 'GET',
@@ -101,10 +55,14 @@ async function fetchModelsFromAPI(config: LLMConfig): Promise<string[]> {
   }
 
   const data = await response.json() as ModelListResponse
-  return parseModelList(data)
+  return parseModelList(data, apiFormat)
 }
 
-function parseModelList(data: ModelListResponse | unknown[]): string[] {
+function parseModelList(data: ModelListResponse | unknown[], apiFormat?: string): string[] {
+  if (!Array.isArray(data) && apiFormat === 'azure_openai_chat' && data.value && Array.isArray(data.value)) {
+    return data.value.map(m => m.id || m.model || '').filter(Boolean)
+  }
+
   if (!Array.isArray(data) && data.data && Array.isArray(data.data)) {
     return data.data.map(m => m.id ?? '').filter(Boolean)
   }

@@ -65,17 +65,30 @@ Do not conflate these layers:
     Groq, Fireworks, Together, Perplexity, DeepSeek, Moonshot/Kimi,
     SiliconFlow, xAI, Mistral, Cohere, Ollama, LM Studio, vLLM, llama.cpp, and
     custom OpenAI/Claude/Gemini-compatible endpoints.
+  - Provider routing is centralized through shared backend helpers, so
+    `NativeEngine`, connection tests, and `/api/llm/models` use the same source,
+    API format, base URL, header, and model-list URL decisions.
   - `NativeEngine` routes OpenAI-compatible chat/completions, Claude Messages,
     and Gemini generateContent/streamGenerateContent with provider-specific
     URL, header, and body mapping.
   - OpenAI-compatible providers use `Authorization: Bearer <key>`; Claude uses
     `x-api-key` plus `anthropic-version`; Gemini uses `x-goog-api-key`;
     OpenRouter includes attribution headers by default.
+  - Azure OpenAI is active runtime behavior: deployment-scoped chat completions
+    URLs with `api-version`, `api-key` auth, no default OpenAI `model` body
+    field, and deployment listing for model discovery.
+  - Ollama has both OpenAI-compatible `/v1` and native `/api` paths. Native
+    Ollama posts to `/api/chat`, parses NDJSON streaming, lists `/api/tags`,
+    and omits auth when no key is configured.
+  - `lmstudio` is accepted by backend schemas as a first-class source, matching
+    the frontend default local provider.
   - `/api/llm/models` is mounted and uses the shared provider catalog plus
     server-side key-session resolution.
   - Settings and onboarding expose provider/source selection with sensible
     default endpoints. Reverse proxy URL, custom headers, and explicit API
     format controls stay behind developer mode.
+  - Settings and onboarding expose Azure OpenAI and Ollama Native. Azure
+    resource, deployment, and API-version fields stay behind developer mode.
   - New provider settings preserve the existing API-key session model: newly
     entered keys are stored in `/api/llm-sessions`, while frontend settings keep
     only `apiKeySessionId`.
@@ -83,6 +96,12 @@ Do not conflate these layers:
   - Added prompt-time macro resolution without mutating source data.
   - Added world book matching and injection for character-bound and enabled global world books.
   - Added 7 insertion positions and developer-mode advanced fields.
+  - World-info scanning keeps the synchronous compatibility contract while
+    supporting delayed entries plus ST-like sticky/cooldown timed metadata
+    persisted in chat metadata.
+  - Vectorized world-info entries are skipped with scan metadata until a real
+    embedding/vector runtime exists, instead of being treated as normal keyword
+    entries.
 - Character/world import:
   - PNG imports keep `character.png` as the original card and avoid duplicate `avatar.png` unless user sets a custom avatar.
   - Character-card embedded `character_book` is extracted into a bound world book.
@@ -136,11 +155,11 @@ Do not conflate these layers:
 
 ## Current Verification Baseline
 
-Most recent known good verification:
+Most recent known good verification from 2026-06-09:
 
-- Frontend `npm run test`: 26 test files, 164 tests passed.
+- Frontend `npm run test`: 27 test files, 174 tests passed.
 - Frontend `npm run build`: passed; only large chunk warnings remain.
-- Backend `npm run test`: 16 test files, 125 tests passed.
+- Backend `npm run test`: 17 test files, 135 tests passed.
 - Backend `npm run build`: passed.
 - `git diff --check`: no whitespace errors.
 

@@ -49,6 +49,13 @@ function jsonResponse(data: unknown): Response {
   })
 }
 
+function streamResponse(text: string): Response {
+  return new Response(text, {
+    status: 200,
+    headers: { 'Content-Type': 'application/x-ndjson' },
+  })
+}
+
 afterEach(() => {
   vi.unstubAllGlobals()
 })
@@ -177,5 +184,103 @@ describe('NativeEngine provider routing', () => {
     const body = JSON.parse(init.body as string) as Record<string, unknown>
     expect(body.provider_option).toBe(true)
     expect(body.frequency_penalty).toBeUndefined()
+  })
+
+  it('sends Azure OpenAI requests to deployment chat completions with api-key auth', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({
+      choices: [{ message: { content: 'azure reply' }, finish_reason: 'stop' }],
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const engine = new NativeEngine()
+    const result = await engine.generate(request({
+      source: 'azure_openai',
+      apiUrl: 'https://{resource}.openai.azure.com',
+      apiKey: 'azure-key',
+      model: 'gpt-4o-mini-deploy',
+      type: 'openai',
+      azureConfig: {
+        resourceName: 'craft-resource',
+        deploymentName: 'gpt-4o-mini-deploy',
+        apiVersion: '2024-10-21',
+      },
+    }))
+
+    expect(result.content).toBe('azure reply')
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit]
+    expect(url).toBe('https://craft-resource.openai.azure.com/openai/deployments/gpt-4o-mini-deploy/chat/completions?api-version=2024-10-21')
+    expect(init.headers).toMatchObject({
+      'api-key': 'azure-key',
+      'Content-Type': 'application/json',
+    })
+    const body = JSON.parse(init.body as string) as Record<string, unknown>
+    expect(body).toMatchObject({
+      stream: false,
+      max_tokens: 128,
+    })
+    expect(body.model).toBeUndefined()
+    expect(body.messages).toEqual(expect.any(Array))
+  })
+
+  it('uses Ollama native chat without auth for local /api endpoints', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({
+      message: { role: 'assistant', content: 'ollama reply' },
+      done_reason: 'stop',
+      prompt_eval_count: 4,
+      eval_count: 3,
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const engine = new NativeEngine()
+    const result = await engine.generate(request({
+      source: 'ollama_native',
+      apiUrl: 'http://localhost:11434',
+      apiKey: '',
+      model: 'llama3.1',
+      type: 'openai',
+    }))
+
+    expect(result.content).toBe('ollama reply')
+    expect(result.usage?.totalTokens).toBe(7)
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit]
+    expect(url).toBe('http://localhost:11434/api/chat')
+    expect((init.headers as Record<string, string>).Authorization).toBeUndefined()
+    const body = JSON.parse(init.body as string) as Record<string, unknown>
+    expect(body).toMatchObject({
+      model: 'llama3.1',
+      stream: false,
+    })
+    expect(body.messages).toEqual(expect.any(Array))
+    expect(body.options).toMatchObject({
+      temperature: 0.7,
+      top_p: 0.9,
+      num_predict: 128,
+    })
+  })
+
+  it('parses Ollama native NDJSON streaming chunks', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(streamResponse([
+      JSON.stringify({ message: { content: 'hel' }, done: false }),
+      JSON.stringify({ message: { content: 'lo' }, done: false }),
+      JSON.stringify({ done: true }),
+    ].join('\n')))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const engine = new NativeEngine()
+    const chunks: string[] = []
+    for await (const chunk of engine.generateStream(request({
+      source: 'ollama_native',
+      apiUrl: 'http://localhost:11434/api',
+      apiKey: '',
+      model: 'llama3.1',
+      type: 'openai',
+    }))) {
+      chunks.push(chunk)
+    }
+
+    expect(chunks.join('')).toBe('hello')
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit]
+    expect(url).toBe('http://localhost:11434/api/chat')
+    expect(JSON.parse(init.body as string)).toMatchObject({ stream: true })
   })
 })

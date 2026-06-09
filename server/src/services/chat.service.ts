@@ -13,6 +13,7 @@ import {
   createStTimestamp,
   deleteLineAt,
   updateLineAt,
+  updateChatMetadataLine,
   deleteLastAssistantLine,
   type ChatLine,
   type ChatMessage,
@@ -147,6 +148,15 @@ export async function renameChatFile(characterName: string, chatId: string, newN
   return true
 }
 
+export async function updateChatMetadata(
+  characterName: string,
+  chatId: string,
+  chatMetadata: Record<string, unknown>,
+): Promise<boolean> {
+  const filePath = getChatPath(characterName, chatId)
+  return updateChatMetadataLine(filePath, { chat_metadata: chatMetadata })
+}
+
 export async function addSwipe(characterName: string, chatId: string, lineIndex: number, content: string): Promise<ChatLine | null> {
   const filePath = getChatPath(characterName, chatId)
   const lines = await readChatFile(filePath)
@@ -161,8 +171,10 @@ export async function addSwipe(characterName: string, chatId: string, lineIndex:
   }
 
   const sendDate = createStTimestamp()
+  const swipeInfo = line.swipe_info ?? []
+  line.swipe_info = swipeInfo
   line.swipes.push(content)
-  line.swipe_info!.push({ send_date: sendDate })
+  swipeInfo.push({ send_date: sendDate })
   line.swipe_id = line.swipes.length - 1
   line.mes = content
   line.send_date = sendDate

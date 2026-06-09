@@ -15,6 +15,17 @@ export interface LLMConfig {
   customHeaders?: Record<string, string>
   customBodyFields?: Record<string, unknown>
   excludeBodyFields?: string[]
+  azureConfig?: {
+    resourceName: string
+    deploymentName: string
+    apiVersion: string
+  }
+  vertexConfig?: {
+    projectId: string
+    region: string
+    authMode: 'express' | 'service_account'
+  }
+  regionEndpoint?: string
 }
 
 export type ChatCompletionSource =
@@ -41,6 +52,7 @@ export type ChatCompletionSource =
   | 'kobold'
   | 'textgen'
   | 'ollama'
+  | 'ollama_native'
   | 'llamacpp'
   | 'vllm'
   | 'lmstudio'
@@ -53,8 +65,10 @@ export type CustomAPIFormat =
   | 'openai_chat'
   | 'openai_completion'
   | 'openai_responses'
+  | 'azure_openai_chat'
   | 'anthropic_messages'
   | 'gemini_generate_content'
+  | 'ollama_native_chat'
   | 'claude_messages'
   | 'gemini_interactions'
 

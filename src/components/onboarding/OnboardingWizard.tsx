@@ -63,7 +63,9 @@ const QUICK_PROVIDERS: Array<{
 }> = [
   { value: 'lmstudio', label: 'LM Studio', endpoint: 'http://localhost:1234/v1', format: 'openai_chat', model: 'local-model' },
   { value: 'ollama', label: 'Ollama', endpoint: 'http://localhost:11434/v1', format: 'openai_chat', model: 'llama3.1' },
+  { value: 'ollama_native', label: 'Ollama Native', endpoint: 'http://localhost:11434', format: 'ollama_native_chat', model: 'llama3.1' },
   { value: 'openai', label: 'OpenAI', endpoint: 'https://api.openai.com/v1', format: 'openai_chat', model: 'gpt-4o-mini' },
+  { value: 'azure_openai', label: 'Azure OpenAI', endpoint: 'https://{resource}.openai.azure.com', format: 'azure_openai_chat', model: 'deployment-name' },
   { value: 'openrouter', label: 'OpenRouter', endpoint: 'https://openrouter.ai/api/v1', format: 'openai_chat', model: 'openai/gpt-4o-mini' },
   { value: 'anthropic', label: 'Claude', endpoint: 'https://api.anthropic.com/v1', format: 'anthropic_messages', model: 'claude-3-5-haiku-latest' },
   { value: 'google', label: 'Gemini', endpoint: 'https://generativelanguage.googleapis.com/v1beta', format: 'gemini_generate_content', model: 'gemini-2.0-flash' },
@@ -153,6 +155,13 @@ export function OnboardingWizard({ characters, onSelectCharacter, onComplete }: 
                     model: provider.model,
                     type: provider.value === 'custom_openai_chat' ? 'custom' : 'openai',
                     customApiFormat: provider.format,
+                    azureConfig: provider.value === 'azure_openai'
+                      ? {
+                        resourceName: localConfig.azureConfig?.resourceName ?? '',
+                        deploymentName: localConfig.azureConfig?.deploymentName || provider.model,
+                        apiVersion: localConfig.azureConfig?.apiVersion || '2024-10-21',
+                      }
+                      : localConfig.azureConfig,
                   })
                 }}
                 className={cn(inputCls, 'mb-2')}

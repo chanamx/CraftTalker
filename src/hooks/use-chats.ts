@@ -1,5 +1,5 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { api, type ChatInfo, type ChatDetail, type PresetType, ApiRequestError } from '@/lib/api'
+import { api, type ChatInfo, type ChatDetail, type LlmRequestConfig, type PresetType, ApiRequestError } from '@/lib/api'
 
 export function useChats(characterName: string | null) {
   return useQuery<ChatInfo[]>({
@@ -73,7 +73,7 @@ export function useGenerateStream() {
     }: {
       characterName: string
       chatId: string
-      config: { apiUrl: string; apiKey: string; model: string; type: string }
+      config: LlmRequestConfig
       presetType?: PresetType
       presetName?: string
       signal?: AbortSignal
