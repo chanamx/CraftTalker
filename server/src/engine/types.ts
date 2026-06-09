@@ -1,6 +1,6 @@
 import type { CharacterCard } from '../lib/png-parser.js'
 import type { GenerationPreset } from '../services/preset.service.js'
-import type { LLMConfig } from '../services/llm.service.js'
+import type { LLMConfig } from '../lib/llm-config.js'
 import type { MatchedEntry } from '../lib/world-match.js'
 
 export interface EngineMessage {
