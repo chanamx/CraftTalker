@@ -4,6 +4,15 @@ import { X, Globe, Key, Cpu, Zap, Check, Loader2, Code, Braces, Route } from 'lu
 import { cn } from '@/lib/utils'
 import { api } from '@/lib/api'
 import { useSettingsStore } from '@/stores/settings-store'
+import {
+  API_FORMAT_OPTIONS,
+  API_TYPE_OPTIONS,
+  LLM_PROVIDER_OPTIONS,
+  PROVIDER_BY_SOURCE,
+  apiFormatLabel,
+  endpointSuffixForFormat,
+  normalizedConfigForProvider,
+} from '@/lib/llm-provider-options'
 import type { ChatCompletionSource, CustomAPIFormat, LLMConfig } from '@/types'
 
 export type { LLMConfig }
@@ -14,60 +23,6 @@ interface SettingsDialogProps {
   config: LLMConfig
   onSave: (config: LLMConfig) => void
 }
-
-const API_TYPES: { value: LLMConfig['type']; label: string }[] = [
-  { value: 'openai', label: 'OpenAI 兼容' },
-  { value: 'kobold', label: 'KoboldAI' },
-  { value: 'textgen', label: 'Text Generation UI' },
-  { value: 'novel', label: 'NovelAI' },
-  { value: 'custom', label: '自定义' },
-]
-
-interface ProviderOption {
-  value: ChatCompletionSource
-  label: string
-  endpoint: string
-  type: LLMConfig['type']
-  format: CustomAPIFormat
-  model: string
-  description: string
-}
-
-const PROVIDERS: ProviderOption[] = [
-  { value: 'lmstudio', label: 'LM Studio', endpoint: 'http://localhost:1234/v1', type: 'openai', format: 'openai_chat', model: 'local-model', description: '本地 OpenAI-compatible 服务' },
-  { value: 'ollama', label: 'Ollama', endpoint: 'http://localhost:11434/v1', type: 'openai', format: 'openai_chat', model: 'llama3.1', description: '本地 Ollama OpenAI-compatible API' },
-  { value: 'ollama_native', label: 'Ollama Native', endpoint: 'http://localhost:11434', type: 'openai', format: 'ollama_native_chat', model: 'llama3.1', description: 'Ollama 原生 /api/chat 与 /api/tags' },
-  { value: 'openai', label: 'OpenAI', endpoint: 'https://api.openai.com/v1', type: 'openai', format: 'openai_chat', model: 'gpt-4o-mini', description: '官方 OpenAI Chat Completions' },
-  { value: 'azure_openai', label: 'Azure OpenAI', endpoint: 'https://{resource}.openai.azure.com', type: 'openai', format: 'azure_openai_chat', model: 'deployment-name', description: 'Azure deployment Chat Completions' },
-  { value: 'openrouter', label: 'OpenRouter', endpoint: 'https://openrouter.ai/api/v1', type: 'openai', format: 'openai_chat', model: 'openai/gpt-4o-mini', description: '多模型路由与中转' },
-  { value: 'anthropic', label: 'Claude / Anthropic', endpoint: 'https://api.anthropic.com/v1', type: 'openai', format: 'anthropic_messages', model: 'claude-3-5-haiku-latest', description: 'Claude Messages API' },
-  { value: 'google', label: 'Gemini', endpoint: 'https://generativelanguage.googleapis.com/v1beta', type: 'openai', format: 'gemini_generate_content', model: 'gemini-2.0-flash', description: 'Google Gemini generateContent API' },
-  { value: 'groq', label: 'Groq', endpoint: 'https://api.groq.com/openai/v1', type: 'openai', format: 'openai_chat', model: 'llama-3.1-8b-instant', description: '高速 OpenAI-compatible 托管' },
-  { value: 'deepseek', label: 'DeepSeek', endpoint: 'https://api.deepseek.com/v1', type: 'openai', format: 'openai_chat', model: 'deepseek-chat', description: 'DeepSeek OpenAI-compatible API' },
-  { value: 'moonshot', label: 'Moonshot / Kimi', endpoint: 'https://api.moonshot.cn/v1', type: 'openai', format: 'openai_chat', model: 'moonshot-v1-8k', description: 'Kimi OpenAI-compatible API' },
-  { value: 'siliconflow', label: 'SiliconFlow', endpoint: 'https://api.siliconflow.cn/v1', type: 'openai', format: 'openai_chat', model: 'deepseek-ai/DeepSeek-V3', description: '国内模型聚合与托管' },
-  { value: 'togetherai', label: 'Together AI', endpoint: 'https://api.together.xyz/v1', type: 'openai', format: 'openai_chat', model: 'meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo', description: '开源模型托管' },
-  { value: 'fireworks', label: 'Fireworks AI', endpoint: 'https://api.fireworks.ai/inference/v1', type: 'openai', format: 'openai_chat', model: 'accounts/fireworks/models/llama-v3p1-8b-instruct', description: 'OpenAI-compatible 模型服务' },
-  { value: 'perplexity', label: 'Perplexity', endpoint: 'https://api.perplexity.ai', type: 'openai', format: 'openai_chat', model: 'sonar', description: 'Perplexity OpenAI-compatible API' },
-  { value: 'xai', label: 'xAI', endpoint: 'https://api.x.ai/v1', type: 'openai', format: 'openai_chat', model: 'grok-2-latest', description: 'xAI OpenAI-compatible API' },
-  { value: 'vllm', label: 'vLLM', endpoint: 'http://localhost:8000/v1', type: 'openai', format: 'openai_chat', model: 'local-model', description: '本地/服务器 vLLM OpenAI-compatible API' },
-  { value: 'llamacpp', label: 'llama.cpp', endpoint: 'http://localhost:8080/v1', type: 'openai', format: 'openai_chat', model: 'local-model', description: 'llama.cpp server OpenAI-compatible API' },
-  { value: 'custom_openai_chat', label: '自定义 OpenAI Chat', endpoint: 'https://example.com/v1', type: 'custom', format: 'openai_chat', model: 'model-name', description: '官方/小众厂商/中转站通用入口' },
-  { value: 'custom_claude', label: '自定义 Claude', endpoint: 'https://example.com/v1', type: 'custom', format: 'anthropic_messages', model: 'claude-compatible-model', description: 'Claude Messages 格式兼容入口' },
-  { value: 'custom_gemini', label: '自定义 Gemini', endpoint: 'https://example.com/v1beta', type: 'custom', format: 'gemini_generate_content', model: 'gemini-compatible-model', description: 'Gemini generateContent 格式兼容入口' },
-]
-
-const PROVIDER_BY_SOURCE = new Map(PROVIDERS.map(provider => [provider.value, provider]))
-
-const API_FORMATS: { value: CustomAPIFormat; label: string }[] = [
-  { value: 'openai_chat', label: 'OpenAI Chat Completions' },
-  { value: 'openai_completion', label: 'OpenAI Legacy Completions' },
-  { value: 'azure_openai_chat', label: 'Azure OpenAI Chat Completions' },
-  { value: 'anthropic_messages', label: 'Claude Messages' },
-  { value: 'gemini_generate_content', label: 'Gemini generateContent' },
-  { value: 'ollama_native_chat', label: 'Ollama Native Chat' },
-  { value: 'openai_responses', label: 'OpenAI Responses（实验）' },
-]
 
 function headersToText(headers: Record<string, string> | undefined): string {
   if (!headers) return ''
@@ -105,10 +60,22 @@ export function SettingsDialog({ open, onClose, config, onSave }: SettingsDialog
   const [tab, setTab] = useState<'llm' | 'ui'>('llm')
   const developerMode = useSettingsStore((s) => s.developerMode)
   const activeProvider = useMemo(() => PROVIDER_BY_SOURCE.get(local.source ?? 'lmstudio'), [local.source])
+  const providerOptions = useMemo(
+    () => LLM_PROVIDER_OPTIONS,
+    [],
+  )
+  const showEndpointInput = !activeProvider || developerMode || activeProvider.endpointEditMode === 'always'
+  const showFormatSelect = !activeProvider || developerMode || activeProvider.formatEditMode === 'always'
+  const selectedFormat = local.customApiFormat ?? activeProvider?.format ?? 'openai_chat'
+  const formatOptions = useMemo(
+    () => API_FORMAT_OPTIONS,
+    [],
+  )
 
   useEffect(() => {
     if (!open) return
-    setLocal(config)
+    const provider = PROVIDER_BY_SOURCE.get(config.source ?? 'lmstudio')
+    setLocal(normalizedConfigForProvider(config, provider, developerMode))
     setHeadersText(headersToText(config.customHeaders))
   }, [config, open])
 
@@ -118,7 +85,8 @@ export function SettingsDialog({ open, onClose, config, onSave }: SettingsDialog
   })
 
   const prepareConfigForSave = async (configToSave: LLMConfig): Promise<LLMConfig> => {
-    const normalized = withParsedHeaders(configToSave)
+    const provider = PROVIDER_BY_SOURCE.get(configToSave.source ?? 'lmstudio')
+    const normalized = normalizedConfigForProvider(withParsedHeaders(configToSave), provider, developerMode)
     const apiKey = normalized.apiKey.trim()
     if (!apiKey) return normalized
 
@@ -141,11 +109,17 @@ export function SettingsDialog({ open, onClose, config, onSave }: SettingsDialog
     }
 
     setLocal(s => {
-      const model = s.model === activeProvider?.model || !s.model.trim() ? provider.model : s.model
+      const previousProvider = PROVIDER_BY_SOURCE.get(s.source ?? 'lmstudio')
+      const previousEndpoint = previousProvider?.endpoint
+      const shouldUseProviderEndpoint =
+        !s.apiUrl.trim() ||
+        s.apiUrl === previousEndpoint ||
+        (!developerMode && provider.endpointEditMode === 'developer')
+      const model = s.model === previousProvider?.model || !s.model.trim() ? provider.model : s.model
       return {
         ...s,
         source,
-        apiUrl: s.apiUrl === activeProvider?.endpoint || !s.apiUrl.trim() ? provider.endpoint : s.apiUrl,
+        apiUrl: shouldUseProviderEndpoint ? provider.endpoint : s.apiUrl,
         type: provider.type,
         customApiFormat: provider.format,
         model,
@@ -248,25 +222,29 @@ export function SettingsDialog({ open, onClose, config, onSave }: SettingsDialog
               <div className="p-6 space-y-4 max-h-[60vh] overflow-y-auto">
                 {tab === 'llm' && (
                   <>
-                    <Field label="API 类型" icon={<Globe size={15} />}>
-                      <select
-                        value={local.type}
-                        onChange={e => setLocal(s => ({ ...s, type: e.target.value as LLMConfig['type'] }))}
-                        className="w-full h-9 px-3 rounded-lg bg-[var(--color-bg-surface)] border border-[var(--color-border-subtle)] text-sm text-[var(--color-text-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)]/20 focus:border-[var(--color-accent)]/30"
-                      >
-                        {API_TYPES.map(t => (
-                          <option key={t.value} value={t.value}>{t.label}</option>
-                        ))}
-                      </select>
-                    </Field>
+                    {developerMode && (
+                      <Field label="API 类型" icon={<Globe size={15} />}>
+                        <select
+                          aria-label="API 类型"
+                          value={local.type}
+                          onChange={e => setLocal(s => ({ ...s, type: e.target.value as LLMConfig['type'] }))}
+                          className="w-full h-9 px-3 rounded-lg bg-[var(--color-bg-surface)] border border-[var(--color-border-subtle)] text-sm text-[var(--color-text-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)]/20 focus:border-[var(--color-accent)]/30"
+                        >
+                          {API_TYPE_OPTIONS.map(t => (
+                            <option key={t.value} value={t.value}>{t.label}</option>
+                          ))}
+                        </select>
+                      </Field>
+                    )}
 
                     <Field label="服务商 / 接口源" icon={<Route size={15} />}>
                       <select
+                        aria-label="服务商 / 接口源"
                         value={local.source ?? 'lmstudio'}
                         onChange={e => handleProviderChange(e.target.value as ChatCompletionSource)}
                         className="w-full h-9 px-3 rounded-lg bg-[var(--color-bg-surface)] border border-[var(--color-border-subtle)] text-sm text-[var(--color-text-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)]/20 focus:border-[var(--color-accent)]/30"
                       >
-                        {PROVIDERS.map(provider => (
+                        {providerOptions.map(provider => (
                           <option key={provider.value} value={provider.value}>{provider.label}</option>
                         ))}
                       </select>
@@ -275,18 +253,35 @@ export function SettingsDialog({ open, onClose, config, onSave }: SettingsDialog
                       )}
                     </Field>
 
-                    <Field label="API 地址" icon={<Globe size={15} />}>
-                      <input
-                        type="text"
-                        value={local.apiUrl}
-                        onChange={e => setLocal(s => ({ ...s, apiUrl: e.target.value }))}
-                        placeholder="http://localhost:1234/v1"
-                        className="w-full h-9 px-3 rounded-lg bg-[var(--color-bg-surface)] border border-[var(--color-border-subtle)] text-sm text-[var(--color-text-primary)] placeholder:text-[var(--color-text-muted)] focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)]/20 focus:border-[var(--color-accent)]/30"
-                      />
-                    </Field>
+                    {activeProvider && (
+                      <div className="rounded-lg border border-[var(--color-border-subtle)] bg-[var(--color-bg-surface)] px-3 py-2">
+                        <div className="flex items-center justify-between gap-3">
+                          <span className="text-[11px] font-medium text-[var(--color-text-muted)]">连接摘要</span>
+                          <span className="text-[11px] text-[var(--color-text-secondary)]">{apiFormatLabel(selectedFormat)}</span>
+                        </div>
+                        <p className="mt-1 break-all text-xs text-[var(--color-text-secondary)]">
+                          {showEndpointInput ? local.apiUrl : activeProvider.endpoint}
+                          <span className="text-[var(--color-text-muted)]">{endpointSuffixForFormat(selectedFormat)}</span>
+                        </p>
+                      </div>
+                    )}
+
+                    {showEndpointInput && (
+                      <Field label="API 地址" icon={<Globe size={15} />}>
+                        <input
+                          aria-label="API 地址"
+                          type="text"
+                          value={local.apiUrl}
+                          onChange={e => setLocal(s => ({ ...s, apiUrl: e.target.value }))}
+                          placeholder={activeProvider?.endpoint ?? 'http://localhost:1234/v1'}
+                          className="w-full h-9 px-3 rounded-lg bg-[var(--color-bg-surface)] border border-[var(--color-border-subtle)] text-sm text-[var(--color-text-primary)] placeholder:text-[var(--color-text-muted)] focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)]/20 focus:border-[var(--color-accent)]/30"
+                        />
+                      </Field>
+                    )}
 
                     <Field label="API 密钥" icon={<Key size={15} />}>
                       <input
+                        aria-label="API 密钥"
                         type="password"
                         value={local.apiKey}
                         onChange={e => setLocal(s => ({ ...s, apiKey: e.target.value }))}
@@ -302,6 +297,7 @@ export function SettingsDialog({ open, onClose, config, onSave }: SettingsDialog
 
                     <Field label="模型名称" icon={<Cpu size={15} />}>
                       <input
+                        aria-label="模型名称"
                         type="text"
                         value={local.model}
                         onChange={e => setLocal(s => ({ ...s, model: e.target.value }))}
@@ -310,21 +306,24 @@ export function SettingsDialog({ open, onClose, config, onSave }: SettingsDialog
                       />
                     </Field>
 
-                    {developerMode && (
+                    {(developerMode || showFormatSelect) && (
                       <>
-                        <Field label="接口格式" icon={<Braces size={15} />}>
-                          <select
-                            value={local.customApiFormat ?? activeProvider?.format ?? 'openai_chat'}
-                            onChange={e => setLocal(s => ({ ...s, customApiFormat: e.target.value as CustomAPIFormat }))}
-                            className="w-full h-9 px-3 rounded-lg bg-[var(--color-bg-surface)] border border-[var(--color-border-subtle)] text-sm text-[var(--color-text-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)]/20 focus:border-[var(--color-accent)]/30"
-                          >
-                            {API_FORMATS.map(format => (
-                              <option key={format.value} value={format.value}>{format.label}</option>
-                            ))}
-                          </select>
-                        </Field>
+                        {showFormatSelect && (
+                          <Field label="接口格式" icon={<Braces size={15} />}>
+                            <select
+                              aria-label="接口格式"
+                              value={selectedFormat}
+                              onChange={e => setLocal(s => ({ ...s, customApiFormat: e.target.value as CustomAPIFormat }))}
+                              className="w-full h-9 px-3 rounded-lg bg-[var(--color-bg-surface)] border border-[var(--color-border-subtle)] text-sm text-[var(--color-text-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)]/20 focus:border-[var(--color-accent)]/30"
+                            >
+                              {formatOptions.map(format => (
+                                <option key={format.value} value={format.value}>{format.label}</option>
+                              ))}
+                            </select>
+                          </Field>
+                        )}
 
-                        {(local.source === 'azure_openai' || local.customApiFormat === 'azure_openai_chat') && (
+                        {developerMode && (local.source === 'azure_openai' || selectedFormat === 'azure_openai_chat') && (
                           <>
                             <Field label="Azure Resource" icon={<Globe size={15} />}>
                               <input
@@ -377,28 +376,32 @@ export function SettingsDialog({ open, onClose, config, onSave }: SettingsDialog
                           </>
                         )}
 
-                        <Field label="反向代理地址" icon={<Route size={15} />}>
-                          <input
-                            type="text"
-                            value={local.reverseProxyUrl ?? ''}
-                            onChange={e => setLocal(s => ({
-                              ...s,
-                              reverseProxyUrl: e.target.value,
-                              useReverseProxy: e.target.value.trim().length > 0,
-                            }))}
-                            placeholder="https://proxy.example.com/v1"
-                            className="w-full h-9 px-3 rounded-lg bg-[var(--color-bg-surface)] border border-[var(--color-border-subtle)] text-sm text-[var(--color-text-primary)] placeholder:text-[var(--color-text-muted)] focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)]/20 focus:border-[var(--color-accent)]/30"
-                          />
-                        </Field>
+                        {developerMode && (
+                          <>
+                            <Field label="反向代理地址" icon={<Route size={15} />}>
+                              <input
+                                type="text"
+                                value={local.reverseProxyUrl ?? ''}
+                                onChange={e => setLocal(s => ({
+                                  ...s,
+                                  reverseProxyUrl: e.target.value,
+                                  useReverseProxy: e.target.value.trim().length > 0,
+                                }))}
+                                placeholder="https://proxy.example.com/v1"
+                                className="w-full h-9 px-3 rounded-lg bg-[var(--color-bg-surface)] border border-[var(--color-border-subtle)] text-sm text-[var(--color-text-primary)] placeholder:text-[var(--color-text-muted)] focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)]/20 focus:border-[var(--color-accent)]/30"
+                              />
+                            </Field>
 
-                        <Field label="自定义请求头" icon={<Braces size={15} />}>
-                          <textarea
-                            value={headersText}
-                            onChange={e => setHeadersText(e.target.value)}
-                            placeholder={'Header-Name: value\nX-Provider-App: CraftTalker'}
-                            className="w-full min-h-20 px-3 py-2 rounded-lg bg-[var(--color-bg-surface)] border border-[var(--color-border-subtle)] text-sm text-[var(--color-text-primary)] placeholder:text-[var(--color-text-muted)] focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)]/20 focus:border-[var(--color-accent)]/30 resize-y"
-                          />
-                        </Field>
+                            <Field label="自定义请求头" icon={<Braces size={15} />}>
+                              <textarea
+                                value={headersText}
+                                onChange={e => setHeadersText(e.target.value)}
+                                placeholder={'Header-Name: value\nX-Provider-App: CraftTalker'}
+                                className="w-full min-h-20 px-3 py-2 rounded-lg bg-[var(--color-bg-surface)] border border-[var(--color-border-subtle)] text-sm text-[var(--color-text-primary)] placeholder:text-[var(--color-text-muted)] focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)]/20 focus:border-[var(--color-accent)]/30 resize-y"
+                              />
+                            </Field>
+                          </>
+                        )}
                       </>
                     )}
 

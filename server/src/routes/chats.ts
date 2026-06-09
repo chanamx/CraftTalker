@@ -6,7 +6,7 @@ import * as characterService from '../services/character.service.js'
 import * as presetService from '../services/preset.service.js'
 import * as worldService from '../services/world.service.js'
 import { getEngine } from '../engine/index.js'
-import { checkWorldInfo, WORLD_INFO_INSERTION_STRATEGY, type WorldInfoScanSettings, type WorldInfoSource, type WorldInfoTimedEffectsMetadata } from '../lib/world-info-compat.js'
+import { checkWorldInfo, WORLD_INFO_INSERTION_STRATEGY, type WorldInfoChatMessage, type WorldInfoForceActivation, type WorldInfoScanSettings, type WorldInfoSource, type WorldInfoTimedEffectsMetadata } from '../lib/world-info-compat.js'
 import { AppError, ErrorCode } from '../lib/errors.js'
 import {
   getGenerationLockInfo,
@@ -16,6 +16,7 @@ import {
 import * as runService from '../services/run.service.js'
 import { llmConfigSchema, resolveLlmConfigApiKey } from '../lib/llm-config.js'
 import { createTokenCounter } from '../lib/tokenizer.js'
+import { resolveMacros } from '../lib/macros.js'
 
 const chatsRoute = new Hono()
 
@@ -62,7 +63,7 @@ chatsRoute.post('/:characterName/:chatId/messages', zValidator('json', messageSc
 
 const generateSchema = z.object({
   config: llmConfigSchema,
-  presetType: z.enum(['kobold', 'openai', 'textgen', 'novel']).optional(),
+  presetType: z.enum(presetService.GENERATION_PRESET_TYPES).optional(),
   presetName: z.string().optional(),
   genOverrides: z.object({
     temperature: z.number().min(0).max(5).optional(),
@@ -125,10 +126,7 @@ async function handleGenerate(
     const character = await characterService.getCharacter(characterName)
     const chat = await chatService.getChat(characterName, chatId)
 
-    const basePreset = {
-      ...presetService.getDefaultPreset(),
-      ...(presetName && presetType ? await presetService.getPreset(presetType, presetName) : {}),
-    }
+    const basePreset = await presetService.getGenerationPreset(presetType, presetName)
 
     const preset = genOverrides ? {
       ...basePreset,
@@ -141,18 +139,20 @@ async function handleGenerate(
     const metadata = chat.lines[0] as { user_name?: string }
     const userName = metadata?.user_name
 
-    const messages = chat.lines
+    const chatMessages = chat.lines
       .filter(l => 'mes' in l)
       .map(l => {
-        const msg = l as { name: string; is_user: boolean; is_system?: boolean; mes: string }
+        const msg = l as { name?: string; is_user: boolean; is_system?: boolean; mes: string }
         return {
+          name: msg.name,
           role: msg.is_system ? 'system' as const : msg.is_user ? 'user' as const : 'assistant' as const,
           content: msg.mes,
         }
       })
+    const messages = chatMessages.map(({ role, content }) => ({ role, content }))
 
   // 世界书匹配：扫描最近对话内容，匹配关键词条目
-    const worldEntries = await loadWorldEntries(character, chat, messages, getContextLength(preset, genOverrides), resolvedConfig.model)
+    const worldEntries = await loadWorldEntries(character, chat, chatMessages, getContextLength(preset, genOverrides), resolvedConfig.model, userName)
 
     if (stream) {
       const engine = getEngine()
@@ -350,9 +350,10 @@ chatsRoute.patch('/:characterName/:chatId', zValidator('json', renameSchema), as
 async function loadWorldEntries(
   character: Awaited<ReturnType<typeof characterService.getCharacter>>,
   chat: Awaited<ReturnType<typeof chatService.getChat>>,
-  messages: Array<{ role: string; content: string }>,
+  messages: Array<WorldInfoChatMessage>,
   maxContext: number,
   model?: string,
+  userName?: string,
 ) {
   const sources: WorldInfoSource[] = []
   const addedWorldNames = new Set<string>()
@@ -383,16 +384,37 @@ async function loadWorldEntries(
   const chatWorldName = getChatWorldName(chat)
   if (chatWorldName && !addedWorldNames.has(chatWorldName)) {
     const source = await loadWorldSource(chatWorldName, 'chat')
-    if (source) sources.unshift(source)
+    if (source) {
+      sources.unshift(source)
+      addedWorldNames.add(chatWorldName)
+    }
+  }
+
+  const personaWorldName = getPersonaWorldName(chat)
+  if (personaWorldName && !addedWorldNames.has(personaWorldName)) {
+    const source = await loadWorldSource(personaWorldName, 'persona')
+    if (source) {
+      sources.push(source)
+      addedWorldNames.add(personaWorldName)
+    }
   }
 
   if (sources.length === 0) return undefined
 
-  const settings = buildWorldInfoSettings(sources, maxContext, character)
+  const settings = buildWorldInfoSettings(sources, character, chat)
   settings.timedEffects = getTimedWorldInfo(chat)
   settings.tokenCounter = createTokenCounter(model)
-  const scanChat = messages.map(m => m.content).reverse()
-  const result = await checkWorldInfo({ sources, chat: scanChat, maxContext, settings })
+  settings.scanInjects = getWorldInfoScanInjects(chat)
+  settings.forceActivations = getWorldInfoForceActivations(chat)
+  settings.macroResolver = text => resolveMacros(text, { user: userName || '用户', char: character.name })
+  const scanChatMessages = messages.map(({ name, content }) => ({ name, content })).reverse()
+  const result = await checkWorldInfo({
+    sources,
+    chat: scanChatMessages.map(message => message.content),
+    chatMessages: scanChatMessages,
+    maxContext,
+    settings,
+  })
   if (result.timedEffectsChanged) {
     await saveTimedWorldInfo(chat.characterName, chat.chatId, chat, result.timedEffects)
   }
@@ -419,24 +441,36 @@ async function loadWorldSource(name: string, type: WorldInfoSource['type']): Pro
 
 function buildWorldInfoSettings(
   sources: WorldInfoSource[],
-  maxContext: number,
   character: Awaited<ReturnType<typeof characterService.getCharacter>>,
+  chat: Awaited<ReturnType<typeof chatService.getChat>>,
 ): WorldInfoScanSettings {
   let depth = 4
   let recursive = false
   let maxRecursionSteps = 0
-  let budgetTokens = Number.isFinite(maxContext) && maxContext > 0 ? maxContext : Number.MAX_SAFE_INTEGER
+  let budgetPercent: number | undefined
+  let budgetCap: number | undefined
+  let budgetTokens: number | undefined
+  let caseSensitive: boolean | undefined
+  let matchWholeWords: boolean | undefined
+  let useGroupScoring: boolean | undefined
+  let characterStrategy: number = WORLD_INFO_INSERTION_STRATEGY.character_first
+  let includeNames = true
 
   for (const source of sources) {
     if (typeof source.scanDepth === 'number' && source.scanDepth > depth) {
       depth = source.scanDepth
     }
-    recursive ||= source.recursive === true
-    if (typeof source.recursiveDepth === 'number') {
+    const sourceRecursive = source.recursive === true
+    recursive ||= sourceRecursive
+    if (sourceRecursive && typeof source.recursiveDepth === 'number') {
       maxRecursionSteps = Math.max(maxRecursionSteps, source.recursiveDepth)
     }
-    if (typeof source.tokenBudget === 'number' && source.tokenBudget > 0) {
-      budgetTokens = Math.min(budgetTokens, source.tokenBudget)
+    if (typeof source.tokenBudget === 'number' && Number.isFinite(source.tokenBudget) && source.tokenBudget > 0) {
+      if (source.tokenBudget <= 100) {
+        budgetPercent = Math.min(budgetPercent ?? 100, source.tokenBudget)
+      } else {
+        budgetCap = Math.min(budgetCap ?? Number.MAX_SAFE_INTEGER, source.tokenBudget)
+      }
     }
     for (const entry of Object.values(source.entries)) {
       if (typeof entry.scan_depth === 'number' && entry.scan_depth > depth) {
@@ -445,16 +479,60 @@ function buildWorldInfoSettings(
     }
   }
 
+  const metadataSettings = getWorldInfoSettingsMetadata(chat)
+  const metadataDepth = numberValue(metadataSettings?.world_info_depth)
+  if (metadataDepth !== undefined && metadataDepth >= 0) depth = metadataDepth
+
+  const metadataMinActivations = numberValue(metadataSettings?.world_info_min_activations)
+  const metadataMinActivationsDepthMax = numberValue(metadataSettings?.world_info_min_activations_depth_max)
+  const metadataBudgetPercent = numberValue(metadataSettings?.world_info_budget)
+  if (metadataBudgetPercent !== undefined && metadataBudgetPercent > 0) {
+    budgetPercent = Math.min(metadataBudgetPercent, 100)
+  }
+
+  const metadataBudgetCap = numberValue(metadataSettings?.world_info_budget_cap)
+  if (metadataBudgetCap !== undefined && metadataBudgetCap > 0) budgetCap = metadataBudgetCap
+
+  const metadataRecursive = booleanValue(metadataSettings?.world_info_recursive)
+  if (metadataRecursive !== undefined) recursive = metadataRecursive
+
+  const metadataMaxRecursionSteps = numberValue(metadataSettings?.world_info_max_recursion_steps)
+  if (metadataMaxRecursionSteps !== undefined && metadataMaxRecursionSteps >= 0) {
+    maxRecursionSteps = metadataMaxRecursionSteps
+  }
+
+  caseSensitive = booleanValue(metadataSettings?.world_info_case_sensitive)
+  matchWholeWords = booleanValue(metadataSettings?.world_info_match_whole_words)
+  useGroupScoring = booleanValue(metadataSettings?.world_info_use_group_scoring)
+
+  const metadataStrategy = numberValue(metadataSettings?.world_info_character_strategy)
+  if (metadataStrategy === WORLD_INFO_INSERTION_STRATEGY.evenly
+    || metadataStrategy === WORLD_INFO_INSERTION_STRATEGY.character_first
+    || metadataStrategy === WORLD_INFO_INSERTION_STRATEGY.global_first) {
+    characterStrategy = metadataStrategy
+  }
+
+  includeNames = booleanValue(metadataSettings?.world_info_include_names) ?? includeNames
+
   return {
     depth,
+    minActivations: metadataMinActivations,
+    minActivationsDepthMax: metadataMinActivationsDepthMax,
     recursive,
     maxRecursionSteps,
+    budgetPercent,
+    budgetCap,
     budgetTokens,
-    characterStrategy: WORLD_INFO_INSERTION_STRATEGY.character_first,
+    caseSensitive,
+    matchWholeWords,
+    useGroupScoring,
+    characterStrategy,
     trigger: 'normal',
+    includeNames,
     characterName: character.name,
     characterTags: Array.isArray(character.tags) ? character.tags : [],
     globalScanData: {
+      personaDescription: getPersonaDescription(chat),
       characterDescription: character.description,
       characterPersonality: character.personality,
       scenario: character.scenario,
@@ -465,16 +543,71 @@ function buildWorldInfoSettings(
 }
 
 function getChatWorldName(chat: Awaited<ReturnType<typeof chatService.getChat>>): string | undefined {
-  const metadata = chat.lines[0] as { chat_metadata?: Record<string, unknown> } | undefined
-  const worldName = metadata?.chat_metadata?.world_info
-  return typeof worldName === 'string' && worldName.trim() ? worldName : undefined
+  return stringValue(getChatMetadata(chat)?.world_info)
+}
+
+function getPersonaWorldName(chat: Awaited<ReturnType<typeof chatService.getChat>>): string | undefined {
+  const chatMetadata = getChatMetadata(chat)
+  if (!chatMetadata) return undefined
+
+  return firstStringValue([
+    chatMetadata.persona_description_lorebook,
+    chatMetadata.persona_lorebook,
+    chatMetadata.personaLorebook,
+    chatMetadata.persona_world_info,
+    chatMetadata.personaWorldInfo,
+    recordValue(chatMetadata.persona)?.lorebook,
+  ])
+}
+
+function getPersonaDescription(chat: Awaited<ReturnType<typeof chatService.getChat>>): string | undefined {
+  const chatMetadata = getChatMetadata(chat)
+  if (!chatMetadata) return undefined
+
+  return firstStringValue([
+    chatMetadata.persona_description,
+    chatMetadata.personaDescription,
+    recordValue(chatMetadata.persona)?.description,
+  ])
 }
 
 function getTimedWorldInfo(chat: Awaited<ReturnType<typeof chatService.getChat>>): WorldInfoTimedEffectsMetadata | undefined {
-  const metadata = chat.lines[0] as { chat_metadata?: Record<string, unknown> } | undefined
-  const timedWorldInfo = metadata?.chat_metadata?.timedWorldInfo
+  const timedWorldInfo = getChatMetadata(chat)?.timedWorldInfo
   if (!timedWorldInfo || typeof timedWorldInfo !== 'object' || Array.isArray(timedWorldInfo)) return undefined
   return timedWorldInfo as WorldInfoTimedEffectsMetadata
+}
+
+function getWorldInfoScanInjects(chat: Awaited<ReturnType<typeof chatService.getChat>>): string[] {
+  const chatMetadata = getChatMetadata(chat)
+  if (!chatMetadata) return []
+
+  const scanInjects = [
+    ...stringArrayValue(chatMetadata.world_info_scan_injects),
+    ...stringArrayValue(chatMetadata.worldInfoScanInjects),
+    ...extensionPromptScanValues(chatMetadata.extensionPrompts),
+    ...extensionPromptScanValues(chatMetadata.extension_prompts),
+  ]
+
+  return [...new Set(scanInjects.map(item => item.trim()).filter(Boolean))]
+}
+
+function getWorldInfoForceActivations(chat: Awaited<ReturnType<typeof chatService.getChat>>): WorldInfoForceActivation[] {
+  const chatMetadata = getChatMetadata(chat)
+  if (!chatMetadata) return []
+
+  return [
+    ...forceActivationValues(chatMetadata.worldinfo_force_activate),
+    ...forceActivationValues(chatMetadata.worldInfoForceActivate),
+    ...forceActivationValues(chatMetadata.world_info_force_activations),
+    ...forceActivationValues(chatMetadata.worldInfoForceActivations),
+  ]
+}
+
+function getWorldInfoSettingsMetadata(chat: Awaited<ReturnType<typeof chatService.getChat>>): Record<string, unknown> | undefined {
+  const chatMetadata = getChatMetadata(chat)
+  if (!chatMetadata) return undefined
+  const nestedSettings = recordValue(chatMetadata.world_info_settings)
+  return nestedSettings ? { ...nestedSettings, ...chatMetadata } : chatMetadata
 }
 
 async function saveTimedWorldInfo(
@@ -483,14 +616,103 @@ async function saveTimedWorldInfo(
   chat: Awaited<ReturnType<typeof chatService.getChat>>,
   timedWorldInfo: WorldInfoTimedEffectsMetadata,
 ): Promise<void> {
-  const metadata = chat.lines[0] as { chat_metadata?: Record<string, unknown> } | undefined
   const chatMetadata = {
-    ...(metadata?.chat_metadata ?? {}),
+    ...(getChatMetadata(chat) ?? {}),
     timedWorldInfo,
   }
   await chatService.updateChatMetadata(characterName, chatId, chatMetadata).catch((error) => {
     console.warn('[WI] Failed to persist timed world info metadata:', error)
   })
+}
+
+function getChatMetadata(chat: Awaited<ReturnType<typeof chatService.getChat>>): Record<string, unknown> | undefined {
+  const metadata = chat.lines[0] as { chat_metadata?: unknown } | undefined
+  return isRecord(metadata?.chat_metadata) ? metadata.chat_metadata : undefined
+}
+
+function extensionPromptScanValues(value: unknown): string[] {
+  if (!isRecord(value)) return []
+
+  const prompts: string[] = []
+  for (const prompt of Object.values(value)) {
+    if (typeof prompt === 'string') continue
+    if (!isRecord(prompt) || prompt.scan !== true) continue
+    if (typeof prompt.value === 'string') prompts.push(prompt.value)
+  }
+  return prompts
+}
+
+function stringArrayValue(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : []
+}
+
+function forceActivationValues(value: unknown): WorldInfoForceActivation[] {
+  if (!Array.isArray(value)) return []
+
+  const activations: WorldInfoForceActivation[] = []
+  for (const item of value) {
+    if (!isRecord(item)) continue
+    const world = stringValue(item.world)
+    const uid = numberValue(item.uid)
+    if (!world || uid === undefined || uid < 0) continue
+
+    const activation: WorldInfoForceActivation = { world, uid: Math.floor(uid) }
+    if (typeof item.content === 'string') activation.content = item.content
+    assignOptionalNumber(activation, 'position', item.position)
+    assignOptionalNumber(activation, 'depth', item.depth)
+    assignOptionalNumber(activation, 'insertion_order', item.insertion_order ?? item.insertionOrder)
+    assignOptionalNumber(activation, 'role', item.role)
+    activations.push(activation)
+  }
+
+  return activations
+}
+
+function assignOptionalNumber<T extends 'position' | 'depth' | 'insertion_order' | 'role'>(
+  target: WorldInfoForceActivation,
+  key: T,
+  value: unknown,
+): void {
+  const parsed = numberValue(value)
+  if (parsed !== undefined) target[key] = Math.floor(parsed)
+}
+
+function firstStringValue(values: unknown[]): string | undefined {
+  for (const value of values) {
+    const text = stringValue(value)
+    if (text) return text
+  }
+  return undefined
+}
+
+function stringValue(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined
+}
+
+function numberValue(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = Number(value)
+    if (Number.isFinite(parsed)) return parsed
+  }
+  return undefined
+}
+
+function booleanValue(value: unknown): boolean | undefined {
+  if (typeof value === 'boolean') return value
+  if (typeof value !== 'string') return undefined
+  const normalized = value.trim().toLowerCase()
+  if (normalized === 'true') return true
+  if (normalized === 'false') return false
+  return undefined
+}
+
+function recordValue(value: unknown): Record<string, unknown> | undefined {
+  return isRecord(value) ? value : undefined
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value)
 }
 
 function getContextLength(

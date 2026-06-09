@@ -53,6 +53,7 @@ function createDefaultEntry(): Partial<WorldBookEntry> {
 
 export function WorldBookEditor({ open, onClose, initialWorld }: WorldBookEditorProps) {
   const { data: worldList } = useWorlds()
+  const developerMode = useSettingsStore((s) => s.developerMode)
   const [selectedWorld, setSelectedWorld] = useState<string | null>(null)
   const [editingEntry, setEditingEntry] = useState<string | null>(null)
   const [showNewWorld, setShowNewWorld] = useState(false)
@@ -164,6 +165,7 @@ export function WorldBookEditor({ open, onClose, initialWorld }: WorldBookEditor
                         key={w.name}
                         world={w}
                         selected={selectedWorld === w.name}
+                        developerMode={developerMode}
                         onSelect={() => setSelectedWorld(w.name)}
                         onToggleEnabled={() => updateWorld.mutate({ name: w.name, data: { enabled: !w.enabled } })}
                         onDelete={() => {
@@ -236,31 +238,33 @@ export function WorldBookEditor({ open, onClose, initialWorld }: WorldBookEditor
                               {selectedInfo && <ScopeBadges world={selectedInfo} />}
                             </div>
                           </div>
-                          <div className="flex items-center gap-1 flex-shrink-0">
-                            <ScopeToggle
-                              icon={<Power size={12} />}
-                              label={worldEnabled ? '关闭' : '启用'}
-                              active={worldEnabled}
-                              onClick={() => selectedWorld && selectedInfo && updateWorld.mutate({
-                                name: selectedWorld,
-                                data: { enabled: !selectedInfo.enabled },
-                              })}
-                              title={worldEnabled ? '关闭整本世界书' : '启用整本世界书'}
-                            />
-                            <ScopeToggle
-                              icon={<Globe size={12} />}
-                              label="全局"
-                              active={worldGlobalEnabled}
-                              onClick={() => selectedWorld && selectedInfo && updateWorld.mutate({
-                                name: selectedWorld,
-                                data: {
-                                  global_enabled: !selectedInfo.global_enabled,
-                                  enabled: !selectedInfo.global_enabled || selectedInfo.bound_to.length > 0,
-                                },
-                              })}
-                              title={worldGlobalEnabled ? '取消全局生效' : '设为全局生效'}
-                            />
-                          </div>
+                          {developerMode && (
+                            <div className="flex items-center gap-1 flex-shrink-0">
+                              <ScopeToggle
+                                icon={<Power size={12} />}
+                                label={worldEnabled ? '关闭' : '启用'}
+                                active={worldEnabled}
+                                onClick={() => selectedWorld && selectedInfo && updateWorld.mutate({
+                                  name: selectedWorld,
+                                  data: { enabled: !selectedInfo.enabled },
+                                })}
+                                title={worldEnabled ? '关闭整本世界书' : '启用整本世界书'}
+                              />
+                              <ScopeToggle
+                                icon={<Globe size={12} />}
+                                label="全局"
+                                active={worldGlobalEnabled}
+                                onClick={() => selectedWorld && selectedInfo && updateWorld.mutate({
+                                  name: selectedWorld,
+                                  data: {
+                                    global_enabled: !selectedInfo.global_enabled,
+                                    enabled: !selectedInfo.global_enabled || selectedInfo.bound_to.length > 0,
+                                  },
+                                })}
+                                title={worldGlobalEnabled ? '取消全局生效' : '设为全局生效'}
+                              />
+                            </div>
+                          )}
                         </div>
                         <div className="flex items-center gap-2 flex-wrap">
                           <select
@@ -700,9 +704,10 @@ function ScopeToggle({ icon, label, active, disabled, title, onClick }: {
   )
 }
 
-function WorldListItem({ world, selected, onSelect, onDelete, onToggleEnabled }: {
+function WorldListItem({ world, selected, developerMode, onSelect, onDelete, onToggleEnabled }: {
   world: WorldIndex
   selected: boolean
+  developerMode: boolean
   onSelect: () => void
   onDelete: () => void
   onToggleEnabled: () => void
@@ -734,20 +739,22 @@ function WorldListItem({ world, selected, onSelect, onDelete, onToggleEnabled }:
         </div>
       </motion.button>
       <div className="absolute right-1 top-1/2 -translate-y-1/2 flex gap-0.5 opacity-0 group-hover:opacity-100 transition-all">
-        <motion.button
-          whileHover={{ scale: 1.1 }}
-          whileTap={{ scale: 0.9 }}
-          onClick={e => { e.stopPropagation(); onToggleEnabled() }}
-          className={cn(
-            'p-1 rounded-md transition-colors',
-            enabled
-              ? 'text-[var(--color-success)] hover:bg-[var(--color-success)]/10'
-              : 'text-[var(--color-text-muted)] hover:bg-[var(--color-bg-surface)]'
-          )}
-          title={enabled ? '关闭整本世界书' : '启用整本世界书'}
-        >
-          <Power size={11} />
-        </motion.button>
+        {developerMode && (
+          <motion.button
+            whileHover={{ scale: 1.1 }}
+            whileTap={{ scale: 0.9 }}
+            onClick={e => { e.stopPropagation(); onToggleEnabled() }}
+            className={cn(
+              'p-1 rounded-md transition-colors',
+              enabled
+                ? 'text-[var(--color-success)] hover:bg-[var(--color-success)]/10'
+                : 'text-[var(--color-text-muted)] hover:bg-[var(--color-bg-surface)]'
+            )}
+            title={enabled ? '关闭整本世界书' : '启用整本世界书'}
+          >
+            <Power size={11} />
+          </motion.button>
+        )}
         <motion.button
           whileHover={{ scale: 1.1 }}
           whileTap={{ scale: 0.9 }}

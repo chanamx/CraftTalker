@@ -1,6 +1,22 @@
-import { describe, expect, it } from 'vitest'
-import { render, screen } from '@testing-library/react'
+import { describe, expect, it, vi } from 'vitest'
+import { render, screen, waitFor } from '@testing-library/react'
 import { Markdown } from '@/components/chat/Markdown'
+
+vi.mock('shiki/core', () => ({
+  createBundledHighlighter: () => async () => ({
+    codeToHtml: (code: string) => `<pre><code><span class="line">${code}</span></code></pre>`,
+    getLoadedLanguages: () => [],
+    loadLanguage: vi.fn().mockResolvedValue(undefined),
+  }),
+}))
+
+vi.mock('shiki/engine/javascript', () => ({
+  createJavaScriptRegexEngine: vi.fn(),
+}))
+
+vi.mock('@shikijs/themes/github-dark', () => ({ default: {} }))
+vi.mock('@shikijs/themes/github-light', () => ({ default: {} }))
+vi.mock('@shikijs/langs/javascript', () => ({ default: [] }))
 
 describe('Markdown', () => {
   it('removes unsafe html, attributes, and protocols', () => {
@@ -30,5 +46,21 @@ describe('Markdown', () => {
     expect(link).toHaveAttribute('href', 'https://example.com/docs')
     expect(link).toHaveAttribute('target', '_blank')
     expect(link).toHaveAttribute('rel', 'noopener noreferrer')
+  })
+
+  it('highlights supported code languages lazily', async () => {
+    const { container } = render(<Markdown content={'```js\nconst value = 1\n```'} />)
+
+    await waitFor(() => {
+      expect(container.querySelector('code .line')).toHaveTextContent('const value = 1')
+    })
+  })
+
+  it('leaves unsupported code languages as escaped plain text', () => {
+    const { container } = render(<Markdown content={'```cpp\nstd::vector<int> values;\n```'} />)
+
+    const code = container.querySelector('code.shiki-target')
+    expect(code).toHaveTextContent('std::vector<int> values;')
+    expect(code?.querySelector('.line')).not.toBeInTheDocument()
   })
 })

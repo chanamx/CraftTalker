@@ -33,14 +33,34 @@ export default defineConfig({
       input: {
         main: 'index.html',
       },
-    },
-    rollupOptions: {
       output: {
-        manualChunks(id) {
-          if (id.includes('node_modules/react') || id.includes('node_modules/react-dom')) return 'vendor-react'
-          if (id.includes('node_modules/framer-motion')) return 'vendor-motion'
-          if (id.includes('node_modules/@tanstack')) return 'vendor-query'
-          if (id.includes('node_modules/lucide-react')) return 'vendor-icons'
+        codeSplitting: {
+          groups: [
+            {
+              name: 'vendor-react',
+              test: /node_modules[\\/](react|react-dom|scheduler|use-sync-external-store)[\\/]/,
+            },
+            {
+              name: 'vendor-router',
+              test: /node_modules[\\/](react-router|react-router-dom)[\\/]/,
+            },
+            {
+              name: 'vendor-query',
+              test: /node_modules[\\/]@tanstack[\\/]/,
+            },
+            {
+              name: 'vendor-motion',
+              test: /node_modules[\\/]framer-motion[\\/]/,
+            },
+            {
+              name: 'vendor-icons',
+              test: /node_modules[\\/]lucide-react[\\/]/,
+            },
+            {
+              name: 'vendor-markdown',
+              test: /node_modules[\\/](marked|dompurify|katex)[\\/]/,
+            },
+          ],
         },
       },
     },

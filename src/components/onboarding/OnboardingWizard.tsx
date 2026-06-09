@@ -4,7 +4,14 @@ import { Sparkles, Key, MessageCircle } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { api } from '@/lib/api'
 import { useSettingsStore } from '@/stores/settings-store'
-import type { ChatCompletionSource, CustomAPIFormat, LLMConfig, Character } from '@/types'
+import {
+  LLM_PROVIDER_OPTIONS,
+  PROVIDER_BY_SOURCE,
+  apiFormatLabel,
+  normalizedConfigForProvider,
+  type ProviderOption,
+} from '@/lib/llm-provider-options'
+import type { ChatCompletionSource, LLMConfig, Character } from '@/types'
 
 interface OnboardingWizardProps {
   characters: Character[]
@@ -54,23 +61,44 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
 
 const inputCls = 'w-full px-3 py-2 rounded-lg text-sm bg-[var(--color-bg-surface)] border border-[var(--color-border-subtle)] text-[var(--color-text-primary)] focus:outline-none focus:border-[var(--color-accent)]/50'
 
-const QUICK_PROVIDERS: Array<{
-  value: ChatCompletionSource
-  label: string
-  endpoint: string
-  format: CustomAPIFormat
-  model: string
-}> = [
-  { value: 'lmstudio', label: 'LM Studio', endpoint: 'http://localhost:1234/v1', format: 'openai_chat', model: 'local-model' },
-  { value: 'ollama', label: 'Ollama', endpoint: 'http://localhost:11434/v1', format: 'openai_chat', model: 'llama3.1' },
-  { value: 'ollama_native', label: 'Ollama Native', endpoint: 'http://localhost:11434', format: 'ollama_native_chat', model: 'llama3.1' },
-  { value: 'openai', label: 'OpenAI', endpoint: 'https://api.openai.com/v1', format: 'openai_chat', model: 'gpt-4o-mini' },
-  { value: 'azure_openai', label: 'Azure OpenAI', endpoint: 'https://{resource}.openai.azure.com', format: 'azure_openai_chat', model: 'deployment-name' },
-  { value: 'openrouter', label: 'OpenRouter', endpoint: 'https://openrouter.ai/api/v1', format: 'openai_chat', model: 'openai/gpt-4o-mini' },
-  { value: 'anthropic', label: 'Claude', endpoint: 'https://api.anthropic.com/v1', format: 'anthropic_messages', model: 'claude-3-5-haiku-latest' },
-  { value: 'google', label: 'Gemini', endpoint: 'https://generativelanguage.googleapis.com/v1beta', format: 'gemini_generate_content', model: 'gemini-2.0-flash' },
-  { value: 'custom_openai_chat', label: '自定义', endpoint: 'https://example.com/v1', format: 'openai_chat', model: 'model-name' },
+const QUICK_PROVIDER_SOURCES: ChatCompletionSource[] = [
+  'lmstudio',
+  'ollama',
+  'ollama_native',
+  'openai',
+  'openrouter',
+  'anthropic',
+  'google',
+  'deepseek',
+  'custom_openai_chat',
 ]
+
+const QUICK_PROVIDERS = LLM_PROVIDER_OPTIONS.filter(provider =>
+  QUICK_PROVIDER_SOURCES.includes(provider.value),
+)
+
+function defaultAzureConfig(config: LLMConfig): NonNullable<LLMConfig['azureConfig']> {
+  return {
+    resourceName: config.azureConfig?.resourceName ?? '',
+    deploymentName: config.azureConfig?.deploymentName || config.model || 'deployment-name',
+    apiVersion: config.azureConfig?.apiVersion || '2024-10-21',
+  }
+}
+
+function configForProvider(config: LLMConfig, provider: ProviderOption): LLMConfig {
+  const next: LLMConfig = {
+    ...config,
+    source: provider.value,
+    apiUrl: provider.endpoint,
+    model: provider.model,
+    type: provider.type,
+    customApiFormat: provider.format,
+    azureConfig: provider.value === 'azure_openai'
+      ? defaultAzureConfig({ ...config, model: provider.model })
+      : config.azureConfig,
+  }
+  return normalizedConfigForProvider(next, provider, false)
+}
 
 export function OnboardingWizard({ characters, onSelectCharacter, onComplete }: OnboardingWizardProps) {
   const [step, setStep] = useState(0)
@@ -79,21 +107,28 @@ export function OnboardingWizard({ characters, onSelectCharacter, onComplete }: 
   const llmConfig = useSettingsStore((s) => s.llmConfig)
   const setLlmConfig = useSettingsStore((s) => s.setLlmConfig)
   const [localConfig, setLocalConfig] = useState<LLMConfig>(llmConfig)
+  const activeProvider = PROVIDER_BY_SOURCE.get(localConfig.source ?? 'lmstudio')
+  const showEndpointInput = !activeProvider || activeProvider.endpointEditMode === 'always'
+  const selectedFormat = localConfig.customApiFormat ?? activeProvider?.format ?? 'openai_chat'
 
-  useEffect(() => { setLocalConfig(llmConfig) }, [llmConfig])
+  useEffect(() => {
+    const provider = PROVIDER_BY_SOURCE.get(llmConfig.source ?? 'lmstudio')
+    setLocalConfig(normalizedConfigForProvider(llmConfig, provider, false))
+  }, [llmConfig])
 
   const handleFinish = async () => {
     setFinishing(true)
     try {
-      let safeConfig = localConfig
-      const apiKey = localConfig.apiKey.trim()
+      const provider = PROVIDER_BY_SOURCE.get(localConfig.source ?? 'lmstudio')
+      let safeConfig = normalizedConfigForProvider(localConfig, provider, false)
+      const apiKey = safeConfig.apiKey.trim()
       if (apiKey) {
         const session = await api.llmSessions.create({
           apiKey,
-          label: `${localConfig.source ?? localConfig.type}:${localConfig.model}`,
+          label: `${safeConfig.source ?? safeConfig.type}:${safeConfig.model}`,
         })
         safeConfig = {
-          ...localConfig,
+          ...safeConfig,
           apiKey: '',
           apiKeySessionId: session.sessionId,
         }
@@ -142,38 +177,48 @@ export function OnboardingWizard({ characters, onSelectCharacter, onComplete }: 
       return (
         <StepContent key="s1" icon={<Key size={20} />} title="配置 API" subtitle="设置 LLM 服务连接">
           <div className="space-y-3">
-            <Field label="API 地址">
+            <Field label="服务商">
               <select
+                aria-label="服务商"
                 value={localConfig.source ?? 'lmstudio'}
                 onChange={(e) => {
                   const provider = QUICK_PROVIDERS.find(p => p.value === e.target.value)
                   if (!provider) return
-                  setLocalConfig({
-                    ...localConfig,
-                    source: provider.value,
-                    apiUrl: provider.endpoint,
-                    model: provider.model,
-                    type: provider.value === 'custom_openai_chat' ? 'custom' : 'openai',
-                    customApiFormat: provider.format,
-                    azureConfig: provider.value === 'azure_openai'
-                      ? {
-                        resourceName: localConfig.azureConfig?.resourceName ?? '',
-                        deploymentName: localConfig.azureConfig?.deploymentName || provider.model,
-                        apiVersion: localConfig.azureConfig?.apiVersion || '2024-10-21',
-                      }
-                      : localConfig.azureConfig,
-                  })
+                  setLocalConfig(s => configForProvider(s, provider))
                 }}
-                className={cn(inputCls, 'mb-2')}
+                className={inputCls}
               >
                 {QUICK_PROVIDERS.map(provider => (
                   <option key={provider.value} value={provider.value}>{provider.label}</option>
                 ))}
               </select>
-              <input value={localConfig.apiUrl} onChange={(e) => setLocalConfig({ ...localConfig, apiUrl: e.target.value })} placeholder="http://localhost:1234/v1" className={inputCls} />
+              {activeProvider && (
+                <p className="mt-1 text-[11px] text-[var(--color-text-muted)]">{activeProvider.description}</p>
+              )}
             </Field>
+            {activeProvider && !showEndpointInput && (
+              <div className="rounded-lg border border-[var(--color-border-subtle)] bg-[var(--color-bg-surface)] px-3 py-2">
+                <div className="flex items-center justify-between gap-3">
+                  <span className="text-[11px] font-medium text-[var(--color-text-muted)]">连接摘要</span>
+                  <span className="text-[11px] text-[var(--color-text-secondary)]">{apiFormatLabel(selectedFormat)}</span>
+                </div>
+                <p className="mt-1 break-all text-xs text-[var(--color-text-secondary)]">{activeProvider.endpoint}</p>
+              </div>
+            )}
+            {showEndpointInput && (
+              <Field label="API 地址">
+                <input
+                  aria-label="API 地址"
+                  value={localConfig.apiUrl}
+                  onChange={(e) => setLocalConfig({ ...localConfig, apiUrl: e.target.value })}
+                  placeholder={activeProvider?.endpoint ?? 'http://localhost:1234/v1'}
+                  className={inputCls}
+                />
+              </Field>
+            )}
             <Field label="API Key（可选）">
               <input
+                aria-label="API Key（可选）"
                 type="password"
                 value={localConfig.apiKey}
                 onChange={(e) => setLocalConfig({ ...localConfig, apiKey: e.target.value })}
@@ -182,7 +227,7 @@ export function OnboardingWizard({ characters, onSelectCharacter, onComplete }: 
               />
             </Field>
             <Field label="模型名称">
-              <input value={localConfig.model} onChange={(e) => setLocalConfig({ ...localConfig, model: e.target.value })} placeholder="gpt-4o / local-model" className={inputCls} />
+              <input aria-label="模型名称" value={localConfig.model} onChange={(e) => setLocalConfig({ ...localConfig, model: e.target.value })} placeholder="gpt-4o / local-model" className={inputCls} />
             </Field>
           </div>
         </StepContent>

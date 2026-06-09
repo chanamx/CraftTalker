@@ -3,10 +3,39 @@ import { useTranslation } from 'react-i18next'
 import { marked } from 'marked'
 import DOMPurify from 'dompurify'
 import type { Tokens } from 'marked'
-import { createHighlighter } from 'shiki'
+import type { HighlighterGeneric, LanguageInput, ThemeInput } from 'shiki/core'
 import katex from 'katex'
 
-let highlighterPromise: ReturnType<typeof createHighlighter> | null = null
+const shikiThemes = {
+  'github-dark': () => import('@shikijs/themes/github-dark'),
+  'github-light': () => import('@shikijs/themes/github-light'),
+} satisfies Record<string, ThemeInput>
+
+const shikiLanguages = {
+  javascript: () => import('@shikijs/langs/javascript'),
+  jsx: () => import('@shikijs/langs/jsx'),
+  typescript: () => import('@shikijs/langs/typescript'),
+  tsx: () => import('@shikijs/langs/tsx'),
+  python: () => import('@shikijs/langs/python'),
+  bash: () => import('@shikijs/langs/bash'),
+  json: () => import('@shikijs/langs/json'),
+  css: () => import('@shikijs/langs/css'),
+  html: () => import('@shikijs/langs/html'),
+  markdown: () => import('@shikijs/langs/markdown'),
+  yaml: () => import('@shikijs/langs/yaml'),
+  rust: () => import('@shikijs/langs/rust'),
+  go: () => import('@shikijs/langs/go'),
+  java: () => import('@shikijs/langs/java'),
+  c: () => import('@shikijs/langs/c'),
+  sql: () => import('@shikijs/langs/sql'),
+} satisfies Record<string, LanguageInput>
+
+type ShikiLanguage = keyof typeof shikiLanguages
+type ShikiTheme = keyof typeof shikiThemes
+type MarkdownHighlighter = HighlighterGeneric<ShikiLanguage, ShikiTheme>
+
+let highlighterPromise: Promise<MarkdownHighlighter> | null = null
+const languageLoadPromises = new Map<ShikiLanguage, Promise<void>>()
 
 const markdownSanitizeConfig = {
   ALLOWED_TAGS: [
@@ -22,7 +51,6 @@ const markdownSanitizeConfig = {
   ],
   ALLOWED_ATTR: [
     'class', 'href', 'target', 'rel', 'title',
-    'data-lang',
   ],
   ALLOWED_URI_REGEXP: /^(?:https?|mailto):/i,
   ALLOW_ARIA_ATTR: false,
@@ -84,34 +112,72 @@ function normalizeCodeLanguage(lang: string | undefined): string {
   return /^[\w#+.-]{1,32}$/.test(normalized) ? normalized : 'text'
 }
 
+function resolveHighlightLanguage(lang: string): ShikiLanguage | null {
+  switch (lang) {
+    case 'js':
+    case 'mjs':
+    case 'cjs':
+      return 'javascript'
+    case 'ts':
+    case 'mts':
+    case 'cts':
+      return 'typescript'
+    case 'py':
+      return 'python'
+    case 'sh':
+    case 'shell':
+    case 'zsh':
+      return 'bash'
+    case 'yml':
+      return 'yaml'
+    case 'md':
+      return 'markdown'
+    case 'htm':
+      return 'html'
+    default:
+      return lang in shikiLanguages ? (lang as ShikiLanguage) : null
+  }
+}
+
+function getCodeLanguage(el: HTMLElement): string {
+  const languageClass = Array.from(el.classList).find((className) =>
+    className.startsWith('language-')
+  )
+  return languageClass ? normalizeCodeLanguage(languageClass.slice('language-'.length)) : 'text'
+}
+
 function isSafeLink(href: string | null | undefined): href is string {
   return /^(?:https?|mailto):/i.test((href || '').trim())
 }
 
-function getHighlighter() {
+async function getHighlighter(): Promise<MarkdownHighlighter> {
   if (!highlighterPromise) {
-    highlighterPromise = createHighlighter({
-      themes: ['github-dark', 'github-light'],
-      langs: [
-        'javascript',
-        'typescript',
-        'python',
-        'bash',
-        'json',
-        'css',
-        'html',
-        'markdown',
-        'yaml',
-        'rust',
-        'go',
-        'java',
-        'c',
-        'cpp',
-        'sql',
-      ],
+    highlighterPromise = Promise.all([
+      import('shiki/core'),
+      import('shiki/engine/javascript'),
+    ]).then(([core, engine]) => {
+      const createHighlighter = core.createBundledHighlighter<ShikiLanguage, ShikiTheme>({
+        langs: shikiLanguages,
+        themes: shikiThemes,
+        engine: () => engine.createJavaScriptRegexEngine(),
+      })
+      return createHighlighter({
+        themes: ['github-dark', 'github-light'],
+        langs: [],
+      })
     })
   }
   return highlighterPromise
+}
+
+async function ensureLanguageLoaded(highlighter: MarkdownHighlighter, lang: ShikiLanguage): Promise<void> {
+  if (highlighter.getLoadedLanguages().includes(lang)) return
+  let promise = languageLoadPromises.get(lang)
+  if (!promise) {
+    promise = highlighter.loadLanguage(lang)
+    languageLoadPromises.set(lang, promise)
+  }
+  await promise
 }
 
 const LATEX_INLINE = /\$([^$\n]+?)\$/g
@@ -159,7 +225,7 @@ renderer.code = function ({ text, lang }: Tokens.Code) {
   const escaped = escapeHtml(text)
   return `<div class="relative my-3 rounded-lg overflow-hidden border border-[var(--color-border-subtle)] markdown-code-block">
     <div class="flex items-center justify-between px-4 py-1.5 bg-[var(--color-bg-surface)] text-[var(--color-text-muted)] text-xs">${langLabel}<button class="copy-btn text-[10px] hover:text-[var(--color-accent)] transition-colors">复制</button></div>
-    <pre class="p-4 overflow-x-auto text-xs leading-relaxed font-mono bg-[var(--color-bg-elevated)]"><code class="shiki-target" data-lang="${safeLang}">${escaped}</code></pre>
+    <pre class="p-4 overflow-x-auto text-xs leading-relaxed font-mono bg-[var(--color-bg-elevated)]"><code class="shiki-target language-${safeLang}">${escaped}</code></pre>
   </div>`
 }
 
@@ -283,13 +349,17 @@ export function Markdown({ content, isUser }: MarkdownProps) {
     const isDark = document.documentElement.classList.contains('dark')
     const theme = isDark ? 'github-dark' : 'github-light'
 
-    getHighlighter().then((highlighter) => {
-      codeElements.forEach((el) => {
-        const lang = el.dataset.lang || 'text'
+    getHighlighter().then(async (highlighter) => {
+      for (const el of codeElements) {
+        const lang = getCodeLanguage(el)
+        const highlightLang = resolveHighlightLanguage(lang)
+        if (!highlightLang) continue
+
         const code = el.textContent || ''
         try {
+          await ensureLanguageLoaded(highlighter, highlightLang)
           const html = highlighter.codeToHtml(code, {
-            lang,
+            lang: highlightLang,
             theme,
           })
           const match = html.match(/<code[^>]*>([\s\S]*?)<\/code>/)
@@ -299,7 +369,7 @@ export function Markdown({ content, isUser }: MarkdownProps) {
         } catch {
           el.textContent = code
         }
-      })
+      }
       setRenderTick((t) => t + 1)
     })
   }, [html])

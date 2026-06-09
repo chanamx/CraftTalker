@@ -1,10 +1,18 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { api, type PresetData, type PresetType } from '@/lib/api'
+import { api, type PresetData, type PresetIndexEntry, type PresetType } from '@/lib/api'
 
 export function usePresets(type: PresetType | null) {
   return useQuery<string[]>({
     queryKey: ['presets', type],
     queryFn: () => api.presets.list(type!),
+    enabled: !!type,
+  })
+}
+
+export function usePresetEntries(type: PresetType | null) {
+  return useQuery<PresetIndexEntry[]>({
+    queryKey: ['presets', type, 'details'],
+    queryFn: () => api.presets.listDetails(type!),
     enabled: !!type,
   })
 }
@@ -24,6 +32,7 @@ export function useSavePreset() {
       api.presets.save(type, preset),
     onSuccess: (_, { type }) => {
       qc.invalidateQueries({ queryKey: ['presets', type] })
+      qc.invalidateQueries({ queryKey: ['presets', type, 'details'] })
     },
   })
 }
@@ -35,6 +44,7 @@ export function useDeletePreset() {
       api.presets.delete(type, name),
     onSuccess: (_, { type }) => {
       qc.invalidateQueries({ queryKey: ['presets', type] })
+      qc.invalidateQueries({ queryKey: ['presets', type, 'details'] })
     },
   })
 }

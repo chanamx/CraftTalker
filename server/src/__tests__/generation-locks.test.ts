@@ -6,7 +6,7 @@ import { createApp } from '../app.js'
 import { setEngine, NativeEngine } from '../engine/index.js'
 import { clearGenerationLocksForTest } from '../lib/generation-locks.js'
 import type { Engine, EngineRequest, EngineResponse } from '../engine/types.js'
-import { addMessage, getChat } from '../services/chat.service.js'
+import { addMessage, getChat, updateChatMetadata } from '../services/chat.service.js'
 import { listGenerationRuns } from '../services/run.service.js'
 import { clearLlmKeySessionsForTest } from '../services/llm-session.service.js'
 
@@ -64,8 +64,14 @@ function writeCharacter(name: string) {
   )
 }
 
-async function createChat(app: ReturnType<typeof createApp>, characterName: string): Promise<string> {
-  const res = await app.request(`/api/chats/${characterName}`, { method: 'POST' })
+async function createChat(app: ReturnType<typeof createApp>, characterName: string, userName?: string): Promise<string> {
+  const res = await app.request(`/api/chats/${characterName}`, {
+    method: 'POST',
+    ...(userName ? {
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ userName }),
+    } : {}),
+  })
   expect(res.status).toBe(201)
   const body = await res.json() as { chatId: string }
   return body.chatId
@@ -198,5 +204,334 @@ describe('generation locks', () => {
     const runs = await listGenerationRuns()
     expect(JSON.stringify(runs)).not.toContain('sk-session-secret')
     expect(JSON.stringify(runs)).not.toContain(session.sessionId)
+  })
+
+  it('scans world info against ST-style speaker name prefixes during generation', async () => {
+    const app = createApp()
+    writeCharacter('NameScanBot')
+    const charPath = path.join(testDataDir, 'characters', 'NameScanBot', 'character.json')
+    fs.writeFileSync(
+      charPath,
+      JSON.stringify({
+        name: 'NameScanBot',
+        description: 'Test bot',
+        extensions: { world: 'NameScanWorld' },
+      }),
+      'utf8',
+    )
+    fs.writeFileSync(
+      path.join(testDataDir, 'worlds', 'NameScanWorld.json'),
+      JSON.stringify({
+        name: 'NameScanWorld',
+        enabled: true,
+        global_enabled: false,
+        entries: {
+          '1': {
+            uid: 1,
+            key: ['Alice:'],
+            content: 'speaker-specific lore',
+            enabled: true,
+            insertion_order: 100,
+          },
+        },
+      }),
+      'utf8',
+    )
+
+    const chatId = await createChat(app, 'NameScanBot')
+    await addMessage('NameScanBot', chatId, true, 'hello there', 'Alice')
+
+    const res = await streamRequest(app, 'NameScanBot', chatId)
+    expect(res.status).toBe(200)
+    await drain(res)
+
+    expect(lastEngineRequest?.messages).toEqual([
+      { role: 'user', content: 'hello there' },
+    ])
+    expect(lastEngineRequest?.worldEntries?.map(entry => entry.content)).toEqual(['speaker-specific lore'])
+  })
+
+  it('resolves ST macros in world info scan keys during generation', async () => {
+    const app = createApp()
+    writeCharacter('MacroScanBot')
+    const charPath = path.join(testDataDir, 'characters', 'MacroScanBot', 'character.json')
+    fs.writeFileSync(
+      charPath,
+      JSON.stringify({
+        name: 'MacroScanBot',
+        description: 'Test bot',
+        extensions: { world: 'MacroScanWorld' },
+      }),
+      'utf8',
+    )
+    fs.writeFileSync(
+      path.join(testDataDir, 'worlds', 'MacroScanWorld.json'),
+      JSON.stringify({
+        name: 'MacroScanWorld',
+        enabled: true,
+        global_enabled: false,
+        entries: {
+          '1': {
+            uid: 1,
+            key: ['{{user}}'],
+            content: 'macro-scanned lore',
+            enabled: true,
+            insertion_order: 100,
+          },
+        },
+      }),
+      'utf8',
+    )
+
+    const chatId = await createChat(app, 'MacroScanBot', 'Alice')
+    await addMessage('MacroScanBot', chatId, true, 'Alice found the sigil.', 'Alice')
+
+    const res = await streamRequest(app, 'MacroScanBot', chatId)
+    expect(res.status).toBe(200)
+    await drain(res)
+
+    expect(lastEngineRequest?.worldEntries?.map(entry => entry.content)).toEqual(['macro-scanned lore'])
+  })
+
+  it('honors ST-style world info include-name metadata during generation', async () => {
+    const app = createApp()
+    writeCharacter('NoNameScanBot')
+    const charPath = path.join(testDataDir, 'characters', 'NoNameScanBot', 'character.json')
+    fs.writeFileSync(
+      charPath,
+      JSON.stringify({
+        name: 'NoNameScanBot',
+        description: 'Test bot',
+        extensions: { world: 'NoNameScanWorld' },
+      }),
+      'utf8',
+    )
+    fs.writeFileSync(
+      path.join(testDataDir, 'worlds', 'NoNameScanWorld.json'),
+      JSON.stringify({
+        name: 'NoNameScanWorld',
+        enabled: true,
+        global_enabled: false,
+        entries: {
+          '1': {
+            uid: 1,
+            key: ['Alice:'],
+            content: 'speaker-specific lore',
+            enabled: true,
+            insertion_order: 100,
+          },
+        },
+      }),
+      'utf8',
+    )
+
+    const chatId = await createChat(app, 'NoNameScanBot')
+    await addMessage('NoNameScanBot', chatId, true, 'hello there', 'Alice')
+    await updateChatMetadata('NoNameScanBot', chatId, {
+      world_info_settings: { world_info_include_names: false },
+    })
+
+    const res = await streamRequest(app, 'NoNameScanBot', chatId)
+    expect(res.status).toBe(200)
+    await drain(res)
+
+    expect(lastEngineRequest?.messages).toEqual([
+      { role: 'user', content: 'hello there' },
+    ])
+    expect(lastEngineRequest?.worldEntries).toBeUndefined()
+  })
+
+  it('scans extension prompts marked for world-info scanning during generation', async () => {
+    const app = createApp()
+    writeCharacter('ExtensionScanBot')
+    const charPath = path.join(testDataDir, 'characters', 'ExtensionScanBot', 'character.json')
+    fs.writeFileSync(
+      charPath,
+      JSON.stringify({
+        name: 'ExtensionScanBot',
+        description: 'Test bot',
+        extensions: { world: 'ExtensionScanWorld' },
+      }),
+      'utf8',
+    )
+    fs.writeFileSync(
+      path.join(testDataDir, 'worlds', 'ExtensionScanWorld.json'),
+      JSON.stringify({
+        name: 'ExtensionScanWorld',
+        enabled: true,
+        global_enabled: false,
+        entries: {
+          '1': {
+            uid: 1,
+            key: ['hidden archive'],
+            content: 'extension-scanned lore',
+            enabled: true,
+            insertion_order: 100,
+          },
+        },
+      }),
+      'utf8',
+    )
+
+    const chatId = await createChat(app, 'ExtensionScanBot')
+    await addMessage('ExtensionScanBot', chatId, true, 'plain message', 'Alice')
+    await updateChatMetadata('ExtensionScanBot', chatId, {
+      extensionPrompts: {
+        note: { scan: true, value: 'The hidden archive is open.' },
+        ignored: { scan: false, value: 'This should not be scanned.' },
+      },
+    })
+
+    const res = await streamRequest(app, 'ExtensionScanBot', chatId)
+    expect(res.status).toBe(200)
+    await drain(res)
+
+    expect(lastEngineRequest?.worldEntries?.map(entry => entry.content)).toEqual(['extension-scanned lore'])
+  })
+
+  it('force activates vectorized world info entries from ST-compatible metadata during generation', async () => {
+    const app = createApp()
+    writeCharacter('ForcedVectorBot')
+    const charPath = path.join(testDataDir, 'characters', 'ForcedVectorBot', 'character.json')
+    fs.writeFileSync(
+      charPath,
+      JSON.stringify({
+        name: 'ForcedVectorBot',
+        description: 'Test bot',
+        extensions: { world: 'ForcedVectorWorld' },
+      }),
+      'utf8',
+    )
+    fs.writeFileSync(
+      path.join(testDataDir, 'worlds', 'ForcedVectorWorld.json'),
+      JSON.stringify({
+        name: 'ForcedVectorWorld',
+        enabled: true,
+        global_enabled: false,
+        entries: {
+          '0': {
+            uid: 0,
+            key: ['not in chat'],
+            content: 'forced-vector lore',
+            enabled: true,
+            insertion_order: 100,
+            vectorized: true,
+          },
+        },
+      }),
+      'utf8',
+    )
+
+    const chatId = await createChat(app, 'ForcedVectorBot')
+    await addMessage('ForcedVectorBot', chatId, true, 'plain message', 'Alice')
+    await updateChatMetadata('ForcedVectorBot', chatId, {
+      worldinfo_force_activate: [{ world: 'ForcedVectorWorld', uid: '0' }],
+    })
+
+    const res = await streamRequest(app, 'ForcedVectorBot', chatId)
+    expect(res.status).toBe(200)
+    await drain(res)
+
+    expect(lastEngineRequest?.worldEntries?.map(entry => entry.content)).toEqual(['forced-vector lore'])
+  })
+
+  it('loads persona lorebooks from ST-compatible chat metadata during generation', async () => {
+    const app = createApp()
+    writeCharacter('PersonaScanBot')
+    fs.writeFileSync(
+      path.join(testDataDir, 'worlds', 'PersonaScanWorld.json'),
+      JSON.stringify({
+        name: 'PersonaScanWorld',
+        enabled: true,
+        global_enabled: false,
+        entries: {
+          '1': {
+            uid: 1,
+            key: ['silver mask'],
+            content: 'persona-scanned lore',
+            enabled: true,
+            insertion_order: 100,
+            extensions: { match_persona_description: true },
+          },
+        },
+      }),
+      'utf8',
+    )
+
+    const chatId = await createChat(app, 'PersonaScanBot')
+    await addMessage('PersonaScanBot', chatId, true, 'plain message', 'Alice')
+    await updateChatMetadata('PersonaScanBot', chatId, {
+      persona_description_lorebook: 'PersonaScanWorld',
+      persona_description: 'The speaker carries a silver mask.',
+    })
+
+    const res = await streamRequest(app, 'PersonaScanBot', chatId)
+    expect(res.status).toBe(200)
+    await drain(res)
+
+    expect(lastEngineRequest?.worldEntries?.map(entry => entry.content)).toEqual(['persona-scanned lore'])
+  })
+
+  it('does not let disabled world recursion depth suppress ST min-activation depth expansion during generation', async () => {
+    const app = createApp()
+    writeCharacter('MinActivationBot')
+    const charPath = path.join(testDataDir, 'characters', 'MinActivationBot', 'character.json')
+    fs.writeFileSync(
+      charPath,
+      JSON.stringify({
+        name: 'MinActivationBot',
+        description: 'Test bot',
+        extensions: { world: 'MinActivationWorld' },
+      }),
+      'utf8',
+    )
+    fs.writeFileSync(
+      path.join(testDataDir, 'worlds', 'MinActivationWorld.json'),
+      JSON.stringify({
+        name: 'MinActivationWorld',
+        enabled: true,
+        global_enabled: false,
+        recursive_scanning: false,
+        recursive_scanning_depth: 2,
+        entries: {
+          '1': {
+            uid: 1,
+            key: ['alpha'],
+            content: 'first-depth lore',
+            enabled: true,
+            insertion_order: 90,
+          },
+          '2': {
+            uid: 2,
+            key: ['beta'],
+            content: 'expanded-depth lore',
+            enabled: true,
+            insertion_order: 100,
+          },
+        },
+      }),
+      'utf8',
+    )
+
+    const chatId = await createChat(app, 'MinActivationBot')
+    await addMessage('MinActivationBot', chatId, true, 'beta', 'Alice')
+    await addMessage('MinActivationBot', chatId, true, 'alpha', 'Alice')
+    await updateChatMetadata('MinActivationBot', chatId, {
+      world_info_settings: {
+        world_info_depth: 1,
+        world_info_min_activations: 2,
+        world_info_min_activations_depth_max: 2,
+        world_info_recursive: false,
+      },
+    })
+
+    const res = await streamRequest(app, 'MinActivationBot', chatId)
+    expect(res.status).toBe(200)
+    await drain(res)
+
+    expect(lastEngineRequest?.worldEntries?.map(entry => entry.content)).toEqual([
+      'first-depth lore',
+      'expanded-depth lore',
+    ])
   })
 })

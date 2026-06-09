@@ -31,9 +31,13 @@ const MAX_SCAN_DEPTH = 1000
 const KNOWN_DECORATORS = ['@@activate', '@@dont_activate']
 
 type SourceType = 'chat' | 'persona' | 'character' | 'global'
-type ScanState = 'initial' | 'recursion' | 'min_activations'
-type TimedEffectType = 'sticky' | 'cooldown'
+export type WorldInfoScanState = 'initial' | 'recursion' | 'min_activations'
+type ScanState = WorldInfoScanState
+export type WorldInfoTimedEffectType = 'sticky' | 'cooldown' | 'delay'
+type TimedEffectType = Exclude<WorldInfoTimedEffectType, 'delay'>
 export type TokenCounter = (text: string) => number | Promise<number>
+export type WorldInfoMacroResolver = (text: string) => string
+export type WorldInfoVectorActivator = (input: WorldInfoVectorActivationInput) => WorldInfoVectorActivation[] | Promise<WorldInfoVectorActivation[]>
 
 export interface MatchedEntry {
   content: string
@@ -77,6 +81,41 @@ export interface WorldInfoScanSettings {
   dryRun?: boolean
   tokenCounter?: TokenCounter
   scanDoneHooks?: WorldInfoScanDoneHook[]
+  includeNames?: boolean
+  scanInjects?: string[]
+  forceActivations?: WorldInfoForceActivation[]
+  vectorActivations?: WorldInfoVectorActivation[]
+  vectorActivator?: WorldInfoVectorActivator
+  macroResolver?: WorldInfoMacroResolver
+}
+
+export interface WorldInfoChatMessage {
+  name?: string
+  content: string
+}
+
+export interface WorldInfoForceActivation {
+  world: string
+  uid: number
+  content?: string
+  position?: number
+  depth?: number
+  insertion_order?: number
+  role?: number
+}
+
+export interface WorldInfoVectorActivation extends WorldInfoForceActivation {
+  score?: number
+  source?: string
+}
+
+export interface WorldInfoVectorActivationInput {
+  entries: WorldInfoCompatEntry[]
+  vectorizedEntries: WorldInfoCompatEntry[]
+  chat: string[]
+  scanText: string
+  trigger: string
+  isDryRun: boolean
 }
 
 export interface WorldInfoGlobalScanData {
@@ -103,14 +142,17 @@ export interface WorldInfoPromptResult {
   timedEffectsChanged: boolean
   scanEvents: WorldInfoScanEvent[]
   vectorizedSkipped: WorldInfoScanEvent[]
+  vectorizedActivated: WorldInfoScanEvent[]
 }
 
 export interface WorldInfoScanEvent {
-  type: 'vectorized_skipped' | 'scan_done'
+  type: 'vectorized_skipped' | 'vectorized_activated' | 'scan_done'
   entryId?: string
   world?: string
   uid?: number
   reason?: string
+  source?: string
+  score?: number
   loopCount?: number
   currentState?: ScanState
   nextState?: ScanState | null
@@ -127,9 +169,62 @@ export interface WorldInfoScanHookInput {
   activatedEntries: WorldInfoCompatEntry[]
   budgetRemaining: number
   overflowed: boolean
+  state: WorldInfoScanHookState
+  trigger: string
+  isDryRun: boolean
+  isFinal: boolean
+  new: WorldInfoScanHookNewEntries
+  activated: WorldInfoScanHookActivatedEntries
+  sortedEntries: WorldInfoCompatEntry[]
+  recursionDelay: WorldInfoScanHookRecursionDelay
+  budget: WorldInfoScanHookBudget
+  timedEffects: WorldInfoTimedEffectsHookState
 }
 
-type WorldInfoScanHookPatch = Partial<Pick<WorldInfoScanHookInput, 'nextState' | 'overflowed' | 'budgetRemaining'>>
+export interface WorldInfoScanHookState {
+  current: ScanState
+  next: ScanState | null
+  loopCount: number
+}
+
+export interface WorldInfoScanHookNewEntries {
+  all: WorldInfoCompatEntry[]
+  successful: WorldInfoCompatEntry[]
+}
+
+export interface WorldInfoScanHookActivatedEntries {
+  entries: Map<string, WorldInfoCompatEntry>
+  text: string
+}
+
+export interface WorldInfoScanHookRecursionDelay {
+  availableLevels: number[]
+  currentLevel: number
+}
+
+export interface WorldInfoScanHookBudget {
+  current: number
+  overflowed: boolean
+}
+
+export interface WorldInfoTimedEffectsHookState {
+  metadata: WorldInfoTimedEffectsMetadata
+  changed: boolean
+  sticky: Set<string>
+  cooldown: Set<string>
+  delay: Set<string>
+  chatLength: number
+  isEffectActive: (type: WorldInfoTimedEffectType, entry: WorldInfoCompatEntry) => boolean
+  getEffectMetadata: (type: WorldInfoTimedEffectType, entry: WorldInfoCompatEntry) => WorldInfoTimedEffect | undefined
+  setTimedEffect: (type: WorldInfoTimedEffectType, entry: WorldInfoCompatEntry, newState: boolean) => void
+}
+
+type WorldInfoScanHookPatch = Partial<Pick<WorldInfoScanHookInput, 'nextState' | 'overflowed' | 'budgetRemaining'>> & {
+  state?: Partial<WorldInfoScanHookState>
+  activated?: Partial<WorldInfoScanHookActivatedEntries>
+  recursionDelay?: Partial<WorldInfoScanHookRecursionDelay>
+  budget?: Partial<WorldInfoScanHookBudget>
+}
 export type WorldInfoScanDoneHook = (input: WorldInfoScanHookInput) => void | WorldInfoScanHookPatch | Promise<void | WorldInfoScanHookPatch>
 
 export interface WorldInfoTimedEffect {
@@ -203,6 +298,7 @@ interface WorldInfoCharacterFilter {
 interface CheckWorldInfoInput {
   sources: WorldInfoSource[]
   chat: string[]
+  chatMessages?: WorldInfoChatMessage[]
   maxContext?: number
   settings?: WorldInfoScanSettings
 }
@@ -218,6 +314,7 @@ interface ScanBuffer {
 interface TimedEffectRuntime {
   metadata: WorldInfoTimedEffectsMetadata
   changed: boolean
+  dryRun: boolean
   sticky: Set<string>
   cooldown: Set<string>
   delay: Set<string>
@@ -233,9 +330,12 @@ interface CheckWorldInfoRuntime {
   scanState: ScanState | null
   loopCount: number
   currentRecursionDelayLevel: number
+  availableRecursionDelayLevels: number[]
   activated: Map<string, WorldInfoCompatEntry>
   failedProbability: Set<string>
   skippedVectorized: Set<string>
+  activatedVectorized: Set<string>
+  forceActivations: Map<string, Partial<WorldInfoCompatEntry>>
   timedEffects: TimedEffectRuntime
   scanEvents: WorldInfoScanEvent[]
   activatedText: string
@@ -293,7 +393,7 @@ export function checkWorldInfoSync(input: CheckWorldInfoInput): WorldInfoPromptR
 }
 
 async function runCheckWorldInfo(input: CheckWorldInfoInput): Promise<WorldInfoPromptResult> {
-  const settings = input.settings ?? {}
+  const settings = normalizeScanSettings(input.settings)
   const runtime = createRuntime(input, settings)
 
   while (runtime.scanState) {
@@ -305,17 +405,14 @@ async function runCheckWorldInfo(input: CheckWorldInfoInput): Promise<WorldInfoP
     for (const entry of runtime.sortedEntries) {
       const key = entryId(entry)
       if (runtime.activated.has(key) || runtime.failedProbability.has(key)) continue
-      if (!entry.enabled || !entry.content) continue
-      if (entry.vectorized) {
-        pushVectorizedSkippedEvent(runtime, entry)
-        continue
-      }
+      if (!entry.enabled) continue
       if (!isEntryAllowedForScan(entry, settings)) continue
+      const isSticky = isTimedEffectActive(runtime.timedEffects, 'sticky', entry)
       if (isTimedEffectActive(runtime.timedEffects, 'delay', entry)) continue
-      if (isTimedEffectActive(runtime.timedEffects, 'cooldown', entry) && !isTimedEffectActive(runtime.timedEffects, 'sticky', entry)) continue
-      if (runtime.scanState === 'recursion' && entry.excludeRecursion) continue
-      if (runtime.scanState !== 'recursion' && entry.delayUntilRecursion > 0) continue
-      if (runtime.scanState === 'recursion' && entry.delayUntilRecursion > runtime.currentRecursionDelayLevel) continue
+      if (isTimedEffectActive(runtime.timedEffects, 'cooldown', entry) && !isSticky) continue
+      if (runtime.scanState === 'recursion' && entry.excludeRecursion && !isSticky) continue
+      if (runtime.scanState !== 'recursion' && entry.delayUntilRecursion > 0 && !isSticky) continue
+      if (runtime.scanState === 'recursion' && entry.delayUntilRecursion > runtime.currentRecursionDelayLevel && !isSticky) continue
 
       if (entry.decorators.includes('@@dont_activate')) continue
       if (entry.decorators.includes('@@activate')) {
@@ -323,7 +420,20 @@ async function runCheckWorldInfo(input: CheckWorldInfoInput): Promise<WorldInfoP
         continue
       }
 
-      if (isTimedEffectActive(runtime.timedEffects, 'sticky', entry)) {
+      const forcedEntry = getForcedActivation(runtime, entry)
+      if (forcedEntry) {
+        possibleEntries.push(forcedEntry)
+        continue
+      }
+
+      if (!entry.content) continue
+
+      if (entry.vectorized) {
+        pushVectorizedSkippedEvent(runtime, entry)
+        continue
+      }
+
+      if (isSticky) {
         possibleEntries.push(entry)
         continue
       }
@@ -357,50 +467,38 @@ async function runCheckWorldInfo(input: CheckWorldInfoInput): Promise<WorldInfoP
 
       if (!passesProbabilityCheck(runtime, entry)) continue
 
-      newContent += `${entry.content}\n`
+      const activatedEntry = resolveEntryForActivation(entry, settings)
+      newContent += `${activatedEntry.content}\n`
       const prospectiveTokens = activatedTokens + await countTokens(runtime.tokenCounter, newContent)
       if (!entry.ignoreBudget && prospectiveTokens >= runtime.budget) {
         runtime.overflowed = true
         continue
       }
 
-      runtime.activated.set(entryId(entry), entry)
-      successfulEntries.push(entry)
+      runtime.activated.set(entryId(entry), activatedEntry)
+      successfulEntries.push(activatedEntry)
     }
 
     const successfulForRecursion = successfulEntries.filter(entry => !entry.preventRecursion)
-    const nextScanState = getNextScanState(runtime, settings, successfulForRecursion)
+    const baseNextScanState = getNextScanState(runtime, settings, successfulForRecursion)
+    updateRecursionBuffer(runtime, baseNextScanState, successfulForRecursion)
     const usedTokens = await countTokens(runtime.tokenCounter, getActivatedText(runtime.activated))
     const budgetRemaining = Math.max(0, runtime.budget - usedTokens)
-
-    const hookPatch = await emitScanDoneHooks(settings, {
-      loopCount: runtime.loopCount,
-      currentState: runtime.scanState,
-      nextState: nextScanState,
-      newEntries,
-      successfulEntries,
-      activatedEntries: [...runtime.activated.values()],
-      budgetRemaining,
-      overflowed: runtime.overflowed,
-    })
-    const patchedNextState = Object.hasOwn(hookPatch, 'nextState') ? hookPatch.nextState! : nextScanState
-    const patchedOverflowed = Object.hasOwn(hookPatch, 'overflowed') ? hookPatch.overflowed! : runtime.overflowed
+    const hookInput = buildScanHookInput(runtime, settings, newEntries, successfulEntries, baseNextScanState, budgetRemaining)
+    const hookPatch = await emitScanDoneHooks(settings, hookInput)
+    const patchResult = applyScanHookPatch(runtime, hookInput, hookPatch, usedTokens)
 
     runtime.scanEvents.push({
       type: 'scan_done',
       loopCount: runtime.loopCount,
       currentState: runtime.scanState,
-      nextState: patchedNextState,
+      nextState: patchResult.nextState,
       activatedCount: runtime.activated.size,
-      overflowed: patchedOverflowed,
+      overflowed: patchResult.overflowed,
     })
 
-    if (Object.hasOwn(hookPatch, 'budgetRemaining') && Number.isFinite(hookPatch.budgetRemaining)) {
-      runtime.budget = usedTokens + Math.max(0, Math.floor(hookPatch.budgetRemaining!))
-    }
-    runtime.overflowed = patchedOverflowed
-    runtime.scanState = patchedNextState
-    updateRecursionBuffer(runtime, runtime.scanState, successfulForRecursion)
+    runtime.overflowed = patchResult.overflowed
+    runtime.scanState = patchResult.nextState
   }
 
   setTimedEffects(runtime.timedEffects, [...runtime.activated.values()], settings.dryRun === true)
@@ -408,7 +506,7 @@ async function runCheckWorldInfo(input: CheckWorldInfoInput): Promise<WorldInfoP
 }
 
 function runCheckWorldInfoSync(input: CheckWorldInfoInput): WorldInfoPromptResult {
-  const settings = input.settings ?? {}
+  const settings = normalizeScanSettings(input.settings)
   const runtime = createRuntime(input, settings)
 
   while (runtime.scanState) {
@@ -420,17 +518,14 @@ function runCheckWorldInfoSync(input: CheckWorldInfoInput): WorldInfoPromptResul
     for (const entry of runtime.sortedEntries) {
       const key = entryId(entry)
       if (runtime.activated.has(key) || runtime.failedProbability.has(key)) continue
-      if (!entry.enabled || !entry.content) continue
-      if (entry.vectorized) {
-        pushVectorizedSkippedEvent(runtime, entry)
-        continue
-      }
+      if (!entry.enabled) continue
       if (!isEntryAllowedForScan(entry, settings)) continue
+      const isSticky = isTimedEffectActive(runtime.timedEffects, 'sticky', entry)
       if (isTimedEffectActive(runtime.timedEffects, 'delay', entry)) continue
-      if (isTimedEffectActive(runtime.timedEffects, 'cooldown', entry) && !isTimedEffectActive(runtime.timedEffects, 'sticky', entry)) continue
-      if (runtime.scanState === 'recursion' && entry.excludeRecursion) continue
-      if (runtime.scanState !== 'recursion' && entry.delayUntilRecursion > 0) continue
-      if (runtime.scanState === 'recursion' && entry.delayUntilRecursion > runtime.currentRecursionDelayLevel) continue
+      if (isTimedEffectActive(runtime.timedEffects, 'cooldown', entry) && !isSticky) continue
+      if (runtime.scanState === 'recursion' && entry.excludeRecursion && !isSticky) continue
+      if (runtime.scanState !== 'recursion' && entry.delayUntilRecursion > 0 && !isSticky) continue
+      if (runtime.scanState === 'recursion' && entry.delayUntilRecursion > runtime.currentRecursionDelayLevel && !isSticky) continue
 
       if (entry.decorators.includes('@@dont_activate')) continue
       if (entry.decorators.includes('@@activate')) {
@@ -438,7 +533,20 @@ function runCheckWorldInfoSync(input: CheckWorldInfoInput): WorldInfoPromptResul
         continue
       }
 
-      if (isTimedEffectActive(runtime.timedEffects, 'sticky', entry)) {
+      const forcedEntry = getForcedActivation(runtime, entry)
+      if (forcedEntry) {
+        possibleEntries.push(forcedEntry)
+        continue
+      }
+
+      if (!entry.content) continue
+
+      if (entry.vectorized) {
+        pushVectorizedSkippedEvent(runtime, entry)
+        continue
+      }
+
+      if (isSticky) {
         possibleEntries.push(entry)
         continue
       }
@@ -472,62 +580,64 @@ function runCheckWorldInfoSync(input: CheckWorldInfoInput): WorldInfoPromptResul
 
       if (!passesProbabilityCheck(runtime, entry)) continue
 
-      newContent += `${entry.content}\n`
+      const activatedEntry = resolveEntryForActivation(entry, settings)
+      newContent += `${activatedEntry.content}\n`
       const prospectiveTokens = activatedTokens + countTokensSync(runtime.tokenCounter, newContent)
       if (!entry.ignoreBudget && prospectiveTokens >= runtime.budget) {
         runtime.overflowed = true
         continue
       }
 
-      runtime.activated.set(entryId(entry), entry)
-      successfulEntries.push(entry)
+      runtime.activated.set(entryId(entry), activatedEntry)
+      successfulEntries.push(activatedEntry)
     }
 
     const successfulForRecursion = successfulEntries.filter(entry => !entry.preventRecursion)
-    const nextScanState = getNextScanState(runtime, settings, successfulForRecursion)
+    const baseNextScanState = getNextScanState(runtime, settings, successfulForRecursion)
+    updateRecursionBuffer(runtime, baseNextScanState, successfulForRecursion)
     const usedTokens = countTokensSync(runtime.tokenCounter, getActivatedText(runtime.activated))
     const budgetRemaining = Math.max(0, runtime.budget - usedTokens)
-
-    const hookPatch = emitScanDoneHooksSync(settings, {
-      loopCount: runtime.loopCount,
-      currentState: runtime.scanState,
-      nextState: nextScanState,
-      newEntries,
-      successfulEntries,
-      activatedEntries: [...runtime.activated.values()],
-      budgetRemaining,
-      overflowed: runtime.overflowed,
-    })
-    const patchedNextState = Object.hasOwn(hookPatch, 'nextState') ? hookPatch.nextState! : nextScanState
-    const patchedOverflowed = Object.hasOwn(hookPatch, 'overflowed') ? hookPatch.overflowed! : runtime.overflowed
+    const hookInput = buildScanHookInput(runtime, settings, newEntries, successfulEntries, baseNextScanState, budgetRemaining)
+    const hookPatch = emitScanDoneHooksSync(settings, hookInput)
+    const patchResult = applyScanHookPatch(runtime, hookInput, hookPatch, usedTokens)
 
     runtime.scanEvents.push({
       type: 'scan_done',
       loopCount: runtime.loopCount,
       currentState: runtime.scanState,
-      nextState: patchedNextState,
+      nextState: patchResult.nextState,
       activatedCount: runtime.activated.size,
-      overflowed: patchedOverflowed,
+      overflowed: patchResult.overflowed,
     })
 
-    if (Object.hasOwn(hookPatch, 'budgetRemaining') && Number.isFinite(hookPatch.budgetRemaining)) {
-      runtime.budget = usedTokens + Math.max(0, Math.floor(hookPatch.budgetRemaining!))
-    }
-    runtime.overflowed = patchedOverflowed
-    runtime.scanState = patchedNextState
-    updateRecursionBuffer(runtime, runtime.scanState, successfulForRecursion)
+    runtime.overflowed = patchResult.overflowed
+    runtime.scanState = patchResult.nextState
   }
 
   setTimedEffects(runtime.timedEffects, [...runtime.activated.values()], settings.dryRun === true)
   return buildPromptResult([...runtime.activated.values()], runtime.overflowed, runtime.timedEffects, runtime.scanEvents)
 }
 
+function normalizeScanSettings(settings: WorldInfoScanSettings | undefined): WorldInfoScanSettings {
+  const normalized = { ...(settings ?? {}) }
+  const minActivations = normalized.minActivations ?? 0
+  const maxRecursionSteps = normalized.maxRecursionSteps ?? 0
+  if (maxRecursionSteps > 0 && minActivations > 0) {
+    normalized.minActivations = 0
+    normalized.minActivationsDepthMax = 0
+  }
+  return normalized
+}
+
 function createRuntime(input: CheckWorldInfoInput, settings: WorldInfoScanSettings): CheckWorldInfoRuntime {
   const sortedEntries = getSortedWorldInfoEntries(input.sources, settings)
+  const chat = normalizeScanChat(input, settings)
+  const availableRecursionDelayLevels = getRecursionDelayLevels(sortedEntries)
+  const currentRecursionDelayLevel = availableRecursionDelayLevels.shift() ?? 0
   const buffer: ScanBuffer = {
-    chat: input.chat.map(message => message.trim()),
+    chat,
     recurse: [],
-    inject: [],
+    inject: normalizeScanInjects(settings.scanInjects),
     depth: clampDepth(settings.depth ?? inferDepth(sortedEntries)),
     startDepth: 0,
   }
@@ -540,15 +650,63 @@ function createRuntime(input: CheckWorldInfoInput, settings: WorldInfoScanSettin
     overflowed: false,
     scanState: 'initial',
     loopCount: 0,
-    currentRecursionDelayLevel: getNextRecursionDelayLevel(sortedEntries, 0),
+    currentRecursionDelayLevel,
+    availableRecursionDelayLevels,
     activated: new Map(),
     failedProbability: new Set(),
     skippedVectorized: new Set(),
-    timedEffects: prepareTimedEffects(settings.timedEffects, sortedEntries, input.chat.length, settings.dryRun === true),
+    forceActivations: normalizeForceActivations(settings.forceActivations),
+    timedEffects: prepareTimedEffects(settings.timedEffects, sortedEntries, chat.length, settings.dryRun === true),
     scanEvents: [],
     activatedText: '',
     tokenCounter: settings.tokenCounter ?? estimateTokenCount,
   }
+}
+
+function normalizeScanChat(input: CheckWorldInfoInput, settings: WorldInfoScanSettings): string[] {
+  if (!input.chatMessages) return input.chat.map(message => message.trim())
+  return input.chatMessages.map((message) => {
+    const content = message.content.trim()
+    const name = message.name?.trim()
+    return settings.includeNames !== false && name ? `${name}: ${content}` : content
+  })
+}
+
+function normalizeScanInjects(scanInjects: string[] | undefined): string[] {
+  return Array.isArray(scanInjects)
+    ? scanInjects.map(item => item.trim()).filter(Boolean)
+    : []
+}
+
+function normalizeForceActivations(forceActivations: WorldInfoForceActivation[] | undefined): Map<string, Partial<WorldInfoCompatEntry>> {
+  const result = new Map<string, Partial<WorldInfoCompatEntry>>()
+  if (!Array.isArray(forceActivations)) return result
+
+  for (const activation of forceActivations) {
+    if (!activation || typeof activation !== 'object') continue
+    const world = typeof activation.world === 'string' ? activation.world.trim() : ''
+    const uid = Math.floor(numberValue(activation.uid, Number.NaN))
+    if (!world || uid < 0) continue
+
+    const patch: Partial<WorldInfoCompatEntry> = {}
+    if (typeof activation.content === 'string') patch.content = activation.content
+    patchNumber(patch, 'position', activation.position)
+    patchNumber(patch, 'depth', activation.depth)
+    patchNumber(patch, 'insertion_order', activation.insertion_order)
+    patchNumber(patch, 'role', activation.role)
+    result.set(`${world}.${uid}`, patch)
+  }
+
+  return result
+}
+
+function patchNumber<T extends 'position' | 'depth' | 'insertion_order' | 'role'>(
+  patch: Partial<WorldInfoCompatEntry>,
+  key: T,
+  value: unknown,
+): void {
+  const parsed = numberValue(value, Number.NaN)
+  if (Number.isFinite(parsed)) patch[key] = Math.floor(parsed)
 }
 
 function toCompatEntry(entry: WorldBookEntry, source: WorldInfoSource, entryKey: string): WorldInfoCompatEntry {
@@ -596,7 +754,7 @@ function toCompatEntry(entry: WorldBookEntry, source: WorldInfoSource, entryKey:
     preventRecursion: booleanFrom(entry, extensions, ['preventRecursion', 'prevent_recursion'], false),
     delayUntilRecursion: delayValue(valueFrom(entry, extensions, ['delayUntilRecursion', 'delay_until_recursion'])),
     vectorized: booleanFrom(entry, extensions, ['vectorized'], false),
-    scanDepth: nullableNumberFrom(entry, extensions, ['scanDepth', 'scan_depth']),
+    scanDepth: scanDepthValue(entry, extensions),
     caseSensitive: nullableBooleanFrom(entry, extensions, ['caseSensitive', 'case_sensitive']),
     matchWholeWords: nullableBooleanFrom(entry, extensions, ['matchWholeWords', 'match_whole_words']),
     useGroupScoring: nullableBooleanFrom(entry, extensions, ['useGroupScoring', 'use_group_scoring']),
@@ -687,6 +845,11 @@ function getActivatedText(activated: Map<string, WorldInfoCompatEntry>): string 
     .join('\n')
 }
 
+function resolveEntryForActivation(entry: WorldInfoCompatEntry, settings: WorldInfoScanSettings): WorldInfoCompatEntry {
+  const content = resolveScanMacros(entry.content, settings)
+  return content === entry.content ? entry : { ...entry, content }
+}
+
 async function countTokens(tokenCounter: TokenCounter, text: string): Promise<number> {
   const count = await tokenCounter(text)
   return normalizeTokenCount(count)
@@ -709,8 +872,20 @@ function sortScanCandidates(entries: WorldInfoCompatEntry[], runtime: CheckWorld
   return [...entries].sort((a, b) => {
     const aSticky = isTimedEffectActive(runtime.timedEffects, 'sticky', a) ? 1 : 0
     const bSticky = isTimedEffectActive(runtime.timedEffects, 'sticky', b) ? 1 : 0
-    return bSticky - aSticky || runtime.sortedEntries.indexOf(a) - runtime.sortedEntries.indexOf(b)
+    return bSticky - aSticky || sortedEntryIndex(runtime, a) - sortedEntryIndex(runtime, b)
   })
+}
+
+function sortedEntryIndex(runtime: CheckWorldInfoRuntime, entry: WorldInfoCompatEntry): number {
+  const index = runtime.sortedEntries.findIndex(item => entryId(item) === entryId(entry))
+  return index === -1 ? Number.MAX_SAFE_INTEGER : index
+}
+
+function getForcedActivation(runtime: CheckWorldInfoRuntime, entry: WorldInfoCompatEntry): WorldInfoCompatEntry | null {
+  const patch = runtime.forceActivations.get(entryId(entry))
+  if (!patch) return null
+  if (Object.keys(patch).length === 0) return entry
+  return { ...entry, ...patch, world: entry.world, uid: entry.uid, raw: entry.raw }
 }
 
 function passesProbabilityCheck(runtime: CheckWorldInfoRuntime, entry: WorldInfoCompatEntry): boolean {
@@ -730,6 +905,10 @@ function getNextScanState(
     return 'recursion'
   }
 
+  if (settings.recursive && !runtime.overflowed && runtime.scanState === 'min_activations' && runtime.buffer.recurse.length > 0) {
+    return 'recursion'
+  }
+
   const minActivations = settings.minActivations ?? 0
   const minActivationsDepthMax = settings.minActivationsDepthMax ?? 0
   if (!runtime.overflowed && minActivations > 0 && runtime.activated.size < minActivations) {
@@ -742,8 +921,8 @@ function getNextScanState(
   }
 
   if (settings.recursive) {
-    const nextDelayLevel = getNextRecursionDelayLevel(runtime.sortedEntries, runtime.currentRecursionDelayLevel)
-    if (nextDelayLevel > runtime.currentRecursionDelayLevel) {
+    const nextDelayLevel = runtime.availableRecursionDelayLevels.shift()
+    if (nextDelayLevel !== undefined) {
       runtime.currentRecursionDelayLevel = nextDelayLevel
       return 'recursion'
     }
@@ -762,6 +941,163 @@ function updateRecursionBuffer(
   if (!text) return
   runtime.buffer.recurse.unshift(text)
   runtime.activatedText = `${text}\n${runtime.activatedText}`
+}
+
+function buildScanHookInput(
+  runtime: CheckWorldInfoRuntime,
+  settings: WorldInfoScanSettings,
+  newEntries: WorldInfoCompatEntry[],
+  successfulEntries: WorldInfoCompatEntry[],
+  nextState: ScanState | null,
+  budgetRemaining: number,
+): WorldInfoScanHookInput {
+  const activatedEntries = [...runtime.activated.values()]
+  return {
+    loopCount: runtime.loopCount,
+    currentState: runtime.scanState!,
+    nextState,
+    newEntries,
+    successfulEntries,
+    activatedEntries,
+    budgetRemaining,
+    overflowed: runtime.overflowed,
+    state: {
+      current: runtime.scanState!,
+      next: nextState,
+      loopCount: runtime.loopCount,
+    },
+    trigger: settings.trigger ?? 'normal',
+    isDryRun: settings.dryRun === true,
+    isFinal: nextState === null,
+    new: {
+      all: newEntries,
+      successful: successfulEntries,
+    },
+    activated: {
+      entries: runtime.activated,
+      text: runtime.activatedText,
+    },
+    sortedEntries: runtime.sortedEntries,
+    recursionDelay: {
+      availableLevels: [...runtime.availableRecursionDelayLevels],
+      currentLevel: runtime.currentRecursionDelayLevel,
+    },
+    budget: {
+      current: runtime.budget,
+      overflowed: runtime.overflowed,
+    },
+    timedEffects: createTimedEffectsHookState(runtime.timedEffects),
+  }
+}
+
+function createTimedEffectsHookState(runtime: TimedEffectRuntime): WorldInfoTimedEffectsHookState {
+  return {
+    metadata: runtime.metadata,
+    get changed() {
+      return runtime.changed
+    },
+    sticky: runtime.sticky,
+    cooldown: runtime.cooldown,
+    delay: runtime.delay,
+    chatLength: runtime.chatLength,
+    isEffectActive: (type, entry) => isTimedEffectActive(runtime, type, entry),
+    getEffectMetadata: (type, entry) => getTimedEffectMetadata(runtime, type, entry),
+    setTimedEffect: (type, entry, newState) => setTimedEffect(runtime, type, entry, newState),
+  }
+}
+
+function applyScanHookPatch(
+  runtime: CheckWorldInfoRuntime,
+  hookInput: WorldInfoScanHookInput,
+  hookPatch: WorldInfoScanHookPatch,
+  usedTokens: number,
+): { nextState: ScanState | null; overflowed: boolean } {
+  const nextState = normalizeScanState(
+    pickDefined(hookPatch.nextState, hookPatch.state?.next, hookInput.nextState, hookInput.state.next),
+    hookInput.state.next,
+  )
+  const overflowed = booleanOrFallback(
+    pickDefined(hookPatch.overflowed, hookPatch.budget?.overflowed, hookInput.overflowed, hookInput.budget.overflowed),
+    hookInput.budget.overflowed,
+  )
+  const budget = numberOrFallback(
+    pickDefined(hookPatch.budget?.current, hookInput.budget.current),
+    hookInput.budget.current,
+  )
+  const budgetRemaining = Object.hasOwn(hookPatch, 'budgetRemaining')
+    ? numberOrFallback(hookPatch.budgetRemaining, Number.NaN)
+    : Number.NaN
+  const currentDelayLevel = numberOrFallback(
+    pickDefined(hookPatch.recursionDelay?.currentLevel, hookInput.recursionDelay.currentLevel),
+    hookInput.recursionDelay.currentLevel,
+  )
+  const availableDelayLevels = numberArrayOrFallback(
+    pickDefined(hookPatch.recursionDelay?.availableLevels, hookInput.recursionDelay.availableLevels),
+    hookInput.recursionDelay.availableLevels,
+  )
+  const activatedText = stringOrFallback(
+    pickDefined(hookPatch.activated?.text, hookInput.activated.text),
+    hookInput.activated.text,
+  )
+  const activatedEntries = mapOrFallback(
+    pickDefined(hookPatch.activated?.entries, hookInput.activated.entries),
+    hookInput.activated.entries,
+  )
+
+  runtime.activated = activatedEntries
+  runtime.currentRecursionDelayLevel = Math.max(0, Math.floor(currentDelayLevel))
+  runtime.availableRecursionDelayLevels = availableDelayLevels
+    .map(level => Math.max(0, Math.floor(level)))
+    .filter(level => level > runtime.currentRecursionDelayLevel)
+    .sort((a, b) => a - b)
+  runtime.activatedText = activatedText
+
+  if (Number.isFinite(budgetRemaining)) {
+    runtime.budget = usedTokens + Math.max(0, Math.floor(budgetRemaining))
+  } else {
+    runtime.budget = Math.max(1, Math.floor(budget))
+  }
+
+  return { nextState, overflowed }
+}
+
+function normalizeScanState(value: unknown, fallback: ScanState | null): ScanState | null {
+  if (value === undefined) return fallback
+  if (value === null || value === 'none' || value === 0) return null
+  if (value === 'initial' || value === 'recursion' || value === 'min_activations') return value
+  return fallback
+}
+
+function pickDefined<T>(...values: Array<T | undefined>): T | undefined {
+  return values.find(value => value !== undefined)
+}
+
+function booleanOrFallback(value: unknown, fallback: boolean): boolean {
+  return typeof value === 'boolean' ? value : fallback
+}
+
+function numberOrFallback(value: unknown, fallback: number): number {
+  const parsed = numberValue(value, Number.NaN)
+  return Number.isFinite(parsed) ? parsed : fallback
+}
+
+function stringOrFallback(value: unknown, fallback: string): string {
+  return typeof value === 'string' ? value : fallback
+}
+
+function numberArrayOrFallback(value: unknown, fallback: number[]): number[] {
+  if (!Array.isArray(value)) return fallback
+  return value
+    .map(item => numberValue(item, Number.NaN))
+    .filter(Number.isFinite)
+}
+
+function sameNumberArray(a: number[], b: number[]): boolean {
+  return a.length === b.length && a.every((value, index) => value === b[index])
+}
+
+function mapOrFallback<K, V>(value: unknown, fallback: Map<K, V>): Map<K, V> {
+  return value instanceof Map ? value as Map<K, V> : fallback
 }
 
 function pushVectorizedSkippedEvent(runtime: CheckWorldInfoRuntime, entry: WorldInfoCompatEntry): void {
@@ -786,14 +1122,17 @@ async function emitScanDoneHooks(
   input: WorldInfoScanHookInput,
 ): Promise<WorldInfoScanHookPatch> {
   let patch: WorldInfoScanHookPatch = {}
+  const mutableInput = cloneScanHookInput(input)
   for (const hook of settings.scanDoneHooks ?? []) {
-    const result = await hook({
-      ...input,
-      ...patch,
-    })
+    applyPatchToScanHookInput(mutableInput, patch)
+    const hookInput = cloneScanHookInput(mutableInput)
+    const beforeHookInput = cloneScanHookInput(mutableInput)
+    const result = await hook(hookInput)
+    patch = mergeScanHookPatch(patch, extractScanHookMutationPatch(beforeHookInput, hookInput))
     if (result && typeof result === 'object') {
-      patch = { ...patch, ...result }
+      patch = mergeScanHookPatch(patch, result)
     }
+    applyPatchToScanHookInput(mutableInput, patch)
   }
   return patch
 }
@@ -803,19 +1142,117 @@ function emitScanDoneHooksSync(
   input: WorldInfoScanHookInput,
 ): WorldInfoScanHookPatch {
   let patch: WorldInfoScanHookPatch = {}
+  const mutableInput = cloneScanHookInput(input)
   for (const hook of settings.scanDoneHooks ?? []) {
-    const result = hook({
-      ...input,
-      ...patch,
-    })
+    applyPatchToScanHookInput(mutableInput, patch)
+    const hookInput = cloneScanHookInput(mutableInput)
+    const beforeHookInput = cloneScanHookInput(mutableInput)
+    const result = hook(hookInput)
     if (isPromiseLike(result)) {
       throw new Error('checkWorldInfoSync requires synchronous scanDoneHooks')
     }
+    patch = mergeScanHookPatch(patch, extractScanHookMutationPatch(beforeHookInput, hookInput))
     if (result && typeof result === 'object') {
-      patch = { ...patch, ...result }
+      patch = mergeScanHookPatch(patch, result)
     }
+    applyPatchToScanHookInput(mutableInput, patch)
   }
   return patch
+}
+
+function cloneScanHookInput(input: WorldInfoScanHookInput): WorldInfoScanHookInput {
+  return {
+    ...input,
+    state: { ...input.state },
+    new: {
+      all: input.new.all,
+      successful: input.new.successful,
+    },
+    activated: {
+      entries: input.activated.entries,
+      text: input.activated.text,
+    },
+    recursionDelay: {
+      availableLevels: [...input.recursionDelay.availableLevels],
+      currentLevel: input.recursionDelay.currentLevel,
+    },
+    budget: { ...input.budget },
+  }
+}
+
+function extractScanHookMutationPatch(
+  before: WorldInfoScanHookInput,
+  after: WorldInfoScanHookInput,
+): WorldInfoScanHookPatch {
+  let patch: WorldInfoScanHookPatch = {}
+
+  if (after.nextState !== before.nextState) patch = mergeScanHookPatch(patch, { nextState: after.nextState })
+  if (after.state.next !== before.state.next) patch = mergeScanHookPatch(patch, { state: { next: after.state.next } })
+  if (after.overflowed !== before.overflowed) patch = mergeScanHookPatch(patch, { overflowed: after.overflowed })
+  if (after.budget.overflowed !== before.budget.overflowed) patch = mergeScanHookPatch(patch, { budget: { overflowed: after.budget.overflowed } })
+  if (after.budgetRemaining !== before.budgetRemaining) patch = mergeScanHookPatch(patch, { budgetRemaining: after.budgetRemaining })
+  if (after.budget.current !== before.budget.current) patch = mergeScanHookPatch(patch, { budget: { current: after.budget.current } })
+  if (after.activated.text !== before.activated.text) patch = mergeScanHookPatch(patch, { activated: { text: after.activated.text } })
+  if (after.activated.entries !== before.activated.entries) patch = mergeScanHookPatch(patch, { activated: { entries: after.activated.entries } })
+  if (after.recursionDelay.currentLevel !== before.recursionDelay.currentLevel) {
+    patch = mergeScanHookPatch(patch, { recursionDelay: { currentLevel: after.recursionDelay.currentLevel } })
+  }
+  if (!sameNumberArray(after.recursionDelay.availableLevels, before.recursionDelay.availableLevels)) {
+    patch = mergeScanHookPatch(patch, { recursionDelay: { availableLevels: after.recursionDelay.availableLevels } })
+  }
+
+  return patch
+}
+
+function mergeScanHookPatch(base: WorldInfoScanHookPatch, next: WorldInfoScanHookPatch): WorldInfoScanHookPatch {
+  const merged: WorldInfoScanHookPatch = {
+    ...base,
+    ...next,
+    state: next.state ? { ...base.state, ...next.state } : base.state,
+    activated: next.activated ? { ...base.activated, ...next.activated } : base.activated,
+    recursionDelay: next.recursionDelay ? { ...base.recursionDelay, ...next.recursionDelay } : base.recursionDelay,
+    budget: next.budget ? { ...base.budget, ...next.budget } : base.budget,
+  }
+
+  if (next.state && Object.hasOwn(next.state, 'next') && !Object.hasOwn(next, 'nextState')) {
+    merged.nextState = next.state.next
+  }
+  if (next.budget && Object.hasOwn(next.budget, 'overflowed') && !Object.hasOwn(next, 'overflowed')) {
+    merged.overflowed = next.budget.overflowed
+  }
+  if (next.budget && Object.hasOwn(next.budget, 'current') && !Object.hasOwn(next, 'budgetRemaining')) {
+    delete merged.budgetRemaining
+  }
+
+  return merged
+}
+
+function applyPatchToScanHookInput(input: WorldInfoScanHookInput, patch: WorldInfoScanHookPatch): void {
+  const nextState = normalizeScanState(pickDefined(patch.nextState, patch.state?.next), input.state.next)
+  input.nextState = nextState
+  input.state.next = nextState
+  input.isFinal = nextState === null
+
+  const overflowed = booleanOrFallback(pickDefined(patch.overflowed, patch.budget?.overflowed), input.budget.overflowed)
+  input.overflowed = overflowed
+  input.budget.overflowed = overflowed
+
+  const budget = numberOrFallback(patch.budget?.current, input.budget.current)
+  input.budget.current = Math.max(1, Math.floor(budget))
+
+  const budgetRemaining = numberOrFallback(patch.budgetRemaining, input.budgetRemaining)
+  input.budgetRemaining = Math.max(0, Math.floor(budgetRemaining))
+
+  input.activated.text = stringOrFallback(patch.activated?.text, input.activated.text)
+  input.recursionDelay.currentLevel = Math.max(
+    0,
+    Math.floor(numberOrFallback(patch.recursionDelay?.currentLevel, input.recursionDelay.currentLevel)),
+  )
+  input.recursionDelay.availableLevels = numberArrayOrFallback(
+    patch.recursionDelay?.availableLevels,
+    input.recursionDelay.availableLevels,
+  )
+  input.activatedEntries = [...input.activated.entries.values()]
 }
 
 function getGlobalScanParts(entry: WorldInfoCompatEntry, settings: WorldInfoScanSettings): string[] {
@@ -836,6 +1273,7 @@ function matchKey(
   entry: WorldInfoCompatEntry,
   settings: WorldInfoScanSettings,
 ): boolean {
+  key = resolveScanMacros(key, settings).trim()
   if (!key) return false
 
   const parsedRegex = parseSlashRegex(key)
@@ -862,6 +1300,16 @@ function matchKey(
   }
 
   return new RegExp(`(?:^|\\W)${escapeRegex(needle)}(?:$|\\W)`).test(haystack)
+}
+
+function resolveScanMacros(text: string, settings: WorldInfoScanSettings): string {
+  if (!settings.macroResolver || !text.includes('{{')) return text
+  try {
+    const resolved = settings.macroResolver(text)
+    return typeof resolved === 'string' ? resolved : text
+  } catch {
+    return text
+  }
 }
 
 function filterByInclusionGroups(
@@ -1026,6 +1474,7 @@ function prepareTimedEffects(
   const runtime: TimedEffectRuntime = {
     metadata: clonedMetadata.metadata,
     changed: clonedMetadata.changed,
+    dryRun,
     sticky: new Set(),
     cooldown: new Set(),
     delay: new Set(),
@@ -1150,6 +1599,50 @@ function setTimedEffectOfType(
   runtime.changed = true
 }
 
+function getTimedEffectMetadata(
+  runtime: TimedEffectRuntime,
+  type: WorldInfoTimedEffectType,
+  entry: WorldInfoCompatEntry,
+): WorldInfoTimedEffect | undefined {
+  if (type === 'delay') {
+    if (!isTimedEffectActive(runtime, 'delay', entry)) return undefined
+    return {
+      hash: entry.hash,
+      start: 0,
+      end: entry.delay,
+      protected: false,
+    }
+  }
+  return runtime.metadata[type][entryId(entry)]
+}
+
+function setTimedEffect(
+  runtime: TimedEffectRuntime,
+  type: WorldInfoTimedEffectType,
+  entry: WorldInfoCompatEntry,
+  newState: boolean,
+): void {
+  const key = entryId(entry)
+  if (type === 'delay') {
+    runtime.delay.delete(key)
+    if (newState) runtime.delay.add(key)
+    return
+  }
+
+  if (runtime.dryRun) return
+
+  delete runtime.metadata[type][key]
+  runtime[type].delete(key)
+  if (!newState || entry[type] <= 0) {
+    runtime.changed = true
+    return
+  }
+
+  runtime.metadata[type][key] = makeTimedEffect(runtime, entry, type, false)
+  runtime[type].add(key)
+  runtime.changed = true
+}
+
 function makeTimedEffect(
   runtime: TimedEffectRuntime,
   entry: WorldInfoCompatEntry,
@@ -1191,12 +1684,11 @@ function inferDepth(entries: WorldInfoCompatEntry[]): number {
   return depths.length ? Math.max(...depths) : DEFAULT_DEPTH
 }
 
-function getNextRecursionDelayLevel(entries: WorldInfoCompatEntry[], current: number): number {
-  const levels = entries
+function getRecursionDelayLevels(entries: WorldInfoCompatEntry[]): number[] {
+  return [...new Set(entries
     .map(entry => entry.delayUntilRecursion)
-    .filter(level => level > current)
+    .filter(level => level > 0))]
     .sort((a, b) => a - b)
-  return levels[0] ?? current
 }
 
 function clampDepth(depth: number): number {
@@ -1312,8 +1804,17 @@ function numberFrom(entry: WorldBookEntry, extensions: Record<string, unknown>, 
   return numberValue(valueFrom(entry, extensions, keys), fallback)
 }
 
-function nullableNumberFrom(entry: WorldBookEntry, extensions: Record<string, unknown>, keys: string[]): number | null {
-  const value = valueFrom(entry, extensions, keys)
+function scanDepthValue(entry: WorldBookEntry, extensions: Record<string, unknown>): number | null {
+  const extensionValue = nullableNumberValue(extensions.scanDepth ?? extensions.scan_depth)
+  if (extensionValue !== null) return extensionValue
+
+  const entryRecord = entry as Record<string, unknown>
+  const topLevelValue = nullableNumberValue(entryRecord.scanDepth ?? entryRecord.scan_depth)
+  if (topLevelValue === 100) return null
+  return topLevelValue
+}
+
+function nullableNumberValue(value: unknown): number | null {
   if (typeof value === 'number' && Number.isFinite(value)) return value
   if (typeof value === 'string' && value.trim()) {
     const parsed = Number(value)

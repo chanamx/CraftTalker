@@ -1,6 +1,6 @@
 # CraftTalker / 语琢 Agent Notes
 
-Last updated: 2026-06-09
+Last updated: 2026-06-10
 
 ## Project Position
 
@@ -19,6 +19,52 @@ Do not conflate these layers:
 - CraftTalker native UX: modern React UI and clean state management around compatibility data.
 - Harness/Agent future: separate heavy agent runtime, state, skills, tools, and observability.
 
+## Harness / RP Execution Boundary
+
+CraftTalker's best Harness target is a controlled narrative role runtime, not
+just "chat plus tools". The runtime should manage instruction/persona anchoring,
+typed RP state, memory, world knowledge, rule checks, tool permissions, run
+events, artifacts, and explicit commit into chat.
+
+Keep these paths separate:
+
+- Compatibility path: preserve ST file semantics, unknown fields, JSONL chats,
+  character cards, world books, presets, regex scripts, extension payloads, and
+  exact behavior adapters where needed.
+- Native RP path: keep the existing `NativeEngine` route fast, modern, stable,
+  and provider-compatible while improving prompt assembly, macro/world-info
+  behavior, runs, recovery, and UI.
+- Harness path: introduce `GenerationIntent`, `ContextFrame`, run journal,
+  constrained workspace/artifacts, state/memory patches, validation, and a
+  `Committer` boundary. The model must not directly mutate chat JSONL, ST source
+  assets, API keys, or arbitrary filesystem paths.
+
+Preferred first kernel:
+
+- `GenerationIntent` classifies normal reply, continue, regenerate, swipe
+  candidate, state advance, background memory update, world query, and tool
+  backed scene action before prompt assembly.
+- `ContextFrame` carries the structured character view, user persona, chat
+  window, activated world-info snapshot, preset/profile policy, RP state, memory
+  summaries, and allowed tools.
+- Run records should evolve toward append-only events plus artifacts such as
+  `output/main.md`, `state_patch.json`, `memory_patch.md`,
+  `continuity_notes.md`, and `scene_state.json`.
+- Only validated narrative artifacts should be committed through existing chat
+  service semantics, generation locks, recovery behavior, and ST field
+  preservation rules.
+
+Avoid these traps:
+
+- Do not replace ST-compatible files with SQLite before adapter/export/recovery
+  semantics are proven. SQLite can later support Harness indexes, state,
+  memories, and event queries.
+- Do not hide Harness logic inside the ST compatibility layer.
+- Do not execute scripts supplied by cards, worlds, presets, extensions, or MCP
+  config.
+- Do not store tool results as ordinary chat floors unless the user chooses to
+  publish them as narrative content.
+
 ## Current Stack
 
 - Frontend: React 19, Vite 8, TypeScript 6, Tailwind CSS v4, framer-motion, Zustand, TanStack Query, i18next.
@@ -34,6 +80,11 @@ Do not conflate these layers:
   - Split `AppShell` into smaller hooks.
   - Converted server file/service I/O to async where needed.
   - Kept frontend and backend TypeScript builds passing.
+  - Frontend API calls are split behind a stable `src/lib/api.ts` facade, with
+    transport code in `src/lib/api-client.ts`, shared DTO/config types in
+    `src/lib/api-types.ts` and `src/lib/llm-config-types.ts`, and per-domain
+    modules in `src/lib/api-domains/`. Existing `@/lib/api` imports remain the
+    compatibility boundary.
 - Phase 1 base:
   - Added engine interface, `NativeEngine`, engine manager, ST worker skeleton, and engine route.
   - Generation now routes through the engine system.
@@ -63,14 +114,18 @@ Do not conflate these layers:
     behavior instead of unused catalog data.
   - Provider catalog now covers OpenAI, OpenRouter, Claude/Anthropic, Gemini,
     Groq, Fireworks, Together, Perplexity, DeepSeek, Moonshot/Kimi,
-    SiliconFlow, xAI, Mistral, Cohere, Ollama, LM Studio, vLLM, llama.cpp, and
-    custom OpenAI/Claude/Gemini-compatible endpoints.
+    SiliconFlow, xAI, Mistral, Cohere, AI21, AI/ML API, Electron Hub, Chutes,
+    NanoGPT, CometAPI, Z.AI/GLM, Pollinations, Ollama, LM Studio, vLLM,
+    llama.cpp, and custom OpenAI/Claude/Gemini-compatible endpoints.
   - Provider routing is centralized through shared backend helpers, so
     `NativeEngine`, connection tests, and `/api/llm/models` use the same source,
     API format, base URL, header, and model-list URL decisions.
-  - `NativeEngine` routes OpenAI-compatible chat/completions, Claude Messages,
-    and Gemini generateContent/streamGenerateContent with provider-specific
-    URL, header, and body mapping.
+  - Frontend provider metadata is centralized in
+    `src/lib/llm-provider-options.ts`; Settings and onboarding both use this
+    table instead of maintaining separate local provider lists.
+  - `NativeEngine` routes OpenAI-compatible chat/completions, OpenAI Responses
+    text generation, Claude Messages, and Gemini generateContent/
+    streamGenerateContent with provider-specific URL, header, and body mapping.
   - OpenAI-compatible providers use `Authorization: Bearer <key>`; Claude uses
     `x-api-key` plus `anthropic-version`; Gemini uses `x-goog-api-key`;
     OpenRouter includes attribution headers by default.
@@ -84,14 +139,29 @@ Do not conflate these layers:
     the frontend default local provider.
   - `/api/llm/models` is mounted and uses the shared provider catalog plus
     server-side key-session resolution.
+  - Provider-specific model discovery includes Azure deployments, Ollama native
+    `/api/tags`, NanoGPT `/models?detailed=true`, and Pollinations'
+    `https://gen.pollinations.ai/models`.
   - Settings and onboarding expose provider/source selection with sensible
-    default endpoints. Reverse proxy URL, custom headers, and explicit API
-    format controls stay behind developer mode.
+    default endpoints. Fixed official/gateway API address inputs are hidden in
+    normal mode and replaced with a read-only connection summary. Local and
+    custom providers stay editable by default.
+  - Developer mode can reveal and edit fixed endpoints, API type, API format,
+    reverse proxy, custom headers, and Azure advanced fields.
+  - Provider switching visibly syncs `source`, legacy `type`, API format,
+    default endpoint, and default model. User-entered model names are preserved
+    unless the old value was blank or the previous provider default.
   - Settings and onboarding expose Azure OpenAI and Ollama Native. Azure
     resource, deployment, and API-version fields stay behind developer mode.
   - New provider settings preserve the existing API-key session model: newly
     entered keys are stored in `/api/llm-sessions`, while frontend settings keep
     only `apiKeySessionId`.
+  - `custom_openai_responses` is now a real text-generation path. It posts to
+    `/responses`, sends Responses-style `input`, `max_output_tokens`,
+    `store: false`, supports SSE `response.output_text.delta`, and parses
+    `output_text` plus Responses token usage. It is still a minimal text path:
+    stateful `previous_response_id`, tools, reasoning controls, and multimodal
+    inputs are not implemented yet.
 - ST macro/world book:
   - Added prompt-time macro resolution without mutating source data.
   - Added world book matching and injection for character-bound and enabled global world books.
@@ -151,17 +221,22 @@ Do not conflate these layers:
   - `ALLOWED_ORIGINS` entries are trimmed and used consistently by both layers.
 - Build:
   - Vite/Rolldown Windows build is fixed by explicit `build.rolldownOptions.input`.
-  - Frontend and backend builds/tests currently pass after these changes.
+  - Shiki highlighting lazy-loads `shiki/core`, the JavaScript regex engine,
+    themes, and supported language grammars.
+  - Vite/Rolldown code splitting uses
+    `build.rolldownOptions.output.codeSplitting.groups`; the latest frontend
+    build has no large chunk warning.
 
 ## Current Verification Baseline
 
 Most recent known good verification from 2026-06-09:
 
-- Frontend `npm run test`: 27 test files, 174 tests passed.
-- Frontend `npm run build`: passed; only large chunk warnings remain.
-- Backend `npm run test`: 17 test files, 135 tests passed.
+- Frontend `npm run test`: 31 test files, 228 tests passed.
+- Frontend `npm run build`: passed with no large chunk warning.
+- Backend `npm run test`: 18 test files, 174 tests passed.
 - Backend `npm run build`: passed.
-- `git diff --check`: no whitespace errors.
+- `git diff --check`: no whitespace errors; Windows line-ending warnings may
+  appear on the current dirty working tree.
 
 Run verification again after new changes; counts may increase as tests are added.
 
@@ -177,7 +252,7 @@ Run verification again after new changes; counts may increase as tests are added
    - Continue world book behavior audit beyond field preservation: recursive scanning, grouping, vectorized strategy, and import/export mapping.
    - Continue testing rare chat JSONL payloads from real ST histories: attachments, quick replies, timed world info, reasoning/logprobs, media, files, bookmarks, and extension data.
 3. Performance/quality:
-   - Shiki currently produces many chunks and large build output; consider lazy highlighter/language loading.
+   - Continue monitoring frontend bundle size as features grow; the previous Shiki large-chunk warning has been resolved with lazy loading.
    - Streaming uses chunk arrays and persistent run records, but long stream cleanup and a true durable queue/worker model still deserve review.
    - World book matching can be cached/precompiled later.
    - Continue provider edge-case hardening for Azure OpenAI deployment URLs,

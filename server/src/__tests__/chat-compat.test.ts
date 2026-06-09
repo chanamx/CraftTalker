@@ -14,18 +14,29 @@ import {
 } from '../lib/jsonl.js'
 import { addSwipe, editMessage, getChat } from '../services/chat.service.js'
 
-const testDataDir = path.join(os.tmpdir(), `luker-chat-compat-${Date.now()}`)
-const chatPath = path.join(testDataDir, 'chat.jsonl')
+let testDataDir = ''
+let chatPath = ''
 
 beforeEach(() => {
-  process.env.LUKER_DATA_DIR = testDataDir
+  testDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'luker-chat-compat-'))
+  chatPath = path.join(testDataDir, 'chat.jsonl')
   fs.mkdirSync(testDataDir, { recursive: true })
+  process.env.LUKER_DATA_DIR = testDataDir
 })
 
 afterEach(() => {
   delete process.env.LUKER_DATA_DIR
-  fs.rmSync(testDataDir, { recursive: true, force: true })
+  removeDir(testDataDir)
 })
+
+function removeDir(dir: string): void {
+  try {
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 25 })
+  } catch {
+    // Windows can keep a just-written temp file handle alive briefly; the OS temp
+    // cleaner can safely remove this later if the retry window still loses.
+  }
+}
 
 describe('chat JSONL compatibility', () => {
   it('creates new messages with ST-style ISO send_date strings', async () => {

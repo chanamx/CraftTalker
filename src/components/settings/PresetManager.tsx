@@ -2,9 +2,9 @@ import { useEffect, useMemo, useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
 import { Cpu, FileJson, Plus, Save, Sliders, X, Zap } from 'lucide-react'
 import { cn } from '@/lib/utils'
-import { usePresets } from '@/hooks/use-presets'
+import { usePresetEntries } from '@/hooks/use-presets'
 import { useToast } from '@/lib/toast'
-import { api, type GenerationPreset, type PresetData, type PresetType } from '@/lib/api'
+import { api, type GenerationPreset, type PresetData, type PresetIndexEntry, type PresetType } from '@/lib/api'
 
 interface PresetManagerProps {
   open: boolean
@@ -31,6 +31,7 @@ type NumericParamKey =
   | 'top_a'
   | 'min_p'
   | 'max_tokens'
+  | 'max_context'
   | 'repetition_penalty'
   | 'frequency_penalty'
   | 'presence_penalty'
@@ -44,6 +45,7 @@ const PARAM_DEFS: { key: NumericParamKey; label: string; step?: number }[] = [
   { key: 'top_a', label: 'Top-A' },
   { key: 'min_p', label: 'Min-P' },
   { key: 'max_tokens', label: 'Max Tokens', step: 1 },
+  { key: 'max_context', label: 'Context', step: 1 },
   { key: 'repetition_penalty', label: 'Repetition Penalty' },
   { key: 'frequency_penalty', label: 'Frequency Penalty' },
   { key: 'presence_penalty', label: 'Presence Penalty' },
@@ -58,11 +60,12 @@ function createGenerationPreset(): GenerationPreset {
     top_p: 0.9,
     top_k: 40,
     top_a: 0,
-    min_p: 0.1,
-    max_tokens: 512,
+    min_p: 0.05,
+    max_tokens: 300,
+    max_context: 4096,
     repetition_penalty: 1.1,
-    repetition_penalty_range: 0,
-    repetition_penalty_slope: 0,
+    repetition_penalty_range: 1024,
+    repetition_penalty_slope: 0.7,
     frequency_penalty: 0,
     presence_penalty: 0,
     typical_p: 1,
@@ -93,16 +96,20 @@ function getNumericValue(preset: PresetData, key: NumericParamKey): number {
   return typeof value === 'number' ? value : 0
 }
 
+function getSourceLabel(entry: PresetIndexEntry): string {
+  return entry.format === 'crafttalker-legacy' ? 'Legacy' : 'JSON'
+}
+
 export function PresetManager({ open, onClose }: PresetManagerProps) {
   const [activeType, setActiveType] = useState<PresetType>('openai')
-  const { data: presetNames, isLoading, refetch } = usePresets(activeType)
+  const { data: presetEntries, isLoading, refetch } = usePresetEntries(activeType)
   const toast = useToast()
   const [selectedPreset, setSelectedPreset] = useState<string | null>(null)
   const [editing, setEditing] = useState<PresetData | null>(null)
   const [jsonDraft, setJsonDraft] = useState('')
   const [isNew, setIsNew] = useState(false)
   const isTemplateType = TEMPLATE_PRESET_TYPES.has(activeType)
-  const presetList = presetNames ?? []
+  const presetList = presetEntries ?? []
 
   useEffect(() => {
     if (!selectedPreset) return
@@ -189,7 +196,7 @@ export function PresetManager({ open, onClose }: PresetManagerProps) {
           >
             <div
               onClick={e => e.stopPropagation()}
-              className="w-full max-w-3xl bg-[var(--color-bg-elevated)] rounded-2xl shadow-2xl border border-[var(--color-border-subtle)] overflow-hidden"
+              className="w-full max-w-3xl bg-[var(--color-bg-elevated)] rounded-lg shadow-2xl border border-[var(--color-border-subtle)] overflow-hidden"
             >
               <div className="flex items-center justify-between px-6 py-4 border-b border-[var(--color-border-subtle)]">
                 <div className="flex items-center gap-2">
@@ -244,25 +251,28 @@ export function PresetManager({ open, onClose }: PresetManagerProps) {
                     {isLoading && (
                       <div className="text-[10px] text-[var(--color-text-muted)] px-2 py-2">加载中...</div>
                     )}
-                    {presetList.map(name => (
+                    {presetList.map(entry => (
                       <motion.button
-                        key={name}
+                        key={`${entry.format}:${entry.name}`}
                         whileHover={{ scale: 1.01 }}
                         whileTap={{ scale: 0.99 }}
                         onClick={() => {
-                          setSelectedPreset(name)
+                          setSelectedPreset(entry.name)
                           setIsNew(false)
                         }}
                         className={cn(
-                          'w-full text-left px-3 py-2 rounded-lg text-xs transition-all truncate',
-                          selectedPreset === name
+                          'w-full text-left px-3 py-2 rounded-md text-xs transition-all',
+                          selectedPreset === entry.name
                             ? 'bg-[var(--color-accent-muted)] text-[var(--color-accent)]'
                             : 'text-[var(--color-text-secondary)] hover:bg-[var(--color-bg-surface)]'
                         )}
                       >
-                        <div className="flex items-center gap-2">
+                        <div className="flex items-center gap-2 min-w-0">
                           {isTemplateType ? <FileJson size={11} /> : <Zap size={11} />}
-                          <span className="truncate">{name}</span>
+                          <span className="truncate flex-1">{entry.name}</span>
+                          <span className="shrink-0 text-[9px] px-1.5 py-0.5 rounded border border-[var(--color-border-subtle)] text-[var(--color-text-muted)]">
+                            {getSourceLabel(entry)}
+                          </span>
                         </div>
                       </motion.button>
                     ))}

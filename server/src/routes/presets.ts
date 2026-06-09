@@ -11,6 +11,10 @@ presetsRoute.get('/:type', async (c) => {
   if (!isPresetType(type)) {
     return c.json({ error: 'Invalid preset type' }, 400)
   }
+  if (c.req.query('details') === '1') {
+    const entries = await presetService.listPresetEntries(type)
+    return c.json(entries)
+  }
   const presets = await presetService.listPresets(type)
   return c.json(presets)
 })
@@ -27,38 +31,7 @@ presetsRoute.get('/:type/:name', async (c) => {
 
 const presetSchema = z.object({
   name: z.string().min(1),
-  temperature: z.number().optional(),
-  top_p: z.number().optional(),
-  top_k: z.number().optional(),
-  top_a: z.number().optional(),
-  min_p: z.number().optional(),
-  max_tokens: z.number().optional(),
-  repetition_penalty: z.number().optional(),
-  repetition_penalty_range: z.number().optional(),
-  repetition_penalty_slope: z.number().optional(),
-  frequency_penalty: z.number().optional(),
-  presence_penalty: z.number().optional(),
-  typical_p: z.number().optional(),
-  tfs: z.number().optional(),
-  mirostat_mode: z.number().optional(),
-  mirostat_tau: z.number().optional(),
-  mirostat_eta: z.number().optional(),
-  sampler_order: z.array(z.number()).optional(),
-  skip_special_tokens: z.boolean().optional(),
-  ban_eos_token: z.boolean().optional(),
-  add_bos_token: z.boolean().optional(),
-  token_healing: z.boolean().optional(),
-  seed: z.number().optional(),
-  grammar_string: z.string().optional(),
-  guidance_scale: z.number().optional(),
-  negative_prompt: z.string().optional(),
-  dry_allowed_length: z.number().optional(),
-  dry_multiplier: z.number().optional(),
-  dry_base: z.number().optional(),
-  dry_sequence_breakers: z.string().optional(),
-  xtc_threshold: z.number().optional(),
-  xtc_probability: z.number().optional(),
-})
+}).catchall(z.unknown())
 
 presetsRoute.post('/:type', zValidator('json', presetSchema), async (c) => {
   const type = c.req.param('type')
@@ -66,10 +39,7 @@ presetsRoute.post('/:type', zValidator('json', presetSchema), async (c) => {
     return c.json({ error: 'Invalid preset type' }, 400)
   }
   const data = c.req.valid('json')
-  const preset = await presetService.savePreset(type, data.name, {
-    ...presetService.getDefaultPreset(),
-    ...data,
-  })
+  const preset = await presetService.savePreset(type, data.name, data)
   return c.json(preset, 201)
 })
 
