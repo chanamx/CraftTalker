@@ -19,6 +19,7 @@ import {
   geminiBody,
   ollamaNativeBody,
   openAICompatibleBody,
+  openAIResponsesBody,
 } from './native-bodies.js'
 import { buildCompletionPrompt, buildOpenAIMessages, type ChatMessage } from './native-prompt.js'
 import { consumeNDJSON, consumeSSE } from './native-stream.js'
@@ -61,6 +62,19 @@ interface OllamaStreamChunk {
   message?: { content?: string }
 }
 
+interface OpenAIResponsesStreamChunk {
+  type?: string
+  delta?: string
+}
+
+interface OpenAIResponseOutputItem {
+  type?: string
+  content?: Array<{
+    type?: string
+    text?: string
+  }>
+}
+
 const DEBUG_LLM = process.env.DEBUG_LLM === 'true'
 
 function debugLlm(message: string, details?: Record<string, unknown>): void {
@@ -92,6 +106,10 @@ function asOllamaStreamChunk(value: unknown): OllamaStreamChunk {
   return isRecord(value) ? value as OllamaStreamChunk : {}
 }
 
+function asOpenAIResponsesStreamChunk(value: unknown): OpenAIResponsesStreamChunk {
+  return isRecord(value) ? value as OpenAIResponsesStreamChunk : {}
+}
+
 function parseUsage(data: {
   usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number }
   usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number; totalTokenCount?: number }
@@ -111,6 +129,26 @@ function parseUsage(data: {
     }
   }
   return undefined
+}
+
+function parseResponsesUsage(data: {
+  usage?: { input_tokens?: number; output_tokens?: number; total_tokens?: number }
+}): EngineResponse['usage'] {
+  if (!data.usage) return undefined
+  return {
+    promptTokens: data.usage.input_tokens ?? 0,
+    completionTokens: data.usage.output_tokens ?? 0,
+    totalTokens: data.usage.total_tokens ?? 0,
+  }
+}
+
+function responseOutputText(data: { output_text?: string; output?: OpenAIResponseOutputItem[] }): string {
+  if (typeof data.output_text === 'string') return data.output_text
+  return data.output
+    ?.flatMap(item => item.content ?? [])
+    .filter(part => part.type === 'output_text' || typeof part.text === 'string')
+    .map(part => part.text ?? '')
+    .join('') ?? ''
 }
 
 function geminiTextFromCandidate(candidate: GeminiCandidate): string {
@@ -135,6 +173,7 @@ export class NativeEngine implements Engine {
       case 'openai_completion':
         return this.generateCompletion(context)
       case 'openai_responses':
+        return this.generateResponses(context)
       case 'openai_chat':
       default:
         return this.generateChatCompletion(context)
@@ -161,6 +200,8 @@ export class NativeEngine implements Engine {
         yield* this.streamCompletion(context)
         break
       case 'openai_responses':
+        yield* this.streamResponses(context)
+        break
       case 'openai_chat':
       default:
         yield* this.streamChatCompletion(context)
@@ -250,6 +291,24 @@ export class NativeEngine implements Engine {
     }
   }
 
+  private async generateResponses(context: NativeRequestContext): Promise<EngineResponse> {
+    const body = openAIResponsesBody(context.config, context.preset, context.chatMessages, false)
+    const response = await this.fetchLLM(joinUrl(context.baseUrl, '/responses'), context.headers, body, context.signal)
+    const data = await response.json() as {
+      output_text?: string
+      output?: OpenAIResponseOutputItem[]
+      status?: string
+      incomplete_details?: { reason?: string }
+      usage?: { input_tokens?: number; output_tokens?: number; total_tokens?: number }
+    }
+
+    return {
+      content: responseOutputText(data),
+      finishReason: data.incomplete_details?.reason ?? data.status ?? 'stop',
+      usage: parseResponsesUsage(data),
+    }
+  }
+
   private async generateOllamaNative(context: NativeRequestContext): Promise<EngineResponse> {
     const body = ollamaNativeBody(context.config, context.preset, context.chatMessages, false)
     const response = await this.fetchLLM(ollamaNativeChatUrl(context.baseUrl), context.headers, body, context.signal)
@@ -325,6 +384,15 @@ export class NativeEngine implements Engine {
     const body = completionBody(context.config, context.preset, context.prompt, true)
     const response = await this.fetchLLM(joinUrl(context.baseUrl, '/completions'), context.headers, body, context.signal)
     yield* consumeSSE(response, (parsed) => asOpenAIStreamChunk(parsed).choices?.[0]?.text)
+  }
+
+  private async *streamResponses(context: NativeRequestContext): AsyncGenerator<string, void, unknown> {
+    const body = openAIResponsesBody(context.config, context.preset, context.chatMessages, true)
+    const response = await this.fetchLLM(joinUrl(context.baseUrl, '/responses'), context.headers, body, context.signal)
+    yield* consumeSSE(response, (parsed) => {
+      const chunk = asOpenAIResponsesStreamChunk(parsed)
+      return chunk.type === 'response.output_text.delta' ? chunk.delta : undefined
+    })
   }
 
   private async *streamAnthropic(context: NativeRequestContext): AsyncGenerator<string, void, unknown> {

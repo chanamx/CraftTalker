@@ -260,6 +260,33 @@ export const DEEPSEEK_CONFIG = openAICompatibleProvider('deepseek', 'DeepSeek', 
 export const MOONSHOT_CONFIG = openAICompatibleProvider('moonshot', 'Moonshot/Kimi', 'https://api.moonshot.cn/v1')
 export const SILICONFLOW_CONFIG = openAICompatibleProvider('siliconflow', 'SiliconFlow', 'https://api.siliconflow.cn/v1')
 export const XAI_CONFIG = openAICompatibleProvider('xai', 'xAI', 'https://api.x.ai/v1')
+export const AI21_CONFIG = openAICompatibleProvider('ai21', 'AI21', 'https://api.ai21.com/studio/v1')
+export const AIMLAPI_CONFIG = openAICompatibleProvider(
+  'aimlapi',
+  'AI/ML API',
+  'https://api.aimlapi.com/v1',
+  {
+    requiredHeaders: {
+      'HTTP-Referer': 'https://crafttalker.app',
+      'X-Title': 'CraftTalker',
+    },
+  },
+)
+export const ELECTRONHUB_CONFIG = openAICompatibleProvider('electronhub', 'Electron Hub', 'https://api.electronhub.ai/v1')
+export const CHUTES_CONFIG = openAICompatibleProvider('chutes', 'Chutes', 'https://llm.chutes.ai/v1')
+export const NANOGPT_CONFIG = openAICompatibleProvider('nanogpt', 'NanoGPT', 'https://nano-gpt.com/api/v1')
+export const COMETAPI_CONFIG = openAICompatibleProvider('cometapi', 'CometAPI', 'https://api.cometapi.com/v1')
+export const ZAI_CONFIG = openAICompatibleProvider(
+  'zai',
+  'Z.AI',
+  'https://api.z.ai/api/paas/v4',
+  {
+    requiredHeaders: {
+      'Accept-Language': 'en-US,en',
+    },
+  },
+)
+export const POLLINATIONS_CONFIG = openAICompatibleProvider('pollinations', 'Pollinations', 'https://gen.pollinations.ai/v1')
 export const OLLAMA_CONFIG = openAICompatibleProvider('ollama', 'Ollama', 'http://localhost:11434/v1')
 export const OLLAMA_NATIVE_CONFIG = openAICompatibleProvider(
   'ollama_native',
@@ -310,6 +337,14 @@ export const API_PROVIDERS: Record<string, APIProviderConfig> = {
   moonshot: MOONSHOT_CONFIG,
   siliconflow: SILICONFLOW_CONFIG,
   xai: XAI_CONFIG,
+  ai21: AI21_CONFIG,
+  aimlapi: AIMLAPI_CONFIG,
+  electronhub: ELECTRONHUB_CONFIG,
+  chutes: CHUTES_CONFIG,
+  nanogpt: NANOGPT_CONFIG,
+  cometapi: COMETAPI_CONFIG,
+  zai: ZAI_CONFIG,
+  pollinations: POLLINATIONS_CONFIG,
   ollama: OLLAMA_CONFIG,
   ollama_native: OLLAMA_NATIVE_CONFIG,
   lmstudio: LMSTUDIO_CONFIG,

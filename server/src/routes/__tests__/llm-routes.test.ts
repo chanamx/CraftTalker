@@ -117,4 +117,61 @@ describe('/api/llm/models provider routing', () => {
       }),
     )
   })
+
+  it('fetches NanoGPT detailed models from its provider-specific endpoint', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({
+      data: [{ id: 'gpt-4o-mini' }],
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const res = await createTestApp().request('/api/llm/models', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        source: 'nanogpt',
+        apiUrl: 'https://nano-gpt.com/api/v1',
+        apiKey: 'nano-key',
+        model: 'gpt-4o-mini',
+        type: 'openai',
+      }),
+    })
+
+    expect(res.status).toBe(200)
+    expect(await res.json()).toEqual(['gpt-4o-mini'])
+    expect(fetchMock).toHaveBeenCalledWith(
+      'https://nano-gpt.com/api/v1/models?detailed=true',
+      expect.objectContaining({
+        method: 'GET',
+        headers: expect.objectContaining({
+          Authorization: 'Bearer nano-key',
+        }),
+      }),
+    )
+  })
+
+  it('fetches Pollinations models from its public models endpoint', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(['openai', 'mistral']))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const res = await createTestApp().request('/api/llm/models', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        source: 'pollinations',
+        apiUrl: 'https://gen.pollinations.ai/v1',
+        apiKey: '',
+        model: 'openai',
+        type: 'openai',
+      }),
+    })
+
+    expect(res.status).toBe(200)
+    expect(await res.json()).toEqual(['openai', 'mistral'])
+    expect(fetchMock).toHaveBeenCalledWith(
+      'https://gen.pollinations.ai/models',
+      expect.objectContaining({
+        method: 'GET',
+      }),
+    )
+  })
 })

@@ -21,10 +21,18 @@ const OPENAI_COMPAT_SOURCES = new Set([
   'xai',
   'mistral',
   'cohere',
+  'ai21',
+  'aimlapi',
+  'electronhub',
+  'chutes',
+  'nanogpt',
+  'cometapi',
   'ollama',
   'lmstudio',
   'vllm',
   'llamacpp',
+  'zai',
+  'pollinations',
   'custom_openai_chat',
 ])
 
@@ -166,6 +174,8 @@ export function modelListUrlFromConfig(config: LLMConfig): string {
   if (apiFormat === 'azure_openai_chat') {
     return joinUrl(baseUrl, `/openai/deployments?api-version=${encodeURIComponent(azureApiVersion(config))}`)
   }
+  if (provider === 'nanogpt') return joinUrl(baseUrl, '/models?detailed=true')
+  if (provider === 'pollinations') return 'https://gen.pollinations.ai/models'
   return joinUrl(baseUrl, '/models')
 }
 

@@ -3,6 +3,11 @@ import type { GenerationPreset } from '../services/preset.service.js'
 
 type Message = Array<{ role: string; content: string }>
 
+type ResponsesInputMessage = {
+  role: 'system' | 'developer' | 'user' | 'assistant'
+  content: string
+}
+
 export function openAICompatibleBody(
   config: LLMConfig,
   preset: GenerationPreset,
@@ -51,6 +56,23 @@ export function completionBody(
     top_p: preset.top_p,
     max_tokens: preset.max_tokens,
     repetition_penalty: preset.repetition_penalty,
+    stream,
+  })
+}
+
+export function openAIResponsesBody(
+  config: LLMConfig,
+  preset: GenerationPreset,
+  messages: Message,
+  stream: boolean,
+): Record<string, unknown> {
+  return applyBodyCustomizations(config, {
+    model: config.model,
+    input: responsesInputFromMessages(messages),
+    temperature: preset.temperature,
+    top_p: preset.top_p,
+    max_output_tokens: preset.max_tokens,
+    store: false,
     stream,
   })
 }
@@ -132,6 +154,20 @@ export function geminiBody(
 
 function compactObject(value: Record<string, unknown>): Record<string, unknown> {
   return Object.fromEntries(Object.entries(value).filter(([, item]) => item !== undefined))
+}
+
+function responsesInputFromMessages(messages: Message): ResponsesInputMessage[] {
+  return messages.map(message => ({
+    role: responseRole(message.role),
+    content: message.content,
+  }))
+}
+
+function responseRole(role: string): ResponsesInputMessage['role'] {
+  if (role === 'system') return 'system'
+  if (role === 'developer') return 'developer'
+  if (role === 'assistant') return 'assistant'
+  return 'user'
 }
 
 function applyBodyCustomizations(config: LLMConfig, body: Record<string, unknown>): Record<string, unknown> {

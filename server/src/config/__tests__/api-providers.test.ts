@@ -31,6 +31,14 @@ describe('API Provider Configuration', () => {
         'llamacpp',
         'cohere',
         'mistral',
+        'ai21',
+        'aimlapi',
+        'electronhub',
+        'chutes',
+        'nanogpt',
+        'cometapi',
+        'zai',
+        'pollinations',
       ]
 
       for (const provider of requiredProviders) {
@@ -122,6 +130,21 @@ describe('API Provider Configuration', () => {
       expect(headers['Authorization']).toBe('Bearer test-key')
       expect(headers['HTTP-Referer']).toBe('https://crafttalker.app')
       expect(headers['X-OpenRouter-Title']).toBe('CraftTalker')
+    })
+
+    it('should build AIMLAPI attribution headers by default', () => {
+      const headers = buildHeaders('aimlapi', 'test-key')
+
+      expect(headers['Authorization']).toBe('Bearer test-key')
+      expect(headers['HTTP-Referer']).toBe('https://crafttalker.app')
+      expect(headers['X-Title']).toBe('CraftTalker')
+    })
+
+    it('should build Z.AI compatibility headers by default', () => {
+      const headers = buildHeaders('zai', 'test-key')
+
+      expect(headers['Authorization']).toBe('Bearer test-key')
+      expect(headers['Accept-Language']).toBe('en-US,en')
     })
 
     it('should omit authorization for local providers without an API key', () => {

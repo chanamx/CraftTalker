@@ -90,6 +90,35 @@ describe('NativeEngine provider routing', () => {
     })
   })
 
+  it('routes AIMLAPI through OpenAI-compatible chat completions with attribution headers', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({
+      choices: [{ message: { content: 'aiml reply' }, finish_reason: 'stop' }],
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const engine = new NativeEngine()
+    const result = await engine.generate(request({
+      source: 'aimlapi',
+      apiUrl: 'https://api.aimlapi.com/v1',
+      apiKey: 'aiml-key',
+      model: 'chatgpt-4o-latest',
+      type: 'openai',
+    }))
+
+    expect(result.content).toBe('aiml reply')
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit]
+    expect(url).toBe('https://api.aimlapi.com/v1/chat/completions')
+    expect(init.headers).toMatchObject({
+      Authorization: 'Bearer aiml-key',
+      'HTTP-Referer': 'https://crafttalker.app',
+      'X-Title': 'CraftTalker',
+    })
+    expect(JSON.parse(init.body as string)).toMatchObject({
+      model: 'chatgpt-4o-latest',
+      stream: false,
+    })
+  })
+
   it('sends Anthropic sources to messages with x-api-key and anthropic-version', async () => {
     const fetchMock = vi.fn().mockResolvedValue(jsonResponse({
       content: [{ type: 'text', text: 'claude reply' }],
@@ -184,6 +213,85 @@ describe('NativeEngine provider routing', () => {
     const body = JSON.parse(init.body as string) as Record<string, unknown>
     expect(body.provider_option).toBe(true)
     expect(body.frequency_penalty).toBeUndefined()
+  })
+
+  it('sends custom OpenAI Responses providers to /responses with Responses body shape', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({
+      output_text: 'responses reply',
+      status: 'completed',
+      usage: {
+        input_tokens: 11,
+        output_tokens: 5,
+        total_tokens: 16,
+      },
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const engine = new NativeEngine()
+    const result = await engine.generate(request({
+      source: 'custom_openai_responses',
+      apiUrl: 'https://responses.example.test/v1',
+      apiKey: 'responses-key',
+      model: 'gpt-4.1-mini',
+      type: 'custom',
+      customApiFormat: 'openai_responses',
+    }))
+
+    expect(result.content).toBe('responses reply')
+    expect(result.finishReason).toBe('completed')
+    expect(result.usage).toEqual({
+      promptTokens: 11,
+      completionTokens: 5,
+      totalTokens: 16,
+    })
+
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit]
+    expect(url).toBe('https://responses.example.test/v1/responses')
+    expect(init.headers).toMatchObject({
+      Authorization: 'Bearer responses-key',
+    })
+
+    const body = JSON.parse(init.body as string) as Record<string, unknown>
+    expect(body).toMatchObject({
+      model: 'gpt-4.1-mini',
+      max_output_tokens: 128,
+      store: false,
+      stream: false,
+    })
+    expect(body).not.toHaveProperty('messages')
+    expect(body).not.toHaveProperty('max_tokens')
+    expect(body.input).toEqual(expect.arrayContaining([
+      expect.objectContaining({ role: 'system' }),
+      expect.objectContaining({ role: 'user', content: 'Hello' }),
+    ]))
+  })
+
+  it('parses OpenAI Responses SSE output text deltas', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(streamResponse([
+      `data: ${JSON.stringify({ type: 'response.output_text.delta', delta: 'hel' })}`,
+      `data: ${JSON.stringify({ type: 'response.output_text.delta', delta: 'lo' })}`,
+      `data: ${JSON.stringify({ type: 'response.completed' })}`,
+      'data: [DONE]',
+    ].join('\n\n')))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const engine = new NativeEngine()
+    const chunks: string[] = []
+    for await (const chunk of engine.generateStream(request({
+      source: 'custom_openai_responses',
+      apiUrl: 'https://responses.example.test/v1',
+      apiKey: 'responses-key',
+      model: 'gpt-4.1-mini',
+      type: 'custom',
+      customApiFormat: 'openai_responses',
+    }))) {
+      chunks.push(chunk)
+    }
+
+    expect(chunks.join('')).toBe('hello')
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit]
+    expect(url).toBe('https://responses.example.test/v1/responses')
+    expect(JSON.parse(init.body as string)).toMatchObject({ stream: true })
   })
 
   it('sends Azure OpenAI requests to deployment chat completions with api-key auth', async () => {
