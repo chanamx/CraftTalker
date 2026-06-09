@@ -69,6 +69,10 @@ export interface WorldBook {
   [key: string]: unknown
 }
 
+export type WorldBookEntryInput =
+  Pick<WorldBookEntry, 'key' | 'content'> &
+  Partial<Omit<WorldBookEntry, 'key' | 'content'>>
+
 function getWorldPath(name: string): string {
   return safePath(getWorldsDir(), `${name}.json`)
 }
@@ -125,8 +129,9 @@ export async function listWorlds(): Promise<WorldListItem[]> {
         const card = parseCharacterJson(JSON.stringify(await readJsonFile(jsonPath)))
         const worldNames = getWorldNamesFromExtensions(card.extensions as Record<string, unknown> | undefined)
         for (const worldName of worldNames) {
-          if (!bindings.has(worldName)) bindings.set(worldName, [])
-          bindings.get(worldName)!.push(d.name)
+          const boundCharacters = bindings.get(worldName) ?? []
+          boundCharacters.push(d.name)
+          bindings.set(worldName, boundCharacters)
         }
       } catch { /* skip */ }
     }
@@ -214,7 +219,7 @@ export async function deleteWorld(name: string): Promise<boolean> {
   return true
 }
 
-export async function addWorldEntry(worldName: string, entry: WorldBookEntry): Promise<WorldBook> {
+export async function addWorldEntry(worldName: string, entry: WorldBookEntryInput): Promise<WorldBook> {
   const world = await getWorld(worldName)
   const uid = entry.uid || Date.now()
   world.entries[String(uid)] = normalizeWorldEntry({ ...entry, uid })
@@ -277,6 +282,7 @@ export function normalizeWorldEntry(raw: Record<string, unknown>): WorldBookEntr
   const ignoreBudget = asBoolean(valueFrom(raw, extensions, ['ignoreBudget', 'ignore_budget']), false)
   const selectiveLogic = asNumber(valueFrom(raw, extensions, ['selectiveLogic', 'selective_logic']), 0)
   const outletName = asString(valueFrom(raw, extensions, ['outletName', 'outlet_name']))
+  const vectorized = asBoolean(valueFrom(raw, extensions, ['vectorized']), false)
 
   return {
     ...raw,
@@ -302,6 +308,7 @@ export function normalizeWorldEntry(raw: Record<string, unknown>): WorldBookEntr
     ignoreBudget,
     selectiveLogic,
     outletName,
+    vectorized,
     exclude_recursion: asBoolean(valueFrom(raw, extensions, ['excludeRecursion', 'exclude_recursion']), false),
     prevent_recursion: asBoolean(valueFrom(raw, extensions, ['preventRecursion', 'prevent_recursion']), false),
     delay_until_recursion: asBooleanOrNumber(valueFrom(raw, extensions, ['delayUntilRecursion', 'delay_until_recursion']), false),

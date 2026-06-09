@@ -89,19 +89,22 @@ const entrySchema = z.object({
   delay: z.number().optional(),
   display_index: z.number().optional(),
 })
+const entryUpdateSchema = entrySchema.partial()
+type WorldEntryInput = z.infer<typeof entrySchema>
+type WorldEntryUpdate = z.infer<typeof entryUpdateSchema>
 
 worldsRoute.post('/:name/entries', zValidator('json', entrySchema), async (c) => {
   const name = decodeURIComponent(c.req.param('name'))
-  const entry = c.req.valid('json')
-  const updated = await worldService.addWorldEntry(name, entry as any)
+  const entry: WorldEntryInput = c.req.valid('json')
+  const updated = await worldService.addWorldEntry(name, entry)
   return c.json(updated, 201)
 })
 
-worldsRoute.patch('/:name/entries/:uid', zValidator('json', entrySchema.partial()), async (c) => {
+worldsRoute.patch('/:name/entries/:uid', zValidator('json', entryUpdateSchema), async (c) => {
   const name = decodeURIComponent(c.req.param('name'))
   const uid = parseInt(c.req.param('uid'), 10)
-  const updates = c.req.valid('json')
-  const updated = await worldService.updateWorldEntry(name, uid, updates as any)
+  const updates: WorldEntryUpdate = c.req.valid('json')
+  const updated = await worldService.updateWorldEntry(name, uid, updates)
   return c.json(updated)
 })
 

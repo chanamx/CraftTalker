@@ -6,7 +6,7 @@ import * as characterService from '../services/character.service.js'
 import * as presetService from '../services/preset.service.js'
 import * as worldService from '../services/world.service.js'
 import { getEngine } from '../engine/index.js'
-import { checkWorldInfo, WORLD_INFO_INSERTION_STRATEGY, type WorldInfoScanSettings, type WorldInfoSource } from '../lib/world-info-compat.js'
+import { checkWorldInfo, WORLD_INFO_INSERTION_STRATEGY, type WorldInfoScanSettings, type WorldInfoSource, type WorldInfoTimedEffectsMetadata } from '../lib/world-info-compat.js'
 import { AppError, ErrorCode } from '../lib/errors.js'
 import {
   getGenerationLockInfo,
@@ -15,6 +15,7 @@ import {
 } from '../lib/generation-locks.js'
 import * as runService from '../services/run.service.js'
 import { llmConfigSchema, resolveLlmConfigApiKey } from '../lib/llm-config.js'
+import { createTokenCounter } from '../lib/tokenizer.js'
 
 const chatsRoute = new Hono()
 
@@ -151,7 +152,7 @@ async function handleGenerate(
       })
 
   // 世界书匹配：扫描最近对话内容，匹配关键词条目
-    const worldEntries = await loadWorldEntries(character, chat, messages, getContextLength(preset, genOverrides))
+    const worldEntries = await loadWorldEntries(character, chat, messages, getContextLength(preset, genOverrides), resolvedConfig.model)
 
     if (stream) {
       const engine = getEngine()
@@ -351,6 +352,7 @@ async function loadWorldEntries(
   chat: Awaited<ReturnType<typeof chatService.getChat>>,
   messages: Array<{ role: string; content: string }>,
   maxContext: number,
+  model?: string,
 ) {
   const sources: WorldInfoSource[] = []
   const addedWorldNames = new Set<string>()
@@ -387,8 +389,13 @@ async function loadWorldEntries(
   if (sources.length === 0) return undefined
 
   const settings = buildWorldInfoSettings(sources, maxContext, character)
+  settings.timedEffects = getTimedWorldInfo(chat)
+  settings.tokenCounter = createTokenCounter(model)
   const scanChat = messages.map(m => m.content).reverse()
-  const result = checkWorldInfo({ sources, chat: scanChat, maxContext, settings })
+  const result = await checkWorldInfo({ sources, chat: scanChat, maxContext, settings })
+  if (result.timedEffectsChanged) {
+    await saveTimedWorldInfo(chat.characterName, chat.chatId, chat, result.timedEffects)
+  }
   return result.matchedEntries.length > 0 ? result.matchedEntries : undefined
 }
 
@@ -461,6 +468,29 @@ function getChatWorldName(chat: Awaited<ReturnType<typeof chatService.getChat>>)
   const metadata = chat.lines[0] as { chat_metadata?: Record<string, unknown> } | undefined
   const worldName = metadata?.chat_metadata?.world_info
   return typeof worldName === 'string' && worldName.trim() ? worldName : undefined
+}
+
+function getTimedWorldInfo(chat: Awaited<ReturnType<typeof chatService.getChat>>): WorldInfoTimedEffectsMetadata | undefined {
+  const metadata = chat.lines[0] as { chat_metadata?: Record<string, unknown> } | undefined
+  const timedWorldInfo = metadata?.chat_metadata?.timedWorldInfo
+  if (!timedWorldInfo || typeof timedWorldInfo !== 'object' || Array.isArray(timedWorldInfo)) return undefined
+  return timedWorldInfo as WorldInfoTimedEffectsMetadata
+}
+
+async function saveTimedWorldInfo(
+  characterName: string,
+  chatId: string,
+  chat: Awaited<ReturnType<typeof chatService.getChat>>,
+  timedWorldInfo: WorldInfoTimedEffectsMetadata,
+): Promise<void> {
+  const metadata = chat.lines[0] as { chat_metadata?: Record<string, unknown> } | undefined
+  const chatMetadata = {
+    ...(metadata?.chat_metadata ?? {}),
+    timedWorldInfo,
+  }
+  await chatService.updateChatMetadata(characterName, chatId, chatMetadata).catch((error) => {
+    console.warn('[WI] Failed to persist timed world info metadata:', error)
+  })
 }
 
 function getContextLength(
