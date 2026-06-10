@@ -47,6 +47,10 @@ server/data/backups/
 # Preserve directory structure with .gitkeep
 !server/data/.gitkeep
 
+# AI coding context files
+AGENTS.md
+CLAUDE.md
+
 # OS generated files
 Desktop.ini
 ehthumbs.db
