@@ -6,7 +6,7 @@ import * as characterService from '../services/character.service.js'
 import * as presetService from '../services/preset.service.js'
 import * as worldService from '../services/world.service.js'
 import { getEngine } from '../engine/index.js'
-import { checkWorldInfo, WORLD_INFO_INSERTION_STRATEGY, type WorldInfoChatMessage, type WorldInfoForceActivation, type WorldInfoScanSettings, type WorldInfoSource, type WorldInfoTimedEffectsMetadata } from '../lib/world-info-compat.js'
+import { checkWorldInfo, WORLD_INFO_INSERTION_STRATEGY, type WorldInfoChatMessage, type WorldInfoForceActivation, type WorldInfoScanSettings, type WorldInfoSource, type WorldInfoTimedEffectsMetadata, type WorldInfoVectorActivation } from '../lib/world-info-compat.js'
 import { AppError, ErrorCode } from '../lib/errors.js'
 import {
   getGenerationLockInfo,
@@ -406,6 +406,7 @@ async function loadWorldEntries(
   settings.tokenCounter = createTokenCounter(model)
   settings.scanInjects = getWorldInfoScanInjects(chat)
   settings.forceActivations = getWorldInfoForceActivations(chat)
+  settings.vectorActivations = getWorldInfoVectorActivations(chat)
   settings.macroResolver = text => resolveMacros(text, { user: userName || '用户', char: character.name })
   const scanChatMessages = messages.map(({ name, content }) => ({ name, content })).reverse()
   const result = await checkWorldInfo({
@@ -415,8 +416,15 @@ async function loadWorldEntries(
     maxContext,
     settings,
   })
-  if (result.timedEffectsChanged) {
-    await saveTimedWorldInfo(chat.characterName, chat.chatId, chat, result.timedEffects)
+  const shouldClearExternalActivations = hasWorldInfoExternalActivations(chat)
+  if (result.timedEffectsChanged || shouldClearExternalActivations) {
+    await saveWorldInfoRuntimeMetadata(
+      chat.characterName,
+      chat.chatId,
+      chat,
+      result.timedEffectsChanged ? result.timedEffects : undefined,
+      shouldClearExternalActivations,
+    )
   }
   return result.matchedEntries.length > 0 ? result.matchedEntries : undefined
 }
@@ -603,6 +611,29 @@ function getWorldInfoForceActivations(chat: Awaited<ReturnType<typeof chatServic
   ]
 }
 
+function getWorldInfoVectorActivations(chat: Awaited<ReturnType<typeof chatService.getChat>>): WorldInfoVectorActivation[] {
+  const chatMetadata = getChatMetadata(chat)
+  if (!chatMetadata) return []
+
+  const worldInfoBuffer = recordValue(chatMetadata.worldInfoBuffer) ?? recordValue(chatMetadata.world_info_buffer)
+  return [
+    ...vectorActivationValues(chatMetadata.worldinfo_vector_activate),
+    ...vectorActivationValues(chatMetadata.worldInfoVectorActivate),
+    ...vectorActivationValues(chatMetadata.world_info_vector_activations),
+    ...vectorActivationValues(chatMetadata.worldInfoVectorActivations),
+    ...vectorActivationValues(chatMetadata.vectorActivations),
+    ...vectorActivationValues(worldInfoBuffer?.externalActivations),
+  ]
+}
+
+function hasWorldInfoExternalActivations(chat: Awaited<ReturnType<typeof chatService.getChat>>): boolean {
+  const chatMetadata = getChatMetadata(chat)
+  if (!chatMetadata) return false
+
+  const worldInfoBuffer = recordValue(chatMetadata.worldInfoBuffer) ?? recordValue(chatMetadata.world_info_buffer)
+  return activationRecordValues(worldInfoBuffer?.externalActivations).length > 0
+}
+
 function getWorldInfoSettingsMetadata(chat: Awaited<ReturnType<typeof chatService.getChat>>): Record<string, unknown> | undefined {
   const chatMetadata = getChatMetadata(chat)
   if (!chatMetadata) return undefined
@@ -610,19 +641,33 @@ function getWorldInfoSettingsMetadata(chat: Awaited<ReturnType<typeof chatServic
   return nestedSettings ? { ...nestedSettings, ...chatMetadata } : chatMetadata
 }
 
-async function saveTimedWorldInfo(
+async function saveWorldInfoRuntimeMetadata(
   characterName: string,
   chatId: string,
   chat: Awaited<ReturnType<typeof chatService.getChat>>,
-  timedWorldInfo: WorldInfoTimedEffectsMetadata,
+  timedWorldInfo: WorldInfoTimedEffectsMetadata | undefined,
+  clearExternalActivations: boolean,
 ): Promise<void> {
   const chatMetadata = {
     ...(getChatMetadata(chat) ?? {}),
-    timedWorldInfo,
+    ...(timedWorldInfo ? { timedWorldInfo } : {}),
+  }
+  if (clearExternalActivations) {
+    clearWorldInfoExternalActivations(chatMetadata, 'worldInfoBuffer')
+    clearWorldInfoExternalActivations(chatMetadata, 'world_info_buffer')
   }
   await chatService.updateChatMetadata(characterName, chatId, chatMetadata).catch((error) => {
-    console.warn('[WI] Failed to persist timed world info metadata:', error)
+    console.warn('[WI] Failed to persist world info runtime metadata:', error)
   })
+}
+
+function clearWorldInfoExternalActivations(chatMetadata: Record<string, unknown>, key: string): void {
+  const worldInfoBuffer = recordValue(chatMetadata[key])
+  if (!worldInfoBuffer) return
+
+  const nextWorldInfoBuffer = { ...worldInfoBuffer }
+  delete nextWorldInfoBuffer.externalActivations
+  chatMetadata[key] = nextWorldInfoBuffer
 }
 
 function getChatMetadata(chat: Awaited<ReturnType<typeof chatService.getChat>>): Record<string, unknown> | undefined {
@@ -647,25 +692,56 @@ function stringArrayValue(value: unknown): string[] {
 }
 
 function forceActivationValues(value: unknown): WorldInfoForceActivation[] {
-  if (!Array.isArray(value)) return []
-
   const activations: WorldInfoForceActivation[] = []
-  for (const item of value) {
-    if (!isRecord(item)) continue
-    const world = stringValue(item.world)
-    const uid = numberValue(item.uid)
-    if (!world || uid === undefined || uid < 0) continue
+  for (const item of activationRecordValues(value)) {
+    const activation = forceActivationValue(item)
+    if (activation) activations.push(activation)
+  }
 
-    const activation: WorldInfoForceActivation = { world, uid: Math.floor(uid) }
-    if (typeof item.content === 'string') activation.content = item.content
-    assignOptionalNumber(activation, 'position', item.position)
-    assignOptionalNumber(activation, 'depth', item.depth)
-    assignOptionalNumber(activation, 'insertion_order', item.insertion_order ?? item.insertionOrder)
-    assignOptionalNumber(activation, 'role', item.role)
+  return activations
+}
+
+function vectorActivationValues(value: unknown): WorldInfoVectorActivation[] {
+  const activations: WorldInfoVectorActivation[] = []
+  for (const item of activationRecordValues(value)) {
+    const forceActivation = forceActivationValue(item)
+    if (!forceActivation) continue
+
+    const activation: WorldInfoVectorActivation = { ...forceActivation }
+    const score = numberValue(item.score)
+    if (score !== undefined) activation.score = score
+    if (typeof item.source === 'string' && item.source.trim()) activation.source = item.source.trim()
     activations.push(activation)
   }
 
   return activations
+}
+
+function activationRecordValues(value: unknown): Array<Record<string, unknown>> {
+  if (Array.isArray(value)) return value.filter(isRecord)
+  if (!isRecord(value)) return []
+  if (stringValue(value.world) && numberValue(value.uid) !== undefined) return [value]
+
+  const records: Array<Record<string, unknown>> = []
+  for (const item of Object.values(value)) {
+    if (Array.isArray(item)) records.push(...item.filter(isRecord))
+    else if (isRecord(item)) records.push(item)
+  }
+  return records
+}
+
+function forceActivationValue(item: Record<string, unknown>): WorldInfoForceActivation | null {
+  const world = stringValue(item.world)
+  const uid = numberValue(item.uid)
+  if (!world || uid === undefined || uid < 0) return null
+
+  const activation: WorldInfoForceActivation = { world, uid: Math.floor(uid) }
+  if (typeof item.content === 'string') activation.content = item.content
+  assignOptionalNumber(activation, 'position', item.position)
+  assignOptionalNumber(activation, 'depth', item.depth)
+  assignOptionalNumber(activation, 'insertion_order', item.insertion_order ?? item.insertionOrder)
+  assignOptionalNumber(activation, 'role', item.role)
+  return activation
 }
 
 function assignOptionalNumber<T extends 'position' | 'depth' | 'insertion_order' | 'role'>(

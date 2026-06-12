@@ -395,6 +395,7 @@ export function checkWorldInfoSync(input: CheckWorldInfoInput): WorldInfoPromptR
 async function runCheckWorldInfo(input: CheckWorldInfoInput): Promise<WorldInfoPromptResult> {
   const settings = normalizeScanSettings(input.settings)
   const runtime = createRuntime(input, settings)
+  await applyVectorActivations(runtime, settings)
 
   while (runtime.scanState) {
     runtime.loopCount += 1
@@ -508,6 +509,7 @@ async function runCheckWorldInfo(input: CheckWorldInfoInput): Promise<WorldInfoP
 function runCheckWorldInfoSync(input: CheckWorldInfoInput): WorldInfoPromptResult {
   const settings = normalizeScanSettings(input.settings)
   const runtime = createRuntime(input, settings)
+  applyVectorActivationsSync(runtime, settings)
 
   while (runtime.scanState) {
     runtime.loopCount += 1
@@ -655,6 +657,7 @@ function createRuntime(input: CheckWorldInfoInput, settings: WorldInfoScanSettin
     activated: new Map(),
     failedProbability: new Set(),
     skippedVectorized: new Set(),
+    activatedVectorized: new Set(),
     forceActivations: normalizeForceActivations(settings.forceActivations),
     timedEffects: prepareTimedEffects(settings.timedEffects, sortedEntries, chat.length, settings.dryRun === true),
     scanEvents: [],
@@ -683,21 +686,104 @@ function normalizeForceActivations(forceActivations: WorldInfoForceActivation[] 
   if (!Array.isArray(forceActivations)) return result
 
   for (const activation of forceActivations) {
-    if (!activation || typeof activation !== 'object') continue
-    const world = typeof activation.world === 'string' ? activation.world.trim() : ''
-    const uid = Math.floor(numberValue(activation.uid, Number.NaN))
-    if (!world || uid < 0) continue
-
-    const patch: Partial<WorldInfoCompatEntry> = {}
-    if (typeof activation.content === 'string') patch.content = activation.content
-    patchNumber(patch, 'position', activation.position)
-    patchNumber(patch, 'depth', activation.depth)
-    patchNumber(patch, 'insertion_order', activation.insertion_order)
-    patchNumber(patch, 'role', activation.role)
-    result.set(`${world}.${uid}`, patch)
+    const key = activationKey(activation)
+    if (!key) continue
+    result.set(key, activationPatch(activation))
   }
 
   return result
+}
+
+async function applyVectorActivations(
+  runtime: CheckWorldInfoRuntime,
+  settings: WorldInfoScanSettings,
+): Promise<void> {
+  const activations = [...normalizeVectorActivations(settings.vectorActivations)]
+  if (settings.vectorActivator) {
+    const dynamicActivations = await settings.vectorActivator(buildVectorActivationInput(runtime, settings))
+    activations.push(...normalizeVectorActivations(dynamicActivations))
+  }
+  applyVectorActivationList(runtime, activations)
+}
+
+function applyVectorActivationsSync(
+  runtime: CheckWorldInfoRuntime,
+  settings: WorldInfoScanSettings,
+): void {
+  const activations = [...normalizeVectorActivations(settings.vectorActivations)]
+  if (settings.vectorActivator) {
+    const dynamicActivations = settings.vectorActivator(buildVectorActivationInput(runtime, settings))
+    if (isPromiseLike(dynamicActivations)) {
+      throw new Error('checkWorldInfoSync requires a synchronous vectorActivator')
+    }
+    activations.push(...normalizeVectorActivations(dynamicActivations))
+  }
+  applyVectorActivationList(runtime, activations)
+}
+
+function normalizeVectorActivations(activations: WorldInfoVectorActivation[] | undefined): WorldInfoVectorActivation[] {
+  if (!Array.isArray(activations)) return []
+  return activations.filter((activation): activation is WorldInfoVectorActivation => {
+    return !!activation && typeof activation === 'object' && activationKey(activation) !== null
+  })
+}
+
+function buildVectorActivationInput(
+  runtime: CheckWorldInfoRuntime,
+  settings: WorldInfoScanSettings,
+): WorldInfoVectorActivationInput {
+  const chat = [...runtime.buffer.chat]
+  return {
+    entries: runtime.sortedEntries,
+    vectorizedEntries: runtime.sortedEntries.filter(entry => entry.vectorized),
+    chat,
+    scanText: [...chat, ...runtime.buffer.inject].join('\n'),
+    trigger: settings.trigger ?? 'normal',
+    isDryRun: settings.dryRun === true,
+  }
+}
+
+function applyVectorActivationList(
+  runtime: CheckWorldInfoRuntime,
+  activations: WorldInfoVectorActivation[],
+): void {
+  if (activations.length === 0) return
+
+  const vectorizedEntries = new Map(
+    runtime.sortedEntries
+      .filter(entry => entry.vectorized)
+      .map(entry => [entryId(entry), entry]),
+  )
+
+  for (const activation of activations) {
+    const key = activationKey(activation)
+    if (!key) continue
+
+    const entry = vectorizedEntries.get(key)
+    if (!entry) continue
+
+    const existingPatch = runtime.forceActivations.get(key) ?? {}
+    runtime.forceActivations.set(key, { ...existingPatch, ...activationPatch(activation) })
+    pushVectorizedActivatedEvent(runtime, entry, activation)
+  }
+}
+
+function activationKey(activation: WorldInfoForceActivation): string | null {
+  if (!activation || typeof activation !== 'object') return null
+  const world = typeof activation.world === 'string' ? activation.world.trim() : ''
+  const uid = Math.floor(numberValue(activation.uid, Number.NaN))
+  if (!world || uid < 0) return null
+  return `${world}.${uid}`
+}
+
+function activationPatch(activation: WorldInfoForceActivation): Partial<WorldInfoCompatEntry> {
+  const patch: Partial<WorldInfoCompatEntry> = {}
+  if (typeof activation.content === 'string') patch.content = activation.content
+  patchNumber(patch, 'position', activation.position)
+  patchNumber(patch, 'depth', activation.depth)
+  patchNumber(patch, 'insertion_order', activation.insertion_order)
+  patchNumber(patch, 'role', activation.role)
+  return patch
 }
 
 function patchNumber<T extends 'position' | 'depth' | 'insertion_order' | 'role'>(
@@ -1102,9 +1188,28 @@ function mapOrFallback<K, V>(value: unknown, fallback: Map<K, V>): Map<K, V> {
 
 function pushVectorizedSkippedEvent(runtime: CheckWorldInfoRuntime, entry: WorldInfoCompatEntry): void {
   const id = entryId(entry)
+  if (runtime.activatedVectorized.has(id)) return
   if (runtime.skippedVectorized.has(id)) return
   runtime.skippedVectorized.add(id)
   runtime.scanEvents.push(vectorizedSkippedEvent(entry))
+}
+
+function pushVectorizedActivatedEvent(
+  runtime: CheckWorldInfoRuntime,
+  entry: WorldInfoCompatEntry,
+  activation: WorldInfoVectorActivation,
+): void {
+  const id = entryId(entry)
+  if (runtime.activatedVectorized.has(id)) return
+  runtime.activatedVectorized.add(id)
+  runtime.scanEvents.push({
+    type: 'vectorized_activated',
+    entryId: id,
+    world: entry.world,
+    uid: entry.uid,
+    source: typeof activation.source === 'string' ? activation.source : undefined,
+    score: typeof activation.score === 'number' && Number.isFinite(activation.score) ? activation.score : undefined,
+  })
 }
 
 function vectorizedSkippedEvent(entry: WorldInfoCompatEntry): WorldInfoScanEvent {
@@ -1461,6 +1566,7 @@ function buildPromptResult(
     timedEffectsChanged: timedEffects.changed,
     scanEvents,
     vectorizedSkipped: scanEvents.filter(event => event.type === 'vectorized_skipped'),
+    vectorizedActivated: scanEvents.filter(event => event.type === 'vectorized_activated'),
   }
 }
 

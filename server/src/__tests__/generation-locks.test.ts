@@ -435,6 +435,116 @@ describe('generation locks', () => {
     expect(lastEngineRequest?.worldEntries?.map(entry => entry.content)).toEqual(['forced-vector lore'])
   })
 
+  it('activates vectorized world info entries from vector metadata during generation', async () => {
+    const app = createApp()
+    writeCharacter('VectorMetadataBot')
+    const charPath = path.join(testDataDir, 'characters', 'VectorMetadataBot', 'character.json')
+    fs.writeFileSync(
+      charPath,
+      JSON.stringify({
+        name: 'VectorMetadataBot',
+        description: 'Test bot',
+        extensions: { world: 'VectorMetadataWorld' },
+      }),
+      'utf8',
+    )
+    fs.writeFileSync(
+      path.join(testDataDir, 'worlds', 'VectorMetadataWorld.json'),
+      JSON.stringify({
+        name: 'VectorMetadataWorld',
+        enabled: true,
+        global_enabled: false,
+        entries: {
+          '0': {
+            uid: 0,
+            key: ['not in chat'],
+            content: 'stored-vector lore',
+            enabled: true,
+            insertion_order: 100,
+            vectorized: true,
+          },
+        },
+      }),
+      'utf8',
+    )
+
+    const chatId = await createChat(app, 'VectorMetadataBot')
+    await addMessage('VectorMetadataBot', chatId, true, 'plain message', 'Alice')
+    await updateChatMetadata('VectorMetadataBot', chatId, {
+      worldInfoVectorActivations: [{
+        world: 'VectorMetadataWorld',
+        uid: '0',
+        content: 'retrieved-vector lore',
+        source: 'test-vector-runtime',
+        score: '0.88',
+      }],
+    })
+
+    const res = await streamRequest(app, 'VectorMetadataBot', chatId)
+    expect(res.status).toBe(200)
+    await drain(res)
+
+    expect(lastEngineRequest?.worldEntries?.map(entry => entry.content)).toEqual(['retrieved-vector lore'])
+  })
+
+  it('clears ST-style world info buffer external activations after generation', async () => {
+    const app = createApp()
+    writeCharacter('BufferedVectorBot')
+    const charPath = path.join(testDataDir, 'characters', 'BufferedVectorBot', 'character.json')
+    fs.writeFileSync(
+      charPath,
+      JSON.stringify({
+        name: 'BufferedVectorBot',
+        description: 'Test bot',
+        extensions: { world: 'BufferedVectorWorld' },
+      }),
+      'utf8',
+    )
+    fs.writeFileSync(
+      path.join(testDataDir, 'worlds', 'BufferedVectorWorld.json'),
+      JSON.stringify({
+        name: 'BufferedVectorWorld',
+        enabled: true,
+        global_enabled: false,
+        entries: {
+          '0': {
+            uid: 0,
+            key: ['not in chat'],
+            content: 'stored-buffer lore',
+            enabled: true,
+            insertion_order: 100,
+            vectorized: true,
+          },
+        },
+      }),
+      'utf8',
+    )
+
+    const chatId = await createChat(app, 'BufferedVectorBot')
+    await addMessage('BufferedVectorBot', chatId, true, 'plain message', 'Alice')
+    await updateChatMetadata('BufferedVectorBot', chatId, {
+      worldInfoBuffer: {
+        externalActivations: {
+          'BufferedVectorWorld.0': {
+            world: 'BufferedVectorWorld',
+            uid: 0,
+            content: 'buffer-vector lore',
+          },
+        },
+      },
+    })
+
+    const res = await streamRequest(app, 'BufferedVectorBot', chatId)
+    expect(res.status).toBe(200)
+    await drain(res)
+
+    expect(lastEngineRequest?.worldEntries?.map(entry => entry.content)).toEqual(['buffer-vector lore'])
+
+    const chat = await getChat('BufferedVectorBot', chatId)
+    const metadata = (chat.lines[0] as { chat_metadata?: { worldInfoBuffer?: Record<string, unknown> } }).chat_metadata
+    expect(metadata?.worldInfoBuffer?.externalActivations).toBeUndefined()
+  })
+
   it('loads persona lorebooks from ST-compatible chat metadata during generation', async () => {
     const app = createApp()
     writeCharacter('PersonaScanBot')

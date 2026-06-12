@@ -50,6 +50,7 @@ server/data/backups/
 # AI coding context files
 AGENTS.md
 CLAUDE.md
+docs/
 
 # OS generated files
 Desktop.ini

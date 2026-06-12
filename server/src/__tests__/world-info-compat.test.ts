@@ -7,6 +7,7 @@ import {
   checkWorldInfoSync,
   getSortedWorldInfoEntries,
   type WorldInfoScanHookInput,
+  type WorldInfoVectorActivationInput,
 } from '../lib/world-info-compat.js'
 import { normalizeWorldEntry, type WorldBookEntry } from '../services/world.service.js'
 
@@ -291,6 +292,68 @@ describe('world-info compatibility scanning', () => {
     })
     expect(forced.matchedEntries.map(entry => entry.content)).toEqual(['vector lore'])
     expect(forced.vectorizedSkipped).toHaveLength(0)
+  })
+
+  it('activates vectorized entries from static vector activations', () => {
+    const result = scan({
+      '1': makeEntry({ uid: 1, key: ['missing'], content: 'vector lore', vectorized: true }),
+    }, ['plain chat'], {
+      vectorActivations: [{ world: 'test-world', uid: 1, source: 'test-vector-store', score: 0.82 }],
+    })
+
+    expect(result.matchedEntries.map(entry => entry.content)).toEqual(['vector lore'])
+    expect(result.vectorizedSkipped).toHaveLength(0)
+    expect(result.vectorizedActivated).toEqual([
+      expect.objectContaining({
+        type: 'vectorized_activated',
+        entryId: 'test-world.1',
+        source: 'test-vector-store',
+        score: 0.82,
+      }),
+    ])
+  })
+
+  it('lets async vector activators feed ST-style external activations', async () => {
+    const vectorActivator = vi.fn(async (input: WorldInfoVectorActivationInput) => {
+      expect(input.vectorizedEntries.map(entry => entry.uid)).toEqual([2])
+      expect(input.chat).toEqual(['plain chat'])
+      expect(input.scanText).toContain('plain chat')
+      expect(input.trigger).toBe('continue')
+      expect(input.isDryRun).toBe(true)
+      return [{
+        world: 'test-world',
+        uid: 2,
+        content: 'retrieved vector lore',
+        source: 'async-vector',
+        score: 0.91,
+      }]
+    })
+
+    const result = await scanAsync({
+      '2': makeEntry({ uid: 2, key: ['missing'], content: 'stored vector lore', vectorized: true }),
+    }, ['plain chat'], {
+      trigger: 'continue',
+      dryRun: true,
+      vectorActivator,
+    })
+
+    expect(vectorActivator).toHaveBeenCalledTimes(1)
+    expect(result.matchedEntries.map(entry => entry.content)).toEqual(['retrieved vector lore'])
+    expect(result.vectorizedActivated).toEqual([
+      expect.objectContaining({
+        entryId: 'test-world.2',
+        source: 'async-vector',
+        score: 0.91,
+      }),
+    ])
+  })
+
+  it('requires synchronous vector activators in checkWorldInfoSync', () => {
+    expect(() => scan({
+      '3': makeEntry({ uid: 3, key: ['missing'], content: 'vector lore', vectorized: true }),
+    }, ['plain chat'], {
+      vectorActivator: async () => [{ world: 'test-world', uid: 3 }],
+    })).toThrow('checkWorldInfoSync requires a synchronous vectorActivator')
   })
 
   it('filters by generation trigger and character filter', () => {

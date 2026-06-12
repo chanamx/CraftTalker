@@ -15,10 +15,28 @@ const WI_POSITION = {
   EM_BOTTOM: 6,
 } as const
 
+const WI_ROLE = {
+  SYSTEM: 0,
+  USER: 1,
+  ASSISTANT: 2,
+} as const
+
 function buildWorldContent(entries: MatchedEntry[], positions: number[], macroEnv: MacroEnv): string {
   const filtered = entries.filter(e => positions.includes(e.position))
   if (filtered.length === 0) return ''
   return filtered.map(e => resolveMacros(e.content, macroEnv)).join('\n')
+}
+
+function worldEntryChatRole(entry: MatchedEntry): 'system' | 'user' | 'assistant' {
+  switch (entry.role) {
+    case WI_ROLE.USER:
+      return 'user'
+    case WI_ROLE.ASSISTANT:
+      return 'assistant'
+    case WI_ROLE.SYSTEM:
+    default:
+      return 'system'
+  }
 }
 
 export function buildOpenAIMessages(
@@ -74,7 +92,7 @@ export function buildOpenAIMessages(
   for (const entry of atDepthEntries) {
     const content = resolveMacros(entry.content, macroEnv)
     const insertIdx = Math.max(1, result.length - entry.depth)
-    result.splice(insertIdx, 0, { role: 'system', content })
+    result.splice(insertIdx, 0, { role: worldEntryChatRole(entry), content })
   }
   return result
 }
@@ -120,7 +138,7 @@ export function buildCompletionPrompt(
     for (const entry of atDepthEntries) {
       const insertIdx = Math.max(0, mutableMessages.length - entry.depth)
       const content = resolveMacros(entry.content, macroEnv)
-      mutableMessages.splice(insertIdx, 0, { role: 'system', content })
+      mutableMessages.splice(insertIdx, 0, { role: worldEntryChatRole(entry), content })
     }
   }
 
