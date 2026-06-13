@@ -355,7 +355,8 @@ describe('API Routes', () => {
     expect(res.status).toBe(201)
     const body = await res.json() as Json
     expect(body.name).toBe('TestWorld')
-    expect(body.global_enabled).toBe(true)
+    expect(body.enabled).toBe(false)
+    expect(body.global_enabled).toBe(false)
     expect(fs.existsSync(path.join(testDataDir, 'worlds', 'TestWorld.json'))).toBe(true)
   })
 
@@ -466,6 +467,57 @@ describe('API Routes', () => {
     const boundOnly = worlds.find(w => w.name === 'BoundOnlyWorld')
     expect(boundOnly?.bound_to).toEqual([])
     expect(boundOnly?.enabled).toBe(false)
+  })
+
+  it('turns legacy bound-only world books off after their last binding is removed', async () => {
+    const app = createApp()
+    const charDir = path.join(testDataDir, 'characters', 'LegacyBoundBot')
+    fs.mkdirSync(charDir, { recursive: true })
+    fs.writeFileSync(
+      path.join(charDir, 'character.json'),
+      JSON.stringify({
+        spec: 'chara_card_v2',
+        spec_version: '2.0',
+        name: 'LegacyBoundBot',
+        description: 'Legacy bound only',
+        extensions: { world: 'LegacyBoundWorld' },
+      }),
+      'utf8',
+    )
+    fs.writeFileSync(
+      path.join(testDataDir, 'worlds', 'LegacyBoundWorld.json'),
+      JSON.stringify({
+        name: 'LegacyBoundWorld',
+        enabled: true,
+        entries: {},
+      }),
+      'utf8',
+    )
+
+    const beforeListRes = await app.request('/api/worlds')
+    const beforeWorlds = await beforeListRes.json() as Array<Json & { bound_to: string[] }>
+    const beforeWorld = beforeWorlds.find(w => w.name === 'LegacyBoundWorld')
+    expect(beforeWorld?.global_enabled).toBe(false)
+    expect(beforeWorld?.bound_to).toEqual(['LegacyBoundBot'])
+
+    const unbind = await app.request('/api/worlds/LegacyBoundWorld/unbind', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ characterName: 'LegacyBoundBot' }),
+    })
+
+    expect(unbind.status).toBe(200)
+    const worldRes = await app.request('/api/worlds/LegacyBoundWorld')
+    const world = await worldRes.json() as Json
+    expect(world.global_enabled).toBe(false)
+    expect(world.enabled).toBe(false)
+
+    const afterListRes = await app.request('/api/worlds')
+    const afterWorlds = await afterListRes.json() as Array<Json & { bound_to: string[] }>
+    const afterWorld = afterWorlds.find(w => w.name === 'LegacyBoundWorld')
+    expect(afterWorld?.global_enabled).toBe(false)
+    expect(afterWorld?.bound_to).toEqual([])
+    expect(afterWorld?.enabled).toBe(false)
   })
 
   it('enabling global scope also enables the whole world book', async () => {

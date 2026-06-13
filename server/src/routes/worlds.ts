@@ -179,9 +179,9 @@ worldsRoute.post('/:name/unbind', zValidator('json', bindSchema), async (c) => {
 async function syncWorldActivationForScopes(worldName: string): Promise<worldService.WorldBook> {
   const current = await worldService.getWorld(worldName)
   const listItem = (await worldService.listWorlds()).find(item => item.name === worldName)
-  const hasActiveScope = Boolean(listItem?.global_enabled) || Boolean(listItem?.bound_to.length)
+  const hasActiveScope = worldService.hasExplicitGlobalScope(current) || Boolean(listItem?.bound_to.length)
   if (!hasActiveScope && current.enabled) {
-    return worldService.updateWorld(worldName, { enabled: false })
+    return worldService.updateWorld(worldName, { enabled: false, global_enabled: false })
   }
   return current
 }

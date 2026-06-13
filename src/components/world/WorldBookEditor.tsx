@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import {
   X, Plus, Trash2, BookOpen, Save, Eye, EyeOff,
-  ArrowDown, GripVertical, User, Globe, Power, Unlink, Code
+  ArrowDown, GripVertical, User, Globe, Unlink, Code
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useWorlds, useWorld, useCreateWorld, useUpdateWorld, useDeleteWorld,
@@ -241,7 +241,7 @@ export function WorldBookEditor({ open, onClose, initialWorld }: WorldBookEditor
                           {developerMode && (
                             <div className="flex items-center gap-1 flex-shrink-0">
                               <ScopeToggle
-                                icon={<Power size={12} />}
+                                icon={worldEnabled ? <EyeOff size={12} /> : <Eye size={12} />}
                                 label={worldEnabled ? '关闭' : '启用'}
                                 active={worldEnabled}
                                 onClick={() => selectedWorld && selectedInfo && updateWorld.mutate({
@@ -752,7 +752,7 @@ function WorldListItem({ world, selected, developerMode, onSelect, onDelete, onT
             )}
             title={enabled ? '关闭整本世界书' : '启用整本世界书'}
           >
-            <Power size={11} />
+            {enabled ? <EyeOff size={11} /> : <Eye size={11} />}
           </motion.button>
         )}
         <motion.button

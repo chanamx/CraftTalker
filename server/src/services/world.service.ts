@@ -113,6 +113,10 @@ export function isWorldGloballyEnabled(world: Pick<WorldBook, 'global_enabled'>,
   return typeof world.global_enabled === 'boolean' ? world.global_enabled : boundTo.length === 0
 }
 
+export function hasExplicitGlobalScope(world: Pick<WorldBook, 'global_enabled'>): boolean {
+  return world.global_enabled === true
+}
+
 export async function listWorlds(): Promise<WorldListItem[]> {
   const worldsDir = getWorldsDir()
   if (!existsSync(worldsDir)) return []
@@ -177,8 +181,8 @@ export async function createWorld(name: string, description?: string): Promise<W
     name,
     description: description ?? '',
     entries: {},
-    enabled: true,
-    global_enabled: true,
+    enabled: false,
+    global_enabled: false,
     global_selective: false,
     selective_default: false,
     recursive_scanning: false,

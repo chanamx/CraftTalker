@@ -1,7 +1,12 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest'
 import { render, screen } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
 import { WorldBookEditor } from '@/components/world/WorldBookEditor'
 import { useSettingsStore } from '@/stores/settings-store'
+
+const mocks = vi.hoisted(() => ({
+  updateWorldMutate: vi.fn(),
+}))
 
 vi.mock('@/hooks/use-worlds', () => ({
   useWorlds: () => ({
@@ -31,7 +36,7 @@ vi.mock('@/hooks/use-worlds', () => ({
     },
   }),
   useCreateWorld: () => ({ mutate: vi.fn() }),
-  useUpdateWorld: () => ({ mutate: vi.fn() }),
+  useUpdateWorld: () => ({ mutate: mocks.updateWorldMutate }),
   useDeleteWorld: () => ({ mutate: vi.fn() }),
   useAddWorldEntry: () => ({ mutate: vi.fn() }),
   useUpdateWorldEntry: () => ({ mutate: vi.fn() }),
@@ -46,6 +51,7 @@ vi.mock('@/hooks/use-characters', () => ({
 
 describe('WorldBookEditor developer mode controls', () => {
   beforeEach(() => {
+    mocks.updateWorldMutate.mockReset()
     useSettingsStore.setState({ developerMode: false })
   })
 
@@ -63,5 +69,19 @@ describe('WorldBookEditor developer mode controls', () => {
 
     expect(screen.getAllByTitle('关闭整本世界书').length).toBeGreaterThan(0)
     expect(screen.getByTitle('设为全局生效')).toBeInTheDocument()
+  })
+
+  it('turns off the whole world without changing global or bound scopes', async () => {
+    useSettingsStore.setState({ developerMode: true })
+    const user = userEvent.setup()
+
+    render(<WorldBookEditor open onClose={vi.fn()} initialWorld="Lore" />)
+
+    await user.click(screen.getAllByTitle('关闭整本世界书')[0])
+
+    expect(mocks.updateWorldMutate).toHaveBeenCalledWith({
+      name: 'Lore',
+      data: { enabled: false },
+    })
   })
 })
