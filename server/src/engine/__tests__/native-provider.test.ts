@@ -187,6 +187,28 @@ describe('NativeEngine provider routing', () => {
     expect(body).toHaveProperty('systemInstruction')
   })
 
+  it('normalizes Gemini model resource names before building generateContent URLs', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({
+      candidates: [{
+        content: { parts: [{ text: 'gemini reply' }] },
+        finishReason: 'STOP',
+      }],
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const engine = new NativeEngine()
+    await engine.generate(request({
+      source: 'google',
+      apiUrl: 'https://generativelanguage.googleapis.com/v1beta',
+      apiKey: 'gemini-key',
+      model: 'models/gemini-2.0-flash',
+      type: 'openai',
+    }))
+
+    const [url] = fetchMock.mock.calls[0] as [string, RequestInit]
+    expect(url).toBe('https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent')
+  })
+
   it('allows custom OpenAI-compatible headers and body customizations', async () => {
     const fetchMock = vi.fn().mockResolvedValue(jsonResponse({
       choices: [{ message: { content: 'custom reply' }, finish_reason: 'stop' }],

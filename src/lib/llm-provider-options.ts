@@ -1,6 +1,7 @@
 import type { ChatCompletionSource, CustomAPIFormat, LLMConfig } from '@/types'
 
 export type ProviderCategory = 'official' | 'gateway' | 'local' | 'custom'
+export type ProviderDisplayGroup = 'compatible' | 'vendor'
 export type ProviderEditMode = 'always' | 'developer'
 
 export interface ProviderOption {
@@ -12,9 +13,17 @@ export interface ProviderOption {
   model: string
   description: string
   category: ProviderCategory
+  displayGroup: ProviderDisplayGroup
   endpointEditMode: ProviderEditMode
   formatEditMode: ProviderEditMode
+  allowedFormats?: CustomAPIFormat[]
+  searchAliases?: string[]
 }
+
+export const PROVIDER_DISPLAY_GROUPS: { value: ProviderDisplayGroup; label: string }[] = [
+  { value: 'compatible', label: '兼容 / 自定义 API' },
+  { value: 'vendor', label: '厂商 / 平台 API' },
+]
 
 export const LLM_PROVIDER_OPTIONS: ProviderOption[] = [
   {
@@ -26,8 +35,10 @@ export const LLM_PROVIDER_OPTIONS: ProviderOption[] = [
     model: 'local-model',
     description: '本地 OpenAI-compatible 服务',
     category: 'local',
+    displayGroup: 'compatible',
     endpointEditMode: 'always',
     formatEditMode: 'developer',
+    searchAliases: ['local', 'openai compatible'],
   },
   {
     value: 'ollama',
@@ -38,8 +49,10 @@ export const LLM_PROVIDER_OPTIONS: ProviderOption[] = [
     model: 'llama3.1',
     description: '本地 Ollama OpenAI-compatible API',
     category: 'local',
+    displayGroup: 'compatible',
     endpointEditMode: 'always',
     formatEditMode: 'developer',
+    searchAliases: ['local', 'openai compatible'],
   },
   {
     value: 'ollama_native',
@@ -50,8 +63,10 @@ export const LLM_PROVIDER_OPTIONS: ProviderOption[] = [
     model: 'llama3.1',
     description: 'Ollama 原生 /api/chat 与 /api/tags',
     category: 'local',
+    displayGroup: 'compatible',
     endpointEditMode: 'always',
     formatEditMode: 'developer',
+    searchAliases: ['local', 'native'],
   },
   {
     value: 'openai',
@@ -62,8 +77,10 @@ export const LLM_PROVIDER_OPTIONS: ProviderOption[] = [
     model: 'gpt-4o-mini',
     description: '官方 OpenAI Chat Completions',
     category: 'official',
+    displayGroup: 'vendor',
     endpointEditMode: 'developer',
     formatEditMode: 'developer',
+    searchAliases: ['chat completions'],
   },
   {
     value: 'azure_openai',
@@ -74,8 +91,10 @@ export const LLM_PROVIDER_OPTIONS: ProviderOption[] = [
     model: 'deployment-name',
     description: 'Azure deployment-scoped Chat Completions',
     category: 'official',
+    displayGroup: 'vendor',
     endpointEditMode: 'developer',
     formatEditMode: 'developer',
+    searchAliases: ['microsoft', 'deployment'],
   },
   {
     value: 'openrouter',
@@ -86,8 +105,10 @@ export const LLM_PROVIDER_OPTIONS: ProviderOption[] = [
     model: 'openai/gpt-4o-mini',
     description: '多模型路由与中转',
     category: 'gateway',
+    displayGroup: 'vendor',
     endpointEditMode: 'developer',
     formatEditMode: 'developer',
+    searchAliases: ['router', 'proxy', '中转'],
   },
   {
     value: 'anthropic',
@@ -98,8 +119,10 @@ export const LLM_PROVIDER_OPTIONS: ProviderOption[] = [
     model: 'claude-3-5-haiku-latest',
     description: 'Claude Messages API',
     category: 'official',
+    displayGroup: 'vendor',
     endpointEditMode: 'developer',
     formatEditMode: 'developer',
+    searchAliases: ['anthropic', 'claude messages'],
   },
   {
     value: 'google',
@@ -110,8 +133,10 @@ export const LLM_PROVIDER_OPTIONS: ProviderOption[] = [
     model: 'gemini-2.0-flash',
     description: 'Google Gemini generateContent API',
     category: 'official',
+    displayGroup: 'vendor',
     endpointEditMode: 'developer',
     formatEditMode: 'developer',
+    searchAliases: ['google', 'makersuite', 'generatecontent'],
   },
   {
     value: 'groq',
@@ -122,8 +147,10 @@ export const LLM_PROVIDER_OPTIONS: ProviderOption[] = [
     model: 'llama-3.1-8b-instant',
     description: '高速 OpenAI-compatible 托管',
     category: 'gateway',
+    displayGroup: 'vendor',
     endpointEditMode: 'developer',
     formatEditMode: 'developer',
+    searchAliases: ['openai compatible'],
   },
   {
     value: 'deepseek',
@@ -134,8 +161,10 @@ export const LLM_PROVIDER_OPTIONS: ProviderOption[] = [
     model: 'deepseek-chat',
     description: 'DeepSeek OpenAI-compatible API',
     category: 'official',
+    displayGroup: 'vendor',
     endpointEditMode: 'developer',
     formatEditMode: 'developer',
+    searchAliases: ['openai compatible'],
   },
   {
     value: 'moonshot',
@@ -146,8 +175,10 @@ export const LLM_PROVIDER_OPTIONS: ProviderOption[] = [
     model: 'moonshot-v1-8k',
     description: 'Kimi OpenAI-compatible API',
     category: 'official',
+    displayGroup: 'vendor',
     endpointEditMode: 'developer',
     formatEditMode: 'developer',
+    searchAliases: ['kimi', 'openai compatible'],
   },
   {
     value: 'siliconflow',
@@ -158,8 +189,10 @@ export const LLM_PROVIDER_OPTIONS: ProviderOption[] = [
     model: 'deepseek-ai/DeepSeek-V3',
     description: '国内模型聚合与托管',
     category: 'gateway',
+    displayGroup: 'vendor',
     endpointEditMode: 'developer',
     formatEditMode: 'developer',
+    searchAliases: ['openai compatible', '中转'],
   },
   {
     value: 'togetherai',
@@ -170,8 +203,10 @@ export const LLM_PROVIDER_OPTIONS: ProviderOption[] = [
     model: 'meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo',
     description: '开源模型托管',
     category: 'gateway',
+    displayGroup: 'vendor',
     endpointEditMode: 'developer',
     formatEditMode: 'developer',
+    searchAliases: ['openai compatible'],
   },
   {
     value: 'fireworks',
@@ -182,8 +217,10 @@ export const LLM_PROVIDER_OPTIONS: ProviderOption[] = [
     model: 'accounts/fireworks/models/llama-v3p1-8b-instruct',
     description: 'OpenAI-compatible 模型服务',
     category: 'gateway',
+    displayGroup: 'vendor',
     endpointEditMode: 'developer',
     formatEditMode: 'developer',
+    searchAliases: ['openai compatible'],
   },
   {
     value: 'perplexity',
@@ -194,8 +231,10 @@ export const LLM_PROVIDER_OPTIONS: ProviderOption[] = [
     model: 'sonar',
     description: 'Perplexity OpenAI-compatible API',
     category: 'official',
+    displayGroup: 'vendor',
     endpointEditMode: 'developer',
     formatEditMode: 'developer',
+    searchAliases: ['openai compatible'],
   },
   {
     value: 'mistral',
@@ -206,8 +245,10 @@ export const LLM_PROVIDER_OPTIONS: ProviderOption[] = [
     model: 'mistral-large-latest',
     description: 'Mistral OpenAI-compatible API',
     category: 'official',
+    displayGroup: 'vendor',
     endpointEditMode: 'developer',
     formatEditMode: 'developer',
+    searchAliases: ['openai compatible'],
   },
   {
     value: 'cohere',
@@ -218,8 +259,10 @@ export const LLM_PROVIDER_OPTIONS: ProviderOption[] = [
     model: 'command-r-plus',
     description: 'Cohere OpenAI-compatible 入口',
     category: 'official',
+    displayGroup: 'vendor',
     endpointEditMode: 'developer',
     formatEditMode: 'developer',
+    searchAliases: ['openai compatible'],
   },
   {
     value: 'xai',
@@ -230,8 +273,10 @@ export const LLM_PROVIDER_OPTIONS: ProviderOption[] = [
     model: 'grok-2-latest',
     description: 'xAI OpenAI-compatible API',
     category: 'official',
+    displayGroup: 'vendor',
     endpointEditMode: 'developer',
     formatEditMode: 'developer',
+    searchAliases: ['grok', 'openai compatible'],
   },
   {
     value: 'ai21',
@@ -242,8 +287,10 @@ export const LLM_PROVIDER_OPTIONS: ProviderOption[] = [
     model: 'jamba-large',
     description: 'AI21 Jamba Chat Completions',
     category: 'official',
+    displayGroup: 'vendor',
     endpointEditMode: 'developer',
     formatEditMode: 'developer',
+    searchAliases: ['jamba'],
   },
   {
     value: 'aimlapi',
@@ -254,8 +301,10 @@ export const LLM_PROVIDER_OPTIONS: ProviderOption[] = [
     model: 'chatgpt-4o-latest',
     description: '多模型 OpenAI-compatible 聚合服务',
     category: 'gateway',
+    displayGroup: 'vendor',
     endpointEditMode: 'developer',
     formatEditMode: 'developer',
+    searchAliases: ['openai compatible', '中转'],
   },
   {
     value: 'electronhub',
@@ -266,8 +315,10 @@ export const LLM_PROVIDER_OPTIONS: ProviderOption[] = [
     model: 'gpt-4o-mini',
     description: 'Electron Hub 多模型 OpenAI-compatible API',
     category: 'gateway',
+    displayGroup: 'vendor',
     endpointEditMode: 'developer',
     formatEditMode: 'developer',
+    searchAliases: ['electronhub', 'openai compatible', '中转'],
   },
   {
     value: 'chutes',
@@ -278,8 +329,10 @@ export const LLM_PROVIDER_OPTIONS: ProviderOption[] = [
     model: 'deepseek-ai/DeepSeek-V3-0324',
     description: 'Chutes OpenAI-compatible 开源模型服务',
     category: 'gateway',
+    displayGroup: 'vendor',
     endpointEditMode: 'developer',
     formatEditMode: 'developer',
+    searchAliases: ['openai compatible'],
   },
   {
     value: 'nanogpt',
@@ -290,8 +343,10 @@ export const LLM_PROVIDER_OPTIONS: ProviderOption[] = [
     model: 'gpt-4o-mini',
     description: 'NanoGPT OpenAI-compatible API',
     category: 'gateway',
+    displayGroup: 'vendor',
     endpointEditMode: 'developer',
     formatEditMode: 'developer',
+    searchAliases: ['openai compatible'],
   },
   {
     value: 'cometapi',
@@ -302,8 +357,10 @@ export const LLM_PROVIDER_OPTIONS: ProviderOption[] = [
     model: 'gpt-4o',
     description: 'CometAPI OpenAI-compatible 聚合服务',
     category: 'gateway',
+    displayGroup: 'vendor',
     endpointEditMode: 'developer',
     formatEditMode: 'developer',
+    searchAliases: ['openai compatible', '中转'],
   },
   {
     value: 'pollinations',
@@ -314,8 +371,10 @@ export const LLM_PROVIDER_OPTIONS: ProviderOption[] = [
     model: 'openai',
     description: 'Pollinations OpenAI-compatible 文本入口',
     category: 'gateway',
+    displayGroup: 'vendor',
     endpointEditMode: 'developer',
     formatEditMode: 'developer',
+    searchAliases: ['openai compatible'],
   },
   {
     value: 'zai',
@@ -326,8 +385,10 @@ export const LLM_PROVIDER_OPTIONS: ProviderOption[] = [
     model: 'glm-4.6',
     description: 'Z.AI GLM OpenAI-compatible API',
     category: 'official',
+    displayGroup: 'vendor',
     endpointEditMode: 'developer',
     formatEditMode: 'developer',
+    searchAliases: ['glm', 'zhipu', 'openai compatible'],
   },
   {
     value: 'vllm',
@@ -338,8 +399,10 @@ export const LLM_PROVIDER_OPTIONS: ProviderOption[] = [
     model: 'local-model',
     description: '本地/服务器 vLLM OpenAI-compatible API',
     category: 'local',
+    displayGroup: 'compatible',
     endpointEditMode: 'always',
     formatEditMode: 'developer',
+    searchAliases: ['local', 'openai compatible'],
   },
   {
     value: 'llamacpp',
@@ -350,8 +413,10 @@ export const LLM_PROVIDER_OPTIONS: ProviderOption[] = [
     model: 'local-model',
     description: 'llama.cpp server OpenAI-compatible API',
     category: 'local',
+    displayGroup: 'compatible',
     endpointEditMode: 'always',
     formatEditMode: 'developer',
+    searchAliases: ['local', 'openai compatible'],
   },
   {
     value: 'custom_openai_chat',
@@ -362,8 +427,11 @@ export const LLM_PROVIDER_OPTIONS: ProviderOption[] = [
     model: 'model-name',
     description: '官方/小众厂商/中转站通用入口',
     category: 'custom',
+    displayGroup: 'compatible',
     endpointEditMode: 'always',
-    formatEditMode: 'always',
+    formatEditMode: 'developer',
+    allowedFormats: ['openai_chat'],
+    searchAliases: ['custom', 'openai compatible', 'proxy', '中转'],
   },
   {
     value: 'custom_openai_responses',
@@ -374,8 +442,11 @@ export const LLM_PROVIDER_OPTIONS: ProviderOption[] = [
     model: 'model-name',
     description: 'OpenAI Responses 格式兼容入口',
     category: 'custom',
+    displayGroup: 'compatible',
     endpointEditMode: 'always',
-    formatEditMode: 'always',
+    formatEditMode: 'developer',
+    allowedFormats: ['openai_responses'],
+    searchAliases: ['custom', 'responses'],
   },
   {
     value: 'custom_claude',
@@ -386,8 +457,11 @@ export const LLM_PROVIDER_OPTIONS: ProviderOption[] = [
     model: 'claude-compatible-model',
     description: 'Claude Messages 格式兼容入口',
     category: 'custom',
+    displayGroup: 'compatible',
     endpointEditMode: 'always',
-    formatEditMode: 'always',
+    formatEditMode: 'developer',
+    allowedFormats: ['anthropic_messages'],
+    searchAliases: ['custom', 'anthropic', 'claude messages'],
   },
   {
     value: 'custom_gemini',
@@ -398,8 +472,11 @@ export const LLM_PROVIDER_OPTIONS: ProviderOption[] = [
     model: 'gemini-compatible-model',
     description: 'Gemini generateContent 格式兼容入口',
     category: 'custom',
+    displayGroup: 'compatible',
     endpointEditMode: 'always',
-    formatEditMode: 'always',
+    formatEditMode: 'developer',
+    allowedFormats: ['gemini_generate_content'],
+    searchAliases: ['custom', 'google', 'generatecontent'],
   },
 ]
 
@@ -425,10 +502,57 @@ export const API_TYPE_OPTIONS: { value: LLMConfig['type']; label: string }[] = [
   { value: 'custom', label: '自定义' },
 ]
 
+export function canonicalAPIFormat(format: CustomAPIFormat | undefined): CustomAPIFormat | undefined {
+  if (format === 'claude_messages') return 'anthropic_messages'
+  if (format === 'gemini_interactions') return 'gemini_generate_content'
+  return API_FORMAT_OPTIONS.some(option => option.value === format) ? format : undefined
+}
+
 export function apiFormatLabel(format: CustomAPIFormat | undefined): string {
-  if (format === 'claude_messages') return 'Claude Messages'
-  if (format === 'gemini_interactions') return 'Gemini generateContent'
-  return API_FORMAT_OPTIONS.find(option => option.value === format)?.label ?? 'OpenAI Chat Completions'
+  const canonical = canonicalAPIFormat(format)
+  return API_FORMAT_OPTIONS.find(option => option.value === canonical)?.label ?? 'OpenAI Chat Completions'
+}
+
+export function allowedFormatsForProvider(provider: ProviderOption | undefined): CustomAPIFormat[] {
+  if (!provider) return API_FORMAT_OPTIONS.map(option => option.value)
+  return provider.allowedFormats ?? [provider.format]
+}
+
+export function apiFormatOptionsForProvider(provider: ProviderOption | undefined) {
+  const allowedFormats = new Set(allowedFormatsForProvider(provider))
+  return API_FORMAT_OPTIONS.filter(option => allowedFormats.has(option.value))
+}
+
+export function canEditProviderEndpoint(
+  provider: ProviderOption | undefined,
+  developerMode: boolean,
+): boolean {
+  if (!provider) return true
+  if (provider.displayGroup === 'compatible') return true
+  return developerMode
+}
+
+export function formatForProvider(
+  provider: ProviderOption | undefined,
+  format: CustomAPIFormat | undefined,
+): CustomAPIFormat {
+  if (!provider) return canonicalAPIFormat(format) ?? 'openai_chat'
+  const canonical = canonicalAPIFormat(format)
+  return canonical && allowedFormatsForProvider(provider).includes(canonical) ? canonical : provider.format
+}
+
+export function providerMatchesSearch(provider: ProviderOption, query: string): boolean {
+  const normalizedQuery = query.trim().toLowerCase()
+  if (!normalizedQuery) return true
+  const haystack = [
+    provider.label,
+    provider.value,
+    provider.description,
+    provider.endpoint,
+    apiFormatLabel(provider.format),
+    ...(provider.searchAliases ?? []),
+  ].join(' ').toLowerCase()
+  return haystack.includes(normalizedQuery)
 }
 
 export function endpointSuffixForFormat(format: CustomAPIFormat | undefined): string {
@@ -459,8 +583,11 @@ export function normalizedConfigForProvider(
   developerMode: boolean,
 ): LLMConfig {
   if (!provider) return config
-  const canEditEndpoint = provider.endpointEditMode === 'always' || developerMode
+  const canEditEndpoint = canEditProviderEndpoint(provider, developerMode)
   const canEditFormat = provider.formatEditMode === 'always' || developerMode
+  const nextFormat = canEditFormat
+    ? formatForProvider(provider, config.customApiFormat)
+    : provider.format
 
   return {
     ...config,
@@ -469,8 +596,6 @@ export function normalizedConfigForProvider(
       ? config.apiUrl
       : provider.endpoint,
     type: provider.type,
-    customApiFormat: canEditFormat
-      ? config.customApiFormat ?? provider.format
-      : provider.format,
+    customApiFormat: nextFormat,
   }
 }

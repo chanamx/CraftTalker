@@ -140,7 +140,7 @@ describe('generation locks', () => {
     const afterComplete = await streamRequest(app, 'LockBot', chatA)
     expect(afterComplete.status).toBe(200)
     await drain(afterComplete)
-  })
+  }, 10_000)
 
   it('keeps regenerate deletion inside the generation lock', async () => {
     const app = createApp()

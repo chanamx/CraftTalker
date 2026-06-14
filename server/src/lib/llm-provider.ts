@@ -179,6 +179,10 @@ export function modelListUrlFromConfig(config: LLMConfig): string {
   return joinUrl(baseUrl, '/models')
 }
 
+export function geminiModelId(model: string): string {
+  return model.trim().replace(/^models\//, '')
+}
+
 export function ollamaNativeChatUrl(baseUrl: string): string {
   return joinOllamaNativeUrl(baseUrl, '/api/chat')
 }

@@ -7,7 +7,7 @@ import { useSettingsStore } from '@/stores/settings-store'
 import {
   LLM_PROVIDER_OPTIONS,
   PROVIDER_BY_SOURCE,
-  apiFormatLabel,
+  canEditProviderEndpoint,
   normalizedConfigForProvider,
   type ProviderOption,
 } from '@/lib/llm-provider-options'
@@ -108,8 +108,7 @@ export function OnboardingWizard({ characters, onSelectCharacter, onComplete }: 
   const setLlmConfig = useSettingsStore((s) => s.setLlmConfig)
   const [localConfig, setLocalConfig] = useState<LLMConfig>(llmConfig)
   const activeProvider = PROVIDER_BY_SOURCE.get(localConfig.source ?? 'lmstudio')
-  const showEndpointInput = !activeProvider || activeProvider.endpointEditMode === 'always'
-  const selectedFormat = localConfig.customApiFormat ?? activeProvider?.format ?? 'openai_chat'
+  const showEndpointInput = canEditProviderEndpoint(activeProvider, false)
 
   useEffect(() => {
     const provider = PROVIDER_BY_SOURCE.get(llmConfig.source ?? 'lmstudio')
@@ -196,15 +195,6 @@ export function OnboardingWizard({ characters, onSelectCharacter, onComplete }: 
                 <p className="mt-1 text-[11px] text-[var(--color-text-muted)]">{activeProvider.description}</p>
               )}
             </Field>
-            {activeProvider && !showEndpointInput && (
-              <div className="rounded-lg border border-[var(--color-border-subtle)] bg-[var(--color-bg-surface)] px-3 py-2">
-                <div className="flex items-center justify-between gap-3">
-                  <span className="text-[11px] font-medium text-[var(--color-text-muted)]">连接摘要</span>
-                  <span className="text-[11px] text-[var(--color-text-secondary)]">{apiFormatLabel(selectedFormat)}</span>
-                </div>
-                <p className="mt-1 break-all text-xs text-[var(--color-text-secondary)]">{activeProvider.endpoint}</p>
-              </div>
-            )}
             {showEndpointInput && (
               <Field label="API 地址">
                 <input

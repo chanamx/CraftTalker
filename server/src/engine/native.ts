@@ -6,6 +6,7 @@ import {
   apiFormatFromConfig,
   azureChatCompletionsUrl,
   baseUrlFromConfig,
+  geminiModelId,
   headersFromConfig,
   joinUrl,
   modelListUrlFromConfig,
@@ -353,7 +354,7 @@ export class NativeEngine implements Engine {
 
   private async generateGemini(context: NativeRequestContext): Promise<EngineResponse> {
     const body = geminiBody(context.config, context.preset, context.chatMessages)
-    const model = encodeURIComponent(context.config.model)
+    const model = encodeURIComponent(geminiModelId(context.config.model))
     const response = await this.fetchLLM(joinUrl(context.baseUrl, `/models/${model}:generateContent`), context.headers, body, context.signal)
     const data = await response.json() as {
       candidates?: Array<{ content?: { parts?: Array<{ text?: string }> }; finishReason?: string }>
@@ -408,7 +409,7 @@ export class NativeEngine implements Engine {
 
   private async *streamGemini(context: NativeRequestContext): AsyncGenerator<string, void, unknown> {
     const body = geminiBody(context.config, context.preset, context.chatMessages)
-    const model = encodeURIComponent(context.config.model)
+    const model = encodeURIComponent(geminiModelId(context.config.model))
     const response = await this.fetchLLM(joinUrl(context.baseUrl, `/models/${model}:streamGenerateContent?alt=sse`), context.headers, body, context.signal)
     yield* consumeSSE(response, (parsed) => {
       const candidate = asGeminiStreamChunk(parsed).candidates?.[0]

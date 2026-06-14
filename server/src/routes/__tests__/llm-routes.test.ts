@@ -84,6 +84,115 @@ describe('/api/llm/models provider routing', () => {
     )
   })
 
+  it('fetches Anthropic models with version headers and cursor pagination', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({
+        data: [{ id: 'claude-sonnet-4-5' }],
+        has_more: true,
+        last_id: 'claude-sonnet-4-5',
+      }))
+      .mockResolvedValueOnce(jsonResponse({
+        data: [
+          { id: 'claude-haiku-4-5' },
+          { id: 'claude-sonnet-4-5' },
+        ],
+        has_more: false,
+      }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const res = await createTestApp().request('/api/llm/models', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        source: 'anthropic',
+        apiUrl: 'https://api.anthropic.com/v1',
+        apiKey: 'claude-key',
+        model: 'claude-sonnet-4-5',
+        type: 'openai',
+      }),
+    })
+
+    expect(res.status).toBe(200)
+    expect(await res.json()).toEqual(['claude-sonnet-4-5', 'claude-haiku-4-5'])
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      'https://api.anthropic.com/v1/models?limit=1000',
+      expect.objectContaining({
+        method: 'GET',
+        headers: expect.objectContaining({
+          'x-api-key': 'claude-key',
+          'anthropic-version': '2023-06-01',
+        }),
+      }),
+    )
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      'https://api.anthropic.com/v1/models?limit=1000&after_id=claude-sonnet-4-5',
+      expect.objectContaining({
+        method: 'GET',
+      }),
+    )
+  })
+
+  it('fetches Gemini models, filters generation-capable entries, and normalizes model ids', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({
+        models: [
+          {
+            name: 'models/gemini-2.0-flash',
+            baseModelId: 'gemini-2.0-flash',
+            supportedGenerationMethods: ['generateContent'],
+          },
+          {
+            name: 'models/embedding-001',
+            supportedGenerationMethods: ['embedContent'],
+          },
+        ],
+        nextPageToken: 'page-2',
+      }))
+      .mockResolvedValueOnce(jsonResponse({
+        models: [
+          {
+            name: 'models/gemini-1.5-pro',
+            supportedActions: ['generateContent'],
+          },
+        ],
+      }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const res = await createTestApp().request('/api/llm/models', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        source: 'google',
+        apiUrl: 'https://generativelanguage.googleapis.com/v1beta',
+        apiKey: 'gemini-key',
+        model: 'gemini-2.0-flash',
+        type: 'openai',
+      }),
+    })
+
+    expect(res.status).toBe(200)
+    expect(await res.json()).toEqual(['gemini-2.0-flash', 'gemini-1.5-pro'])
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      'https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000',
+      expect.objectContaining({
+        method: 'GET',
+        headers: expect.objectContaining({
+          'x-goog-api-key': 'gemini-key',
+        }),
+      }),
+    )
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      'https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000&pageToken=page-2',
+      expect.objectContaining({
+        method: 'GET',
+      }),
+    )
+  })
+
   it('fetches Ollama native tags from /api/tags', async () => {
     const fetchMock = vi.fn().mockResolvedValue(jsonResponse({
       models: [
