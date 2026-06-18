@@ -8,19 +8,89 @@ import { parseCharacterJson } from '../lib/png-parser.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const DEFAULT_DATA_DIR = path.resolve(__dirname, '../../data')
+const WORLD_ENTRY_UPDATE_ALIASES = {
+  keys: 'key',
+  secondary_keys: 'keysecondary',
+  group_weight: 'groupWeight',
+  group_override: 'groupOverride',
+  ignore_budget: 'ignoreBudget',
+  selective_logic: 'selectiveLogic',
+  outlet_name: 'outletName',
+  scan_depth: 'scanDepth',
+  match_whole_words: 'matchWholeWords',
+  use_group_scoring: 'useGroupScoring',
+  case_sensitive: 'caseSensitive',
+  automation_id: 'automationId',
+  display_index: 'displayIndex',
+  exclude_recursion: 'excludeRecursion',
+  prevent_recursion: 'preventRecursion',
+  delay_until_recursion: 'delayUntilRecursion',
+  use_probability: 'useProbability',
+  match_persona_description: 'matchPersonaDescription',
+  match_character_description: 'matchCharacterDescription',
+  match_character_personality: 'matchCharacterPersonality',
+  match_character_depth_prompt: 'matchCharacterDepthPrompt',
+  match_scenario: 'matchScenario',
+  match_creator_notes: 'matchCreatorNotes',
+  character_filter: 'characterFilter',
+  use_regex: 'use_regexp',
+  add_memo: 'addMemo',
+} as const
+const WORLD_ENTRY_EXTENSION_KEYS = {
+  displayIndex: 'display_index',
+  excludeRecursion: 'exclude_recursion',
+  preventRecursion: 'prevent_recursion',
+  delayUntilRecursion: 'delay_until_recursion',
+  depth: 'depth',
+  probability: 'probability',
+  useProbability: 'useProbability',
+  position: 'position',
+  role: 'role',
+  matchWholeWords: 'match_whole_words',
+  useGroupScoring: 'use_group_scoring',
+  caseSensitive: 'case_sensitive',
+  matchPersonaDescription: 'match_persona_description',
+  matchCharacterDescription: 'match_character_description',
+  matchCharacterPersonality: 'match_character_personality',
+  matchCharacterDepthPrompt: 'match_character_depth_prompt',
+  matchScenario: 'match_scenario',
+  matchCreatorNotes: 'match_creator_notes',
+  scanDepth: 'scan_depth',
+  automationId: 'automation_id',
+  vectorized: 'vectorized',
+  group: 'group',
+  groupOverride: 'group_override',
+  groupWeight: 'group_weight',
+  sticky: 'sticky',
+  cooldown: 'cooldown',
+  delay: 'delay',
+  triggers: 'triggers',
+  ignoreBudget: 'ignore_budget',
+  outletName: 'outlet_name',
+} as const
 
 function getDataDir() { return process.env.LUKER_DATA_DIR ?? DEFAULT_DATA_DIR }
 function getWorldsDir() { return path.join(getDataDir(), 'worlds') }
 
+export interface WorldBookEntryCharacterFilter {
+  names: string[]
+  tags: string[]
+  isExclude: boolean
+}
+
 export interface WorldBookEntry {
   uid: number
+  id?: number | string
   key: string[]
+  keys?: string[]
   keysecondary: string[]
+  secondary_keys?: string[]
   comment: string
   content: string
   constant: boolean
   selective: boolean
   insertion_order: number
+  priority?: number | string
   enabled: boolean
   position: number
   depth: number
@@ -47,6 +117,27 @@ export interface WorldBookEntry {
   groupOverride?: boolean
   ignoreBudget?: boolean
   outletName?: string
+  outlet_name?: string
+  excludeRecursion?: boolean
+  preventRecursion?: boolean
+  delayUntilRecursion?: boolean | number
+  useProbability?: boolean
+  scanDepth?: number | null
+  matchWholeWords?: boolean | null
+  useGroupScoring?: boolean | null
+  caseSensitive?: boolean | null
+  automationId?: string
+  displayIndex?: number
+  addMemo?: boolean
+  matchPersonaDescription?: boolean
+  matchCharacterDescription?: boolean
+  matchCharacterPersonality?: boolean
+  matchCharacterDepthPrompt?: boolean
+  matchScenario?: boolean
+  matchCreatorNotes?: boolean
+  triggers?: string[]
+  characterFilter?: WorldBookEntryCharacterFilter
+  character_filter?: WorldBookEntryCharacterFilter
   extensions?: Record<string, unknown>
   disable?: boolean
   vectorized?: boolean
@@ -69,9 +160,12 @@ export interface WorldBook {
   [key: string]: unknown
 }
 
-export type WorldBookEntryInput =
-  Pick<WorldBookEntry, 'key' | 'content'> &
-  Partial<Omit<WorldBookEntry, 'key' | 'content'>>
+export type WorldBookEntryInput = Record<string, unknown> & {
+  content: string
+  key?: string[]
+  keys?: string[]
+  uid?: number
+}
 
 function getWorldPath(name: string): string {
   return safePath(getWorldsDir(), `${name}.json`)
@@ -148,7 +242,7 @@ export async function listWorlds(): Promise<WorldListItem[]> {
       .map(async (f) => {
         const filePath = path.join(worldsDir, f)
         try {
-          const world = normalizeWorld(await readJsonFile(filePath))
+          const world = normalizeWorld(await readJsonFile(filePath), path.parse(f).name)
           const boundTo = bindings.get(world.name) ?? []
           return {
             name: world.name,
@@ -173,7 +267,7 @@ export async function getWorld(name: string): Promise<WorldBook> {
   if (!existsSync(filePath)) {
     throw createError(ErrorCode.WORLD_NOT_FOUND, `世界书 "${name}" 不存在`, { worldName: name })
   }
-  return normalizeWorld(await readJsonFile(filePath))
+  return normalizeWorld(await readJsonFile(filePath), name)
 }
 
 export async function createWorld(name: string, description?: string): Promise<WorldBook> {
@@ -208,7 +302,7 @@ export async function saveWorldBook(world: WorldBook): Promise<WorldBook> {
 
 export async function updateWorld(name: string, updates: Partial<WorldBook>): Promise<WorldBook> {
   const existing = await getWorld(name)
-  const merged = normalizeWorld({ ...existing, ...updates })
+  const merged = normalizeWorld({ ...existing, ...updates }, name)
   const filePath = getWorldPath(name)
   await fs.writeFile(filePath, JSON.stringify(merged, null, 2), 'utf8')
   return merged
@@ -225,18 +319,23 @@ export async function deleteWorld(name: string): Promise<boolean> {
 
 export async function addWorldEntry(worldName: string, entry: WorldBookEntryInput): Promise<WorldBook> {
   const world = await getWorld(worldName)
-  const uid = entry.uid || Date.now()
-  world.entries[String(uid)] = normalizeWorldEntry({ ...entry, uid })
+  const fallbackUid = Date.now()
+  const uid = getEntryFallbackUid(String(fallbackUid), entry) ?? fallbackUid
+  world.entries[String(uid)] = normalizeWorldEntry({ ...canonicalizeWorldEntryUpdates(entry), uid })
   return updateWorld(worldName, world)
 }
 
-export async function updateWorldEntry(worldName: string, uid: number, updates: Partial<WorldBookEntry>): Promise<WorldBook> {
+export async function updateWorldEntry(worldName: string, uid: number, updates: Record<string, unknown>): Promise<WorldBook> {
   const world = await getWorld(worldName)
   const key = String(uid)
   if (!world.entries[key]) {
     throw createError(ErrorCode.NOT_FOUND, `世界书条目 "${uid}" 不存在`, { worldName, uid })
   }
-  world.entries[key] = normalizeWorldEntry({ ...world.entries[key], ...updates, uid })
+  world.entries[key] = normalizeWorldEntry({
+    ...world.entries[key],
+    ...canonicalizeWorldEntryUpdates(updates, world.entries[key].extensions),
+    uid,
+  })
   return updateWorld(worldName, world)
 }
 
@@ -246,19 +345,25 @@ export async function deleteWorldEntry(worldName: string, uid: number): Promise<
   return updateWorld(worldName, world)
 }
 
-export function normalizeWorld(raw: Record<string, unknown>): WorldBook {
-  const entriesRaw = isRecord(raw.entries) ? raw.entries : {}
+export function normalizeWorld(raw: Record<string, unknown>, fallbackName = ''): WorldBook {
+  const entriesRaw = getWorldEntryRecords(raw.entries)
   const entries: Record<string, WorldBookEntry> = {}
+  const usedUids = new Set<number>()
+  let nextFallbackUid = 0
 
-  for (const [key, value] of Object.entries(entriesRaw)) {
+  for (const [key, value] of entriesRaw) {
     if (!isRecord(value)) continue
-    const entry = normalizeWorldEntry(value)
-    entries[String(entry.uid || key)] = entry
+    const fallbackUid = getEntryFallbackUid(key, value)
+    const uid = fallbackUid ?? nextAvailableUid(usedUids, nextFallbackUid)
+    const entry = normalizeWorldEntry({ ...value, uid })
+    usedUids.add(entry.uid)
+    nextFallbackUid = Math.max(nextFallbackUid, entry.uid + 1)
+    entries[String(entry.uid)] = entry
   }
 
   return {
     ...raw,
-    name: asString(raw.name),
+    name: fallbackName || asString(raw.name),
     description: asString(raw.description),
     entries,
     enabled: typeof raw.enabled === 'boolean' ? raw.enabled : true,
@@ -277,9 +382,9 @@ export function normalizeWorldEntry(raw: Record<string, unknown>): WorldBookEntr
   const extensions = isRecord(raw.extensions) ? raw.extensions : {}
   const disable = typeof raw.disable === 'boolean' ? raw.disable : undefined
   const enabled = typeof raw.enabled === 'boolean' ? raw.enabled : disable !== true
-  const uid = asNumber(raw.uid, Date.now())
+  const uid = asUid(raw.uid ?? raw.id, Date.now())
   const useRegexp = asBoolean(valueFrom(raw, extensions, ['use_regexp', 'use_regex']), false)
-  const insertionOrder = asNumber(valueFrom(raw, extensions, ['insertion_order', 'order']), 100)
+  const insertionOrder = asNumber(valueFrom(raw, extensions, ['insertion_order', 'order', 'priority']), 100)
   const positionValue = valueFrom(raw, extensions, ['position'])
   const groupOverride = asBoolean(valueFrom(raw, extensions, ['groupOverride', 'group_override']), false)
   const groupWeight = asNumber(valueFrom(raw, extensions, ['groupWeight', 'group_weight']), 100)
@@ -287,12 +392,32 @@ export function normalizeWorldEntry(raw: Record<string, unknown>): WorldBookEntr
   const selectiveLogic = asNumber(valueFrom(raw, extensions, ['selectiveLogic', 'selective_logic']), 0)
   const outletName = asString(valueFrom(raw, extensions, ['outletName', 'outlet_name']))
   const vectorized = asBoolean(valueFrom(raw, extensions, ['vectorized']), false)
+  const excludeRecursion = asBoolean(valueFrom(raw, extensions, ['excludeRecursion', 'exclude_recursion']), false)
+  const preventRecursion = asBoolean(valueFrom(raw, extensions, ['preventRecursion', 'prevent_recursion']), false)
+  const delayUntilRecursion = asBooleanOrNumber(valueFrom(raw, extensions, ['delayUntilRecursion', 'delay_until_recursion']), false)
+  const scanDepth = asNullableNumber(valueFrom(raw, extensions, ['scanDepth', 'scan_depth']))
+  const matchWholeWords = asNullableBoolean(valueFrom(raw, extensions, ['matchWholeWords', 'match_whole_words']))
+  const useGroupScoring = asNullableBoolean(valueFrom(raw, extensions, ['useGroupScoring', 'use_group_scoring']))
+  const caseSensitive = asNullableBoolean(valueFrom(raw, extensions, ['caseSensitive', 'case_sensitive']))
+  const automationId = asString(valueFrom(raw, extensions, ['automationId', 'automation_id']))
+  const role = asNumber(valueFrom(raw, extensions, ['role']), 0)
+  const sticky = asNullableNumber(valueFrom(raw, extensions, ['sticky']))
+  const cooldown = asNullableNumber(valueFrom(raw, extensions, ['cooldown']))
+  const delay = asNullableNumber(valueFrom(raw, extensions, ['delay']))
+  const displayIndex = asNumber(valueFrom(raw, extensions, ['displayIndex', 'display_index']), uid)
+  const useProbability = asBoolean(valueFrom(raw, extensions, ['useProbability', 'use_probability']), true)
+  const characterFilter = asCharacterFilter(valueFrom(raw, extensions, ['characterFilter', 'character_filter']))
+  const characterFilterFields = characterFilter
+    ? { characterFilter, character_filter: characterFilter }
+    : {}
 
   return {
     ...raw,
     uid,
     key: asStringArray(raw.key ?? raw.keys),
+    ...(Object.hasOwn(raw, 'keys') ? { keys: asStringArray(raw.keys ?? raw.key) } : {}),
     keysecondary: asStringArray(raw.keysecondary ?? raw.secondary_keys),
+    ...(Object.hasOwn(raw, 'secondary_keys') ? { secondary_keys: asStringArray(raw.secondary_keys ?? raw.keysecondary) } : {}),
     comment: asString(raw.comment ?? raw.name),
     content: asString(raw.content),
     constant: Boolean(raw.constant),
@@ -302,7 +427,7 @@ export function normalizeWorldEntry(raw: Record<string, unknown>): WorldBookEntr
     disable: !enabled,
     position: normalizePosition(positionValue),
     depth: asNumber(valueFrom(raw, extensions, ['depth']), 4),
-    order: asNumber(valueFrom(raw, extensions, ['order', 'insertion_order']), insertionOrder),
+    order: asNumber(valueFrom(raw, extensions, ['order', 'insertion_order', 'priority']), insertionOrder),
     use_regexp: useRegexp,
     probability: asNumber(valueFrom(raw, extensions, ['probability']), 100),
     group: asString(valueFrom(raw, extensions, ['group'])),
@@ -313,21 +438,76 @@ export function normalizeWorldEntry(raw: Record<string, unknown>): WorldBookEntr
     selectiveLogic,
     outletName,
     vectorized,
-    exclude_recursion: asBoolean(valueFrom(raw, extensions, ['excludeRecursion', 'exclude_recursion']), false),
-    prevent_recursion: asBoolean(valueFrom(raw, extensions, ['preventRecursion', 'prevent_recursion']), false),
-    delay_until_recursion: asBooleanOrNumber(valueFrom(raw, extensions, ['delayUntilRecursion', 'delay_until_recursion']), false),
-    scan_depth: asNumber(valueFrom(raw, extensions, ['scanDepth', 'scan_depth']), 100),
-    match_whole_words: asBoolean(valueFrom(raw, extensions, ['matchWholeWords', 'match_whole_words']), false),
-    use_group_scoring: asBoolean(valueFrom(raw, extensions, ['useGroupScoring', 'use_group_scoring']), false),
-    case_sensitive: asBoolean(valueFrom(raw, extensions, ['caseSensitive', 'case_sensitive']), false),
-    automation_id: asString(valueFrom(raw, extensions, ['automationId', 'automation_id'])),
-    role: asNumber(valueFrom(raw, extensions, ['role']), 0),
-    sticky: asNumber(valueFrom(raw, extensions, ['sticky']), 0),
-    cooldown: asNumber(valueFrom(raw, extensions, ['cooldown']), 0),
-    delay: asNumber(valueFrom(raw, extensions, ['delay']), 0),
-    display_index: asNumber(valueFrom(raw, extensions, ['displayIndex', 'display_index']), uid),
+    exclude_recursion: excludeRecursion,
+    excludeRecursion,
+    prevent_recursion: preventRecursion,
+    preventRecursion,
+    delay_until_recursion: delayUntilRecursion,
+    delayUntilRecursion,
+    scan_depth: scanDepth ?? 100,
+    scanDepth,
+    match_whole_words: matchWholeWords ?? false,
+    matchWholeWords,
+    use_group_scoring: useGroupScoring ?? false,
+    useGroupScoring,
+    case_sensitive: caseSensitive ?? false,
+    caseSensitive,
+    automation_id: automationId,
+    automationId,
+    role,
+    sticky: sticky ?? 0,
+    cooldown: cooldown ?? 0,
+    delay: delay ?? 0,
+    display_index: displayIndex,
+    displayIndex,
+    useProbability,
+    addMemo: asBoolean(valueFrom(raw, extensions, ['addMemo', 'add_memo']), false),
+    matchPersonaDescription: asBoolean(valueFrom(raw, extensions, ['matchPersonaDescription', 'match_persona_description']), false),
+    matchCharacterDescription: asBoolean(valueFrom(raw, extensions, ['matchCharacterDescription', 'match_character_description']), false),
+    matchCharacterPersonality: asBoolean(valueFrom(raw, extensions, ['matchCharacterPersonality', 'match_character_personality']), false),
+    matchCharacterDepthPrompt: asBoolean(valueFrom(raw, extensions, ['matchCharacterDepthPrompt', 'match_character_depth_prompt']), false),
+    matchScenario: asBoolean(valueFrom(raw, extensions, ['matchScenario', 'match_scenario']), false),
+    matchCreatorNotes: asBoolean(valueFrom(raw, extensions, ['matchCreatorNotes', 'match_creator_notes']), false),
+    triggers: asStringArray(valueFrom(raw, extensions, ['triggers'])),
+    ...characterFilterFields,
     extensions,
   }
+}
+
+function canonicalizeWorldEntryUpdates(
+  updates: Partial<WorldBookEntry> | WorldBookEntryInput,
+  baseExtensions: Record<string, unknown> = {},
+): Partial<WorldBookEntry> {
+  const next: Record<string, unknown> = { ...updates }
+  const updateExtensions = isRecord(updates.extensions) ? updates.extensions : {}
+  const extensions = { ...baseExtensions, ...updateExtensions }
+  let hasExtensionUpdate = Object.hasOwn(updates, 'extensions')
+
+  for (const [sourceKey, targetKey] of Object.entries(WORLD_ENTRY_UPDATE_ALIASES)) {
+    if (Object.hasOwn(updates, sourceKey)) {
+      next[targetKey] = updates[sourceKey]
+    }
+  }
+
+  for (const [sourceKey, extensionKey] of Object.entries(WORLD_ENTRY_EXTENSION_KEYS)) {
+    if (Object.hasOwn(updateExtensions, extensionKey)) {
+      next[sourceKey] = updateExtensions[extensionKey]
+    }
+    if (Object.hasOwn(next, sourceKey)) {
+      extensions[extensionKey] = next[sourceKey]
+      hasExtensionUpdate = true
+    }
+  }
+
+  if (Object.hasOwn(next, 'characterFilter')) {
+    next.character_filter = next.characterFilter
+  }
+
+  if (hasExtensionUpdate) {
+    next.extensions = extensions
+  }
+
+  return next as Partial<WorldBookEntry>
 }
 
 function valueFrom(raw: Record<string, unknown>, extensions: Record<string, unknown>, keys: string[]): unknown {
@@ -336,6 +516,42 @@ function valueFrom(raw: Record<string, unknown>, extensions: Record<string, unkn
     if (Object.hasOwn(extensions, key)) return extensions[key]
   }
   return undefined
+}
+
+function getWorldEntryRecords(value: unknown): Array<[string, Record<string, unknown>]> {
+  if (Array.isArray(value)) {
+    return value
+      .map((entry, index): [string, Record<string, unknown>] | null => isRecord(entry) ? [String(index), entry] : null)
+      .filter((entry): entry is [string, Record<string, unknown>] => entry !== null)
+  }
+  return isRecord(value)
+    ? Object.entries(value).filter((entry): entry is [string, Record<string, unknown>] => isRecord(entry[1]))
+    : []
+}
+
+function getEntryFallbackUid(key: string, entry: Record<string, unknown>): number | undefined {
+  const existingUid = firstNonNegativeInteger(entry.uid, entry.id)
+  if (existingUid !== undefined) return existingUid
+
+  const numericKey = Number(key)
+  return Number.isInteger(numericKey) && numericKey >= 0 ? numericKey : undefined
+}
+
+function firstNonNegativeInteger(...values: unknown[]): number | undefined {
+  for (const value of values) {
+    if (typeof value === 'number' && Number.isInteger(value) && value >= 0) return value
+    if (typeof value === 'string' && value.trim()) {
+      const parsed = Number(value)
+      if (Number.isInteger(parsed) && parsed >= 0) return parsed
+    }
+  }
+  return undefined
+}
+
+function nextAvailableUid(usedUids: Set<number>, start: number): number {
+  let uid = Math.max(0, Math.floor(start))
+  while (usedUids.has(uid)) uid += 1
+  return uid
 }
 
 function normalizePosition(value: unknown): number {
@@ -362,11 +578,33 @@ function asString(value: unknown): string {
 }
 
 function asNumber(value: unknown, fallback: number): number {
-  return typeof value === 'number' && Number.isFinite(value) ? value : fallback
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = Number(value)
+    if (Number.isFinite(parsed)) return parsed
+  }
+  return fallback
+}
+
+function asUid(value: unknown, fallback: number): number {
+  return firstNonNegativeInteger(value) ?? fallback
 }
 
 function asBoolean(value: unknown, fallback: boolean): boolean {
   return typeof value === 'boolean' ? value : fallback
+}
+
+function asNullableBoolean(value: unknown): boolean | null {
+  return typeof value === 'boolean' ? value : null
+}
+
+function asNullableNumber(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = Number(value)
+    if (Number.isFinite(parsed)) return parsed
+  }
+  return null
 }
 
 function asBooleanOrNumber(value: unknown, fallback: boolean): boolean | number {
@@ -381,4 +619,13 @@ function asBooleanOrNumber(value: unknown, fallback: boolean): boolean | number 
 
 function asStringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : []
+}
+
+function asCharacterFilter(value: unknown): WorldBookEntryCharacterFilter | undefined {
+  if (!isRecord(value)) return undefined
+  return {
+    names: asStringArray(value.names),
+    tags: asStringArray(value.tags),
+    isExclude: asBoolean(value.isExclude, false),
+  }
 }

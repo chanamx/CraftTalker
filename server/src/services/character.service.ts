@@ -4,7 +4,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { readCharacterCard, parseCharacterJson, serializeCharacterJson, toStoredCharacterJson, type CharacterCard } from '../lib/png-parser.js'
 import { createError, ErrorCode } from '../lib/errors.js'
-import { normalizeWorld, normalizeWorldEntry, saveWorldBook, type WorldBook } from './world.service.js'
+import { normalizeWorld, saveWorldBook, type WorldBook } from './world.service.js'
 import { safePath } from '../lib/path-utils.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -70,20 +70,13 @@ async function extractAndSaveWorldBook(rawJson: string, worldName: string): Prom
   const book = charData.character_book
   if (!book || !book.entries) return
 
-  const entries: Record<string, ReturnType<typeof normalizeWorldEntry>> = {}
-  for (const [key, entry] of Object.entries(book.entries)) {
-    const e = entry as Record<string, unknown>
-    const uid = (e.uid as number) ?? Number(key) ?? Date.now()
-    entries[String(uid)] = normalizeWorldEntry({ ...e, uid })
-  }
-
   const world = normalizeWorld({
     ...book,
     name: worldName,
     description: (book.description as string) ?? '',
-    entries,
+    entries: book.entries,
     enabled: true,
-  }) as WorldBook
+  }, worldName) as WorldBook
 
   await saveWorldBook(world)
 }

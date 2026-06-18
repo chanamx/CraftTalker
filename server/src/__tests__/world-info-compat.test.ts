@@ -822,11 +822,62 @@ describe('world-info compatibility scanning', () => {
     expect(entry.groupOverride).toBe(true)
     expect(entry.ignoreBudget).toBe(true)
     expect(entry.selectiveLogic).toBe(WORLD_INFO_LOGIC.AND_ALL)
+    expect(entry.excludeRecursion).toBe(false)
+    expect(entry.preventRecursion).toBe(false)
     expect(entry.delay_until_recursion).toBe(2)
+    expect(entry.delayUntilRecursion).toBe(2)
     expect(entry.outletName).toBe('memo')
+    expect(entry.matchCharacterDescription).toBe(true)
     expect(entry.vectorized).toBe(true)
     expect(entry.extensions?.match_character_description).toBe(true)
     expect(entry.extensions?.triggers).toEqual(['normal'])
     expect(entry.character_filter).toEqual({ names: ['Alice'], tags: ['hero'], isExclude: false })
+    expect(entry.characterFilter).toEqual({ names: ['Alice'], tags: ['hero'], isExclude: false })
+  })
+
+  it('normalizes ST extension-only advanced fields into canonical scan fields', () => {
+    const entry = normalizeWorldEntry({
+      uid: 2,
+      key: ['archive'],
+      content: 'advanced lore',
+      extensions: {
+        useProbability: false,
+        match_persona_description: true,
+        match_character_personality: true,
+        match_character_depth_prompt: true,
+        match_scenario: true,
+        match_creator_notes: true,
+        scan_depth: 8,
+        case_sensitive: true,
+        match_whole_words: true,
+        use_group_scoring: false,
+        automation_id: 'auto-1',
+        sticky: 3,
+        cooldown: 4,
+        delay: 5,
+        triggers: ['continue'],
+      },
+    })
+
+    expect(entry.useProbability).toBe(false)
+    expect(entry.matchPersonaDescription).toBe(true)
+    expect(entry.matchCharacterPersonality).toBe(true)
+    expect(entry.matchCharacterDepthPrompt).toBe(true)
+    expect(entry.matchScenario).toBe(true)
+    expect(entry.matchCreatorNotes).toBe(true)
+    expect(entry.scanDepth).toBe(8)
+    expect(entry.scan_depth).toBe(8)
+    expect(entry.caseSensitive).toBe(true)
+    expect(entry.case_sensitive).toBe(true)
+    expect(entry.matchWholeWords).toBe(true)
+    expect(entry.match_whole_words).toBe(true)
+    expect(entry.useGroupScoring).toBe(false)
+    expect(entry.use_group_scoring).toBe(false)
+    expect(entry.automationId).toBe('auto-1')
+    expect(entry.automation_id).toBe('auto-1')
+    expect(entry.sticky).toBe(3)
+    expect(entry.cooldown).toBe(4)
+    expect(entry.delay).toBe(5)
+    expect(entry.triggers).toEqual(['continue'])
   })
 })

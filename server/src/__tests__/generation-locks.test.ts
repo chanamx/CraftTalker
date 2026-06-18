@@ -341,6 +341,101 @@ describe('generation locks', () => {
     expect(lastEngineRequest?.worldEntries).toBeUndefined()
   })
 
+  it('loads enabled global world books during generation without character binding', async () => {
+    const app = createApp()
+    writeCharacter('GlobalScanBot')
+    fs.writeFileSync(
+      path.join(testDataDir, 'worlds', 'GlobalScanWorld.json'),
+      JSON.stringify({
+        name: 'GlobalScanWorld',
+        enabled: true,
+        global_enabled: true,
+        entries: {
+          '1': {
+            uid: 1,
+            key: ['global sigil'],
+            content: 'global lore',
+            enabled: true,
+            insertion_order: 100,
+          },
+        },
+      }),
+      'utf8',
+    )
+
+    const chatId = await createChat(app, 'GlobalScanBot')
+    await addMessage('GlobalScanBot', chatId, true, 'The global sigil is visible.', 'Alice')
+
+    const res = await streamRequest(app, 'GlobalScanBot', chatId)
+    expect(res.status).toBe(200)
+    await drain(res)
+
+    expect(lastEngineRequest?.worldEntries?.map(entry => entry.content)).toEqual(['global lore'])
+  })
+
+  it('loads legacy unbound world books without global_enabled as global during generation', async () => {
+    const app = createApp()
+    writeCharacter('LegacyGlobalScanBot')
+    fs.writeFileSync(
+      path.join(testDataDir, 'worlds', 'LegacyGlobalScanWorld.json'),
+      JSON.stringify({
+        name: 'LegacyGlobalScanWorld',
+        enabled: true,
+        entries: {
+          '1': {
+            uid: 1,
+            key: ['legacy sigil'],
+            content: 'legacy global lore',
+            enabled: true,
+            insertion_order: 100,
+          },
+        },
+      }),
+      'utf8',
+    )
+
+    const chatId = await createChat(app, 'LegacyGlobalScanBot')
+    await addMessage('LegacyGlobalScanBot', chatId, true, 'The legacy sigil is visible.', 'Alice')
+
+    const res = await streamRequest(app, 'LegacyGlobalScanBot', chatId)
+    expect(res.status).toBe(200)
+    await drain(res)
+
+    expect(lastEngineRequest?.worldEntries?.map(entry => entry.content)).toEqual(['legacy global lore'])
+  })
+
+  it('does not load closed global world books during generation', async () => {
+    const app = createApp()
+    writeCharacter('ClosedGlobalScanBot')
+    fs.writeFileSync(
+      path.join(testDataDir, 'worlds', 'ClosedGlobalScanWorld.json'),
+      JSON.stringify({
+        name: 'ClosedGlobalScanWorld',
+        enabled: false,
+        global_enabled: true,
+        entries: {
+          '1': {
+            uid: 1,
+            key: ['closed sigil'],
+            content: 'closed global lore',
+            enabled: true,
+            insertion_order: 100,
+          },
+        },
+      }),
+      'utf8',
+    )
+
+    const chatId = await createChat(app, 'ClosedGlobalScanBot')
+    await addMessage('ClosedGlobalScanBot', chatId, true, 'The closed sigil is visible.', 'Alice')
+
+    const res = await streamRequest(app, 'ClosedGlobalScanBot', chatId)
+    expect(res.status).toBe(200)
+    await drain(res)
+
+    expect(lastEngineRequest?.worldEntries).toBeUndefined()
+  })
+
   it('scans extension prompts marked for world-info scanning during generation', async () => {
     const app = createApp()
     writeCharacter('ExtensionScanBot')

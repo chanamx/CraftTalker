@@ -5,6 +5,7 @@ import { useChats, useChat, useCreateChat, useDeleteChat } from '@/hooks/use-cha
 import { mapCharacterIndex, mapChatLineToMessage, type Character } from '@/types'
 import { useChatStore } from '@/stores/chat-store'
 import { useToast } from '@/lib/toast'
+import { updateStExtensionContext } from '@/lib/st-extension-host'
 import type { CharacterDetail } from '@/lib/api'
 
 export function useAppState() {
@@ -41,6 +42,16 @@ export function useAppState() {
       .filter(({ line }) => 'mes' in line)
       .map(({ line, fileIndex }) => mapChatLineToMessage(line, fileIndex))
   }, [chatData])
+
+  useEffect(() => {
+    updateStExtensionContext({
+      activeCharacter,
+      activeChatId,
+      characters,
+      messages,
+      chatLines: chatData?.lines ?? [],
+    })
+  }, [activeCharacter, activeChatId, characters, messages, chatData])
 
   useEffect(() => {
     if (!activeCharacter || !chatsData) return

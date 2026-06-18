@@ -360,6 +360,60 @@ describe('API Routes', () => {
     expect(fs.existsSync(path.join(testDataDir, 'worlds', 'TestWorld.json'))).toBe(true)
   })
 
+  it('reads nameless ST world files using the filename and preserves uid zero entries', async () => {
+    const app = createApp()
+    fs.writeFileSync(
+      path.join(testDataDir, 'worlds', 'NamelessStWorld.json'),
+      JSON.stringify({
+        entries: {
+          '0': {
+            uid: 0,
+            key: ['eldoria'],
+            content: 'Eldoria lore',
+            selective: true,
+            displayIndex: 0,
+          },
+        },
+      }),
+      'utf8',
+    )
+
+    const worldRes = await app.request('/api/worlds/NamelessStWorld')
+    expect(worldRes.status).toBe(200)
+    const world = await worldRes.json() as Json & { entries: Record<string, Json> }
+    expect(world.name).toBe('NamelessStWorld')
+    expect(world.entries['0']?.uid).toBe(0)
+    expect(world.entries['0']?.content).toBe('Eldoria lore')
+
+    const listRes = await app.request('/api/worlds')
+    const worlds = await listRes.json() as Array<Json>
+    const listed = worlds.find(item => item.name === 'NamelessStWorld')
+    expect(listed?.entry_count).toBe(1)
+  })
+
+  it('uses the world filename as the stable identity when a stored name differs', async () => {
+    const app = createApp()
+    fs.writeFileSync(
+      path.join(testDataDir, 'worlds', 'FileIdentityWorld.json'),
+      JSON.stringify({
+        name: 'Embedded Display Name',
+        entries: {},
+        enabled: true,
+      }),
+      'utf8',
+    )
+
+    const worldRes = await app.request('/api/worlds/FileIdentityWorld')
+    expect(worldRes.status).toBe(200)
+    const world = await worldRes.json() as Json
+    expect(world.name).toBe('FileIdentityWorld')
+
+    const listRes = await app.request('/api/worlds')
+    const worlds = await listRes.json() as Array<Json>
+    expect(worlds.find(item => item.name === 'FileIdentityWorld')).toBeTruthy()
+    expect(worlds.find(item => item.name === 'Embedded Display Name')).toBeFalsy()
+  })
+
   it('keeps world book global scope independent from character bindings', async () => {
     const app = createApp()
 
@@ -543,6 +597,145 @@ describe('API Routes', () => {
     const world = await res.json() as Json
     expect(world.global_enabled).toBe(true)
     expect(world.enabled).toBe(true)
+  })
+
+  it('round-trips ST outlet and extension-backed world book entry fields through the API', async () => {
+    const app = createApp()
+    fs.writeFileSync(
+      path.join(testDataDir, 'worlds', 'OutletWorld.json'),
+      JSON.stringify({
+        name: 'OutletWorld',
+        enabled: true,
+        global_enabled: false,
+        entries: {},
+      }),
+      'utf8',
+    )
+
+    const createRes = await app.request('/api/worlds/OutletWorld/entries', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        uid: 7,
+        keys: ['portal'],
+        secondary_keys: ['gate'],
+        content: 'outlet lore',
+        position: 7,
+        outlet_name: 'memo',
+        group_weight: 10,
+        ignore_budget: false,
+        selective_logic: 0,
+        match_whole_words: false,
+        delay_until_recursion: 2,
+        extensions: { match_character_description: true, custom_extension: 'keep-me' },
+        character_filter: { names: ['Alice'], tags: ['hero'], isExclude: false },
+      }),
+    })
+
+    expect(createRes.status).toBe(201)
+    const createdWorld = await createRes.json() as Json & { entries: Record<string, Json> }
+    expect(createdWorld.entries['7']?.key).toEqual(['portal'])
+    expect(createdWorld.entries['7']?.keysecondary).toEqual(['gate'])
+    expect(createdWorld.entries['7']?.position).toBe(7)
+    expect(createdWorld.entries['7']?.outletName).toBe('memo')
+    expect(createdWorld.entries['7']?.delay_until_recursion).toBe(2)
+    expect(createdWorld.entries['7']?.extensions).toMatchObject({
+      custom_extension: 'keep-me',
+      delay_until_recursion: 2,
+      group_weight: 10,
+      ignore_budget: false,
+      match_character_description: true,
+      match_whole_words: false,
+      outlet_name: 'memo',
+      position: 7,
+    })
+    expect(createdWorld.entries['7']?.selectiveLogic).toBe(0)
+    expect(createdWorld.entries['7']?.character_filter).toEqual({ names: ['Alice'], tags: ['hero'], isExclude: false })
+
+    const updateRes = await app.request('/api/worlds/OutletWorld/entries/7', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        outletName: 'journal',
+        groupWeight: 77,
+        ignoreBudget: true,
+        selectiveLogic: 3,
+        matchWholeWords: true,
+        useProbability: false,
+        matchCreatorNotes: true,
+        triggers: ['continue'],
+        extensions: { scan_depth: 9 },
+      }),
+    })
+
+    expect(updateRes.status).toBe(200)
+    const updatedWorld = await updateRes.json() as Json & { entries: Record<string, Json> }
+    expect(updatedWorld.entries['7']?.position).toBe(7)
+    expect(updatedWorld.entries['7']?.outletName).toBe('journal')
+    expect(updatedWorld.entries['7']?.groupWeight).toBe(77)
+    expect(updatedWorld.entries['7']?.ignoreBudget).toBe(true)
+    expect(updatedWorld.entries['7']?.selectiveLogic).toBe(3)
+    expect(updatedWorld.entries['7']?.match_whole_words).toBe(true)
+    expect(updatedWorld.entries['7']?.useProbability).toBe(false)
+    expect(updatedWorld.entries['7']?.matchCreatorNotes).toBe(true)
+    expect(updatedWorld.entries['7']?.scanDepth).toBe(9)
+    expect(updatedWorld.entries['7']?.triggers).toEqual(['continue'])
+    expect(updatedWorld.entries['7']?.extensions).toMatchObject({
+      custom_extension: 'keep-me',
+      outlet_name: 'journal',
+      group_weight: 77,
+      ignore_budget: true,
+      match_whole_words: true,
+      useProbability: false,
+      match_creator_notes: true,
+      triggers: ['continue'],
+      scan_depth: 9,
+    })
+    expect(updatedWorld.entries['7']?.selectiveLogic).toBe(3)
+  })
+
+  it('accepts ST string positions and nullable probability fields through the world book API', async () => {
+    const app = createApp()
+    fs.writeFileSync(
+      path.join(testDataDir, 'worlds', 'LooseStWorld.json'),
+      JSON.stringify({
+        name: 'LooseStWorld',
+        enabled: true,
+        global_enabled: false,
+        entries: {},
+      }),
+      'utf8',
+    )
+
+    const createRes = await app.request('/api/worlds/LooseStWorld/entries', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        uid: 8,
+        key: ['portal'],
+        content: 'loose ST fields',
+        position: 'outlet',
+        outletName: 'memo',
+        probability: null,
+        useProbability: false,
+        delay_until_recursion: '2',
+      }),
+    })
+
+    expect(createRes.status).toBe(201)
+    const createdWorld = await createRes.json() as Json & { entries: Record<string, Json> }
+    expect(createdWorld.entries['8']?.position).toBe(7)
+    expect(createdWorld.entries['8']?.outletName).toBe('memo')
+    expect(createdWorld.entries['8']?.probability).toBe(100)
+    expect(createdWorld.entries['8']?.useProbability).toBe(false)
+    expect(createdWorld.entries['8']?.delay_until_recursion).toBe(2)
+    expect(createdWorld.entries['8']?.extensions).toMatchObject({
+      position: 'outlet',
+      outlet_name: 'memo',
+      probability: null,
+      useProbability: false,
+      delay_until_recursion: '2',
+    })
   })
 
   it('POST /api/chats/:name/:chatId/messages sends and reads back a message', async () => {

@@ -5,6 +5,7 @@ import { useSettingsStore } from '@/stores/settings-store'
 import { useSendMessage, useGenerateStream } from '@/hooks/use-chats'
 import { useCommitRun, useDiscardRun, useRecoverableRuns } from '@/hooks/use-runs'
 import { ApiRequestError, api, consumeSSEStream, type ChatDetail } from '@/lib/api'
+import { event_types, eventSource } from '@/lib/st-extension-host'
 import { useToast } from '@/lib/toast'
 import type { ChatMessage } from '@/types'
 
@@ -45,6 +46,7 @@ export function useChatActions(messages: ChatMessage[]) {
     const key = streamKey(charName, chatId)
     const abortController = new AbortController()
     startStreamEntry(key, abortController, mode)
+    void eventSource.emit(event_types.GENERATION_STARTED, mode)
 
     const chunks: string[] = []
     try {
@@ -103,6 +105,7 @@ export function useChatActions(messages: ChatMessage[]) {
     }
 
     endStream(key)
+    void eventSource.emit(event_types.GENERATION_ENDED)
   }, [toast, queryClient, startStreamEntry, appendStream, endStream])
 
   const handleSend = useCallback(async (content: string) => {
@@ -117,6 +120,7 @@ export function useChatActions(messages: ChatMessage[]) {
 
     try {
       await sendMessage.mutateAsync({ characterName: charName, chatId, content })
+      void eventSource.emit(event_types.MESSAGE_SENT, messages.length)
     } catch {
       toast.error('发送消息失败')
       return
@@ -125,10 +129,11 @@ export function useChatActions(messages: ChatMessage[]) {
     await runStream(charName, charDisplayName, chatId, (signal) =>
       generateStream.mutateAsync({ characterName: charName, chatId, config: llmConfig, signal, genOverrides: genConfig })
     )
-  }, [activeCharacter, activeChatId, streams, sendMessage, generateStream, llmConfig, genConfig, runStream, toast])
+  }, [activeCharacter, activeChatId, streams, sendMessage, generateStream, llmConfig, genConfig, runStream, toast, messages.length])
 
   const handleStop = useCallback(() => {
     if (currentKey) abortStream(currentKey)
+    void eventSource.emit(event_types.GENERATION_STOPPED)
   }, [currentKey, abortStream])
 
   const handleDeleteMessage = useCallback(async (lineIndex: number) => {
@@ -139,6 +144,7 @@ export function useChatActions(messages: ChatMessage[]) {
         if (!old) return old
         return { ...old, lines: old.lines.filter((_, i) => i !== lineIndex) }
       })
+      void eventSource.emit(event_types.MESSAGE_DELETED, lineIndex)
       toast.success('消息已删除')
     } catch {
       toast.error('删除消息失败')
@@ -155,6 +161,8 @@ export function useChatActions(messages: ChatMessage[]) {
         lines[lineIndex] = { ...lines[lineIndex], ...updated }
         return { ...old, lines }
       })
+      void eventSource.emit(event_types.MESSAGE_EDITED, lineIndex)
+      void eventSource.emit(event_types.MESSAGE_UPDATED, lineIndex)
       toast.success('消息已编辑')
     } catch {
       toast.error('编辑消息失败')
@@ -186,6 +194,7 @@ export function useChatActions(messages: ChatMessage[]) {
         lines[lineIndex] = { ...lines[lineIndex], ...updated }
         return { ...old, lines }
       })
+      void eventSource.emit(event_types.MESSAGE_SWIPED, lineIndex)
     } catch {
       toast.error('切换 Swipe 失败')
     }

@@ -12,6 +12,7 @@ describe('api facade', () => {
       runs: expect.any(Object),
       worlds: expect.any(Object),
       presets: expect.any(Object),
+      extensions: expect.any(Object),
     })
   })
 

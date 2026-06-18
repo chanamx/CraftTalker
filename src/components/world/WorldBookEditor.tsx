@@ -20,6 +20,7 @@ const POSITION_LABELS: Record<number, string> = {
   4: '指定深度',
   5: '示例对话前',
   6: '示例对话后',
+  7: '扩展出口',
 }
 
 const TRIGGER_LABELS = {
@@ -40,13 +41,16 @@ function createDefaultEntry(): Partial<WorldBookEntry> {
     comment: '',
     content: '',
     constant: false,
-    selective: false,
+    selective: true,
+    selectiveLogic: 0,
+    addMemo: false,
     insertion_order: 100,
     enabled: true,
     position: 0,
     depth: 4,
     order: 100,
     probability: 100,
+    useProbability: true,
     group: '',
   }
 }
@@ -410,6 +414,7 @@ function EntryCard({ entry, isEditing, onToggleEdit, onToggleEnabled, onUpdateFi
           whileHover={{ scale: 1.1 }}
           whileTap={{ scale: 0.9 }}
           onClick={onToggleEdit}
+          title={isEditing ? '收起条目' : '展开条目'}
           className="p-1 rounded-md text-[var(--color-text-muted)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-bg-surface)]"
         >
           <ArrowDown size={13} className={cn('transition-transform', isEditing && 'rotate-180')} />
@@ -481,6 +486,16 @@ function EntryCard({ entry, isEditing, onToggleEdit, onToggleEnabled, onUpdateFi
                       value={entry.depth}
                       onChange={e => onUpdateField('depth', Number(e.target.value))}
                       min={0}
+                      className="w-full h-7 px-2 rounded-md bg-[var(--color-bg-elevated)] border border-[var(--color-border-subtle)] text-[11px] text-[var(--color-text-primary)]"
+                    />
+                  </MiniField>
+                )}
+                {entry.position === 7 && (
+                  <MiniField label="出口名">
+                    <input
+                      type="text"
+                      value={entry.outletName ?? ''}
+                      onChange={e => onUpdateField('outletName', e.target.value)}
                       className="w-full h-7 px-2 rounded-md bg-[var(--color-bg-elevated)] border border-[var(--color-border-subtle)] text-[11px] text-[var(--color-text-primary)]"
                     />
                   </MiniField>
@@ -617,7 +632,7 @@ function EntryCard({ entry, isEditing, onToggleEdit, onToggleEnabled, onUpdateFi
                       <span className="text-[10px] text-[var(--color-text-secondary)]">阻止递归</span>
                     </label>
                     <label className="flex items-center gap-1.5 cursor-pointer">
-                      <input type="checkbox" checked={entry.delay_until_recursion} onChange={e => onUpdateField('delay_until_recursion', e.target.checked)} className="w-3 h-3 rounded" />
+                      <input type="checkbox" checked={Boolean(entry.delay_until_recursion)} onChange={e => onUpdateField('delay_until_recursion', e.target.checked)} className="w-3 h-3 rounded" />
                       <span className="text-[10px] text-[var(--color-text-secondary)]">延迟至递归</span>
                     </label>
                   </div>

@@ -174,6 +174,55 @@ describe('character card compatibility', () => {
     expect(entry.custom_entry_field).toBe('keep-entry')
   })
 
+  it('extracts Character Book array entries using stable id and priority fields', async () => {
+    const rawCard = {
+      spec: 'chara_card_v2',
+      spec_version: '2.0',
+      data: {
+        name: 'ArrayBookBot',
+        description: 'Has array book',
+        character_book: {
+          name: 'Array Book',
+          description: 'Book description',
+          entries: [
+            {
+              id: 12,
+              keys: ['archive'],
+              secondary_keys: ['sealed'],
+              content: 'Archive lore',
+              enabled: true,
+              insertion_order: 30,
+              priority: 44,
+              position: 'before_char',
+              extensions: {
+                depth: 6,
+                display_index: 3,
+                match_whole_words: true,
+                unknown_extension: 'keep-extension',
+              },
+            },
+          ],
+        },
+      },
+    }
+
+    await importCharacterJson(JSON.stringify(rawCard), 'array-book-bot.json')
+    const world = await getWorld('ArrayBookBot')
+    const entry = world.entries['12']
+
+    expect(world.name).toBe('ArrayBookBot')
+    expect(entry.uid).toBe(12)
+    expect(entry.key).toEqual(['archive'])
+    expect(entry.keysecondary).toEqual(['sealed'])
+    expect(entry.insertion_order).toBe(30)
+    expect(entry.order).toBe(30)
+    expect(entry.position).toBe(0)
+    expect(entry.depth).toBe(6)
+    expect(entry.displayIndex).toBe(3)
+    expect(entry.matchWholeWords).toBe(true)
+    expect(entry.extensions?.unknown_extension).toBe('keep-extension')
+  })
+
   it('writes ccv3 and chara chunks for V3 PNG cards', () => {
     const sourcePng = path.join(testDataDir, 'source.png')
     const outputPng = path.join(testDataDir, 'card.png')
