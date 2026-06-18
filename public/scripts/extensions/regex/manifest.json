@@ -1,0 +1,7 @@
+{
+  "display_name": "Regex",
+  "loading_order": -100,
+  "js": "engine.js",
+  "version": "crafttalker-compat",
+  "author": "CraftTalker"
+}
