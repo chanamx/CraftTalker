@@ -1,6 +1,7 @@
 import { charactersApi } from '@/lib/api-domains/characters'
 import { chatsApi } from '@/lib/api-domains/chats'
 import { engineApi } from '@/lib/api-domains/engine'
+import { extensionsApi } from '@/lib/api-domains/extensions'
 import { llmApi } from '@/lib/api-domains/llm'
 import { llmSessionsApi } from '@/lib/api-domains/llm-sessions'
 import { presetsApi } from '@/lib/api-domains/presets'
@@ -19,4 +20,5 @@ export const api = {
   runs: runsApi,
   worlds: worldsApi,
   presets: presetsApi,
+  extensions: extensionsApi,
 }

@@ -87,13 +87,17 @@ export interface GenerationOverrides {
 
 export interface WorldBookEntry {
   uid: number
+  id?: number | string
   key: string[]
+  keys?: string[]
   keysecondary: string[]
+  secondary_keys?: string[]
   comment: string
   content: string
   constant: boolean
   selective: boolean
   insertion_order: number
+  priority?: number | string
   enabled: boolean
   position: number
   depth: number
@@ -104,7 +108,7 @@ export interface WorldBookEntry {
   group_override: boolean
   exclude_recursion: boolean
   prevent_recursion: boolean
-  delay_until_recursion: boolean
+  delay_until_recursion: boolean | number
   scan_depth: number
   match_whole_words: boolean
   use_group_scoring: boolean
@@ -115,6 +119,41 @@ export interface WorldBookEntry {
   cooldown: number
   delay: number
   display_index: number
+  selectiveLogic?: number
+  groupWeight?: number
+  groupOverride?: boolean
+  ignoreBudget?: boolean
+  outletName?: string
+  outlet_name?: string
+  excludeRecursion?: boolean
+  preventRecursion?: boolean
+  delayUntilRecursion?: boolean | number
+  useProbability?: boolean
+  scanDepth?: number | null
+  matchWholeWords?: boolean | null
+  useGroupScoring?: boolean | null
+  caseSensitive?: boolean | null
+  automationId?: string
+  displayIndex?: number
+  addMemo?: boolean
+  matchPersonaDescription?: boolean
+  matchCharacterDescription?: boolean
+  matchCharacterPersonality?: boolean
+  matchCharacterDepthPrompt?: boolean
+  matchScenario?: boolean
+  matchCreatorNotes?: boolean
+  triggers?: string[]
+  characterFilter?: {
+    names: string[]
+    tags: string[]
+    isExclude: boolean
+  }
+  character_filter?: {
+    names: string[]
+    tags: string[]
+    isExclude: boolean
+  }
+  extensions?: Record<string, unknown>
   disable?: boolean
   vectorized?: boolean
   [key: string]: unknown
@@ -257,3 +296,23 @@ export interface LlmKeySessionCreateInput {
   apiKey: string
   label?: string
 }
+
+export type ExtensionType = 'system' | 'local' | 'global'
+
+export interface ExtensionDiscovery {
+  type: ExtensionType
+  name: string
+}
+
+export interface ExtensionManifest {
+  display_name?: string
+  version?: string
+  author?: string
+  js?: string
+  css?: string
+  loading_order?: number | string
+  requires?: string[]
+  [key: string]: unknown
+}
+
+export type ExtensionSettings = Record<string, unknown>
