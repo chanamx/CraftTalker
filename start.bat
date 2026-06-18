@@ -152,6 +152,8 @@ for %%D in (
     "%DATA%\characters"
     "%DATA%\chats"
     "%DATA%\worlds"
+    "%DATA%\extensions"
+    "%DATA%\extensions\third-party"
     "%DATA%\koboldAI_Settings"
     "%DATA%\openAI_Settings"
     "%DATA%\textGen_Settings"

@@ -42,6 +42,7 @@ server/data/characters/
 server/data/chats/
 server/data/worlds/
 server/data/presets/
+server/data/extensions/
 server/data/backups/
 
 # Preserve directory structure with .gitkeep

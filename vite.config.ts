@@ -1,4 +1,5 @@
 import { defineConfig } from 'vitest/config'
+import { loadEnv } from 'vite'
 
 import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
@@ -7,7 +8,11 @@ import { fileURLToPath } from 'node:url'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 
-export default defineConfig({
+export default defineConfig(({ mode }) => {
+  const env = loadEnv(mode, __dirname, '')
+  const apiTarget = env.CRAFTTALKER_API_TARGET || 'http://localhost:3000'
+
+  return {
   plugins: [react(), tailwindcss()],
   resolve: {
     alias: {
@@ -17,7 +22,11 @@ export default defineConfig({
   server: {
     proxy: {
       '/api': {
-        target: 'http://localhost:3000',
+        target: apiTarget,
+        changeOrigin: true,
+      },
+      '/scripts/extensions/': {
+        target: apiTarget,
         changeOrigin: true,
       },
     },
@@ -70,6 +79,12 @@ export default defineConfig({
     globals: true,
     environment: 'jsdom',
     setupFiles: './src/test/setup.ts',
+    exclude: [
+      '**/node_modules/**',
+      '**/dist/**',
+      '**/server/data/extensions/**',
+    ],
     css: false,
   },
+  }
 })
