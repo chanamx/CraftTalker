@@ -1,8 +1,9 @@
 import { request } from '@/lib/api-client'
-import type { WorldBook, WorldBookEntry, WorldIndex } from '@/lib/api-types'
+import type { StWorldInfoSettings, WorldBook, WorldBookEntry, WorldIndex } from '@/lib/api-types'
 
 export const worldsApi = {
   list: () => request<WorldIndex[]>('/worlds'),
+  getSettings: () => request<StWorldInfoSettings>('/worlds/settings'),
   get: (name: string) => request<WorldBook>(`/worlds/${encodeURIComponent(name)}`),
   create: (name: string, description?: string) =>
     request<WorldBook>('/worlds', {

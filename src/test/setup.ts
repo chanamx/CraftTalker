@@ -15,6 +15,11 @@ Object.defineProperty(window, 'matchMedia', {
   }),
 })
 
+Object.defineProperty(window, 'scrollTo', {
+  writable: true,
+  value: vi.fn(),
+})
+
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
     t: (key: string) => key,

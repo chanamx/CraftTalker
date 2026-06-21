@@ -1,19 +1,20 @@
-import { StrictMode } from 'react'
+import { StrictMode, Suspense, lazy, type ReactNode } from 'react'
 import { createRoot } from 'react-dom/client'
 import { BrowserRouter, Routes, Route } from 'react-router'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { ToastProvider } from '@/lib/toast'
 import { ErrorBoundary } from '@/components/ui/ErrorBoundary'
-import { initializeStExtensionHost } from '@/lib/st-extension-host'
+import { initializeStExtensionHostBridge } from '@/lib/st-extension-bridge'
 import { AppShell } from './AppShell'
-import { SettingsRoute } from '@/routes/SettingsRoute'
-import { ImportRoute } from '@/routes/ImportRoute'
-import { WorldBookRoute } from '@/routes/WorldBookRoute'
-import { PresetsRoute } from '@/routes/PresetsRoute'
 import '@/lib/i18n'
 import './index.css'
 
-void initializeStExtensionHost()
+const SettingsRoute = lazy(() => import('@/routes/SettingsRoute').then(m => ({ default: m.SettingsRoute })))
+const ImportRoute = lazy(() => import('@/routes/ImportRoute').then(m => ({ default: m.ImportRoute })))
+const WorldBookRoute = lazy(() => import('@/routes/WorldBookRoute').then(m => ({ default: m.WorldBookRoute })))
+const PresetsRoute = lazy(() => import('@/routes/PresetsRoute').then(m => ({ default: m.PresetsRoute })))
+
+initializeStExtensionHostBridge()
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -24,6 +25,22 @@ const queryClient = new QueryClient({
   },
 })
 
+function DialogRoute({ children }: { children: ReactNode }) {
+  return (
+    <Suspense fallback={<DialogRouteFallback />}>
+      {children}
+    </Suspense>
+  )
+}
+
+function DialogRouteFallback() {
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/20">
+      <div className="h-8 w-8 rounded-full border-2 border-[var(--color-accent)] border-t-transparent animate-spin" />
+    </div>
+  )
+}
+
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
     <BrowserRouter>
@@ -32,10 +49,10 @@ createRoot(document.getElementById('root')!).render(
           <ErrorBoundary>
             <Routes>
               <Route path="/" element={<AppShell />}>
-                <Route path="settings" element={<SettingsRoute />} />
-                <Route path="import" element={<ImportRoute />} />
-                <Route path="world-book" element={<WorldBookRoute />} />
-                <Route path="presets" element={<PresetsRoute />} />
+                <Route path="settings" element={<DialogRoute><SettingsRoute /></DialogRoute>} />
+                <Route path="import" element={<DialogRoute><ImportRoute /></DialogRoute>} />
+                <Route path="world-book" element={<DialogRoute><WorldBookRoute /></DialogRoute>} />
+                <Route path="presets" element={<DialogRoute><PresetsRoute /></DialogRoute>} />
               </Route>
             </Routes>
           </ErrorBoundary>

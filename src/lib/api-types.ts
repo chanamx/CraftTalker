@@ -70,12 +70,28 @@ export interface ChatLine {
   character_name?: string
   swipe_id?: number
   swipes?: string[]
+  variables?: unknown
+  variables_initialized?: unknown
 }
 
 export interface ChatDetail {
   chatId: string
   characterName: string
   lines: ChatLine[]
+}
+
+export interface ChatMetadataUpdateResponse {
+  chat_metadata: Record<string, unknown>
+}
+
+export interface ChatMessageVariablesUpdate {
+  lineIndex: number
+  variables?: unknown
+  variables_initialized?: unknown
+}
+
+export interface ChatMessageVariablesUpdateResponse {
+  updated: number
 }
 
 export interface GenerationOverrides {
@@ -182,6 +198,29 @@ export interface WorldIndex {
   enabled: boolean
   global_enabled: boolean
   bound_to: string[]
+}
+
+export interface StWorldInfoSettings {
+  world_names: string[]
+  selected_world_info: string[]
+  world_info: {
+    globalSelect: string[]
+    charLore: Array<Record<string, unknown>>
+    entries: Record<string, WorldBookEntry>
+  }
+  world_info_include_names: boolean
+  world_info_case_sensitive: boolean
+  world_info_match_whole_words: boolean
+  world_info_use_group_scoring: boolean
+  world_info_max_recursion_steps: number
+  world_info_depth: number
+  world_info_min_activations: number
+  world_info_min_activations_depth_max: number
+  world_info_budget: number
+  world_info_budget_cap: number
+  world_info_recursive: boolean
+  world_info_overflow_alert: boolean
+  world_info_character_strategy: number
 }
 
 export interface GenerationPreset {
@@ -316,3 +355,43 @@ export interface ExtensionManifest {
 }
 
 export type ExtensionSettings = Record<string, unknown>
+
+export type ExtensionRuntimeCapabilityStatus = 'supported' | 'partial' | 'stub' | 'blocked'
+
+export interface ExtensionRuntimeCapability {
+  id: string
+  status: ExtensionRuntimeCapabilityStatus
+  note: string
+}
+
+export interface ExtensionCompatibilityReportItem extends ExtensionDiscovery {
+  displayName: string
+  version: string
+  author: string
+  enabled: boolean
+  manifestOk: boolean
+  manifestError?: string
+  scriptPath: string | null
+  scriptOk: boolean
+  cssPath: string | null
+  cssOk: boolean
+  loadingOrder: number
+  requires: string[]
+  missingRequiredDependencies: string[]
+  optional: string[]
+  minimumClientVersion: string | null
+  homePage: string | null
+  autoUpdate: boolean
+  generateInterceptor: string | null
+}
+
+export interface ExtensionCompatibilityReport {
+  generatedAt: string
+  totals: {
+    discovered: number
+    enabled: number
+    withErrors: number
+  }
+  extensions: ExtensionCompatibilityReportItem[]
+  runtimeCapabilities: ExtensionRuntimeCapability[]
+}

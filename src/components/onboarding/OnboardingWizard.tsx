@@ -19,17 +19,6 @@ interface OnboardingWizardProps {
   onComplete: () => void
 }
 
-const STORAGE_KEY = 'luker-onboarding-complete'
-
-export function useOnboarding() {
-  const [show, setShow] = useState(() => !localStorage.getItem(STORAGE_KEY))
-  const complete = () => {
-    localStorage.setItem(STORAGE_KEY, '1')
-    setShow(false)
-  }
-  return { showOnboarding: show, completeOnboarding: complete }
-}
-
 function StepContent({ icon, title, subtitle, children }: {
   icon: React.ReactNode; title: string; subtitle: string; children: React.ReactNode
 }) {

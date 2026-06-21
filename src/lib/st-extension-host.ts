@@ -1,9 +1,11 @@
-import { api, type ChatLine, type ExtensionDiscovery, type ExtensionManifest, type ExtensionSettings } from '@/lib/api'
+import { api, type ChatLine, type ExtensionDiscovery, type ExtensionManifest, type ExtensionSettings, type StWorldInfoSettings, type WorldBook } from '@/lib/api'
+import { ensureStCompatDomAnchors, syncStCompatDomState, syncStCompatWorldSelects } from '@/lib/st-compat-dom'
 import type { Character, ChatMessage } from '@/types'
 import * as Popper from '@popperjs/core'
 import hljs from 'highlight.js/lib/common'
 import jquery from 'jquery'
 import lodash from 'lodash'
+import DOMPurify, { type Config as DomPurifyConfig } from 'dompurify'
 import showdown from 'showdown'
 import toastr from 'toastr'
 
@@ -11,17 +13,82 @@ type Listener = (...args: unknown[]) => unknown | Promise<unknown>
 type SlashCommandCallback = (namedArgs: Record<string, unknown>, unnamedArgs: string) => unknown | Promise<unknown>
 type VariableScope = Record<string, unknown>
 type VariableScopeName = 'global' | 'chat' | 'local' | 'character' | 'preset' | 'message' | 'script' | 'extension'
+type VariableScopeFacade = VariableScope & {
+  get: (path: unknown) => unknown
+  set: (path: unknown, value: unknown) => unknown
+  delete: (path: unknown) => void
+  replace: (variables: Record<string, unknown>) => void
+  assign: (variables: Record<string, unknown>) => void
+  all: () => VariableScope
+}
 type SortableAction = 'destroy' | 'disable' | 'enable' | 'instance' | 'option' | 'refresh' | 'toArray'
 type SortableOptions = Record<string, unknown>
+type StWorldInfoRuntimeSettings = Pick<
+  StWorldInfoSettings,
+  | 'world_info_include_names'
+  | 'world_info_case_sensitive'
+  | 'world_info_match_whole_words'
+  | 'world_info_use_group_scoring'
+  | 'world_info_max_recursion_steps'
+  | 'world_info_depth'
+  | 'world_info_min_activations'
+  | 'world_info_min_activations_depth_max'
+  | 'world_info_budget'
+  | 'world_info_budget_cap'
+  | 'world_info_recursive'
+  | 'world_info_overflow_alert'
+  | 'world_info_character_strategy'
+>
 type MacroLikeContext = {
   message_id?: number | 'latest'
   role?: string
 }
 type MacroLikeReplacement = (context: MacroLikeContext, substring: string, ...args: string[]) => unknown
+type StMarkdownProcessor = {
+  makeHtml: (markdown: unknown) => string
+}
 type XbStreamingStatus = {
   isStreaming: boolean
   text: string
   error: string | null
+}
+type StGenerationRole = 'system' | 'assistant' | 'user'
+type StGenerationMessage = {
+  role: StGenerationRole
+  content: string
+}
+type TavernHelperGenerationConfig = Record<string, unknown> & {
+  custom_api?: Record<string, unknown>
+  generation_id?: string
+  injects?: unknown[]
+  max_chat_history?: unknown
+  ordered_prompts?: unknown[]
+  overrides?: Record<string, unknown>
+  should_stream?: boolean
+  user_input?: string
+}
+type TavernHelperGenerationRequest = {
+  generationId: string
+  payload: Record<string, unknown>
+  stream: boolean
+}
+type TavernHelperGenerationEntry = {
+  controller: AbortController
+}
+type CompatChatMessage = ChatLine & {
+  variables?: unknown
+  variables_initialized?: unknown
+  _lineIndex?: number
+  _hadVariables?: boolean
+  _hadVariablesInitialized?: boolean
+}
+export type CompatDiagnosticStatus = 'supported' | 'partial' | 'stub' | 'blocked'
+export type CompatDiagnosticEntry = {
+  id: string
+  status: CompatDiagnosticStatus
+  count: number
+  lastCalledAt: string
+  note: string
 }
 type JQueryStaticWithPlugins = typeof jquery & {
   fn?: JQueryStatic['fn'] & {
@@ -54,7 +121,7 @@ interface StHostApi {
   SlashCommandEnumValue: typeof SlashCommandEnumValue
   SlashCommandClosure: typeof SlashCommandClosure
   SlashCommandParser: typeof SlashCommandParser
-  chat: ChatLine[]
+  chat: CompatChatMessage[]
   characters: Array<Record<string, unknown>>
   event_types: typeof event_types
   eventSource: StEventEmitter
@@ -63,6 +130,10 @@ interface StHostApi {
   extensionTypes: Record<string, string>
   extension_prompts: Record<string, ExtensionPrompt>
   chat_metadata: Record<string, unknown>
+  world_info: Record<string, unknown>
+  world_info_settings: StWorldInfoRuntimeSettings
+  world_names: string[]
+  selected_world_info: string[]
   variables: {
     global: VariableScope
     local: VariableScope
@@ -74,6 +145,8 @@ interface StHostApi {
   getContext: typeof getContext
   getExtensionManifest: typeof getExtensionManifest
   getRequestHeaders: typeof getRequestHeaders
+  loadWorldInfo: typeof loadWorldInfo
+  updateWorldInfoList: typeof updateWorldInfoList
   initialize: typeof initializeStExtensionHost
   ModuleWorkerWrapper: typeof SimpleMutex
   registerMacro: typeof registerMacro
@@ -81,12 +154,22 @@ interface StHostApi {
   registerMacroLike: typeof registerMacroLike
   unregisterMacroLike: typeof unregisterMacroLike
   replaceVariableMacros: typeof replaceVariableMacros
+  messageFormatting: typeof messageFormatting
+  reloadMarkdownProcessor: typeof reloadMarkdownProcessor
   registerSlashCommand: typeof registerSlashCommand
   STscript: typeof STscript
   executeSlashCommands: typeof executeSlashCommands
   executeSlashCommandsWithOptions: typeof executeSlashCommandsWithOptions
   renderExtensionTemplate: typeof renderExtensionTemplate
   renderExtensionTemplateAsync: typeof renderExtensionTemplateAsync
+  updateMessageBlock: typeof updateMessageBlock
+  printMessages: typeof printMessages
+  clearChat: typeof clearChat
+  addOneMessage: typeof addOneMessage
+  appendMediaToMessage: typeof appendMediaToMessage
+  addCopyToCodeBlocks: typeof addCopyToCodeBlocks
+  saveChatConditional: typeof saveChatConditional
+  saveChatConditionalDebounced: typeof saveChatConditionalDebounced
   saveMetadata: typeof saveMetadata
   saveMetadataDebounced: typeof saveMetadataDebounced
   saveSettings: typeof saveSettings
@@ -108,6 +191,9 @@ interface StHostApi {
   xiaobaixStreamingGeneration: ReturnType<typeof createXiaobaixStreamingGeneration>
   updateTemplateVariables: typeof updateTemplateVariables
   updateContext: typeof updateStExtensionContext
+  recordCompatDiagnostic: typeof recordCompatDiagnostic
+  getDiagnostics: typeof getDiagnostics
+  resetDiagnostics: typeof resetDiagnostics
 }
 
 declare global {
@@ -129,11 +215,21 @@ declare global {
     Popper?: typeof Popper
     getContext?: typeof getContext
     saveSettingsDebounced?: typeof saveSettingsDebounced
+    saveChatConditional?: typeof saveChatConditional
+    saveChatConditionalDebounced?: typeof saveChatConditionalDebounced
     executeSlashCommands?: typeof executeSlashCommands
     executeSlashCommandsWithOptions?: typeof executeSlashCommandsWithOptions
+    messageFormatting?: typeof messageFormatting
+    reloadMarkdownProcessor?: typeof reloadMarkdownProcessor
+    updateMessageBlock?: typeof updateMessageBlock
+    printMessages?: typeof printMessages
+    clearChat?: typeof clearChat
+    addOneMessage?: typeof addOneMessage
     STscript?: typeof STscript
     TavernHelper?: Record<string, unknown>
     builtin?: Record<string, unknown>
+    oai_settings?: Record<string, unknown>
+    openai_settings?: Record<string, unknown>
     registerMacroLike?: typeof registerMacroLike
     unregisterMacroLike?: typeof unregisterMacroLike
     xiaobaixStreamingGeneration?: ReturnType<typeof createXiaobaixStreamingGeneration>
@@ -218,6 +314,11 @@ export const event_types = {
   CHARACTER_RENAMED_IN_PAST_CHAT: 'character_renamed_in_past_chat',
   SMOOTH_STREAM_TOKEN_RECEIVED: 'stream_token_received',
   STREAM_TOKEN_RECEIVED: 'stream_token_received',
+  STREAM_TOKEN_RECEIVED_FULLY: 'js_stream_token_received_fully',
+  STREAM_TOKEN_RECEIVED_INCREMENTALLY: 'js_stream_token_received_incrementally',
+  GENERATION_BEFORE_END: 'js_generation_before_end',
+  JS_GENERATION_STARTED: 'js_generation_started',
+  JS_GENERATION_ENDED: 'js_generation_ended',
   STREAM_REASONING_DONE: 'stream_reasoning_done',
   FILE_ATTACHMENT_DELETED: 'file_attachment_deleted',
   WORLDINFO_FORCE_ACTIVATE: 'worldinfo_force_activate',
@@ -363,6 +464,12 @@ export const eventSource = new StEventEmitter([
   event_types.APP_INITIALIZED,
 ])
 
+const global_variables: VariableScope = {}
+const chat_variables: VariableScope = {}
+const chat_extensions: VariableScope = {}
+const global_variable_facade = createVariableScopeFacade({ type: 'global' })
+const chat_variable_facade = createVariableScopeFacade({ type: 'chat' })
+
 export const extension_settings: ExtensionSettings = createDefaultExtensionSettings()
 export const extensionNames: string[] = []
 export const extensionTypes: Record<string, string> = {}
@@ -374,16 +481,23 @@ const extension_prompts: Record<string, ExtensionPrompt> = {}
 const extensionTemplateCache = new Map<string, string>()
 const macroRegistry = new Map<string, unknown>()
 const macroLikeRegistry: Array<{ regex: RegExp, replace: MacroLikeReplacement }> = []
-const chat: ChatLine[] = []
+const diagnostics = new Map<string, CompatDiagnosticEntry>()
+const tavernHelperGenerations = new Map<string, TavernHelperGenerationEntry>()
+const chat: CompatChatMessage[] = []
 const characters: Array<Record<string, unknown>> = []
-const chat_metadata: Record<string, unknown> = { variables: {}, extensions: {} }
-const world_info: Record<string, unknown> = { globalSelect: [], charLore: [], entries: {} }
+const chat_metadata: Record<string, unknown> = { variables: chat_variables, extensions: chat_extensions }
+const world_names: string[] = []
+const selected_world_info: string[] = []
+const world_info: Record<string, unknown> = { globalSelect: selected_world_info, charLore: [], entries: {} }
+const world_info_settings: StWorldInfoRuntimeSettings = createDefaultWorldInfoSettings()
 const character_variables: VariableScope = {}
 const preset_variables: VariableScope = {}
 const script_variables: VariableScope = {}
 const templateVariables: VariableScope = {}
 
 let saveSettingsTimer: number | null = null
+let saveMetadataTimer: number | null = null
+let saveChatTimer: number | null = null
 let initializePromise: Promise<void> | null = null
 let currentCharacterIndex = -1
 let contextState: StHostContextState = {
@@ -517,21 +631,25 @@ export function registerSlashCommand(
   SlashCommandParser.addCommand(command, callback, aliases, helpString)
 }
 
-export async function executeSlashCommands(text = ''): Promise<unknown> {
-  return executeSlashCommandsWithOptions(text)
+export async function executeSlashCommands(text = '', optionsOrReturnResultObject: unknown = {}): Promise<unknown> {
+  const options = typeof optionsOrReturnResultObject === 'boolean'
+    ? { returnResultObject: optionsOrReturnResultObject }
+    : isPlainRecord(optionsOrReturnResultObject)
+      ? optionsOrReturnResultObject
+      : {}
+  return executeSlashCommandsWithOptions(text, options)
 }
 
 export async function executeSlashCommandsWithOptions(input: unknown = '', options: Record<string, unknown> = {}): Promise<unknown> {
   const text = getSlashCommandText(input, options)
   const trimmed = replaceVariableMacros(text).trim()
-  const match = /^\/?([^\s]+)\s*(.*)$/.exec(trimmed)
-  if (!match) return ''
-
-  const command = SlashCommandParser.commands[match[1] ?? '']
-  if (!command?.callback) return wrapSlashResult(text, options, false)
-
   try {
-    const pipe = await command.callback(parseSlashNamedArgs(match[2] ?? ''), getSlashUnnamedArgs(match[2] ?? ''))
+    const segments = splitSlashPipeline(trimmed)
+    if (!segments.length) return ''
+    let pipe: unknown = ''
+    for (const segment of segments) {
+      pipe = await executeSingleSlashCommand(segment, options, pipe)
+    }
     return wrapSlashResult(pipe, options, false)
   } catch (error) {
     if (options.returnResultObject === true || options.handleErrors === false) {
@@ -674,6 +792,68 @@ export function replaceVariableMacros(value: unknown, context: MacroLikeContext 
   return output
 }
 
+const markdownConverter = new showdown.Converter({
+  ghCodeBlocks: true,
+  literalMidWordUnderscores: true,
+  simpleLineBreaks: true,
+  simplifiedAutoLink: true,
+  strikethrough: true,
+  tables: true,
+  tasklists: true,
+})
+
+function sanitizeFormattedHtml(html: string, overrides: DomPurifyConfig = {}): string {
+  const overrideForbiddenTags = Array.isArray(overrides.FORBID_TAGS) ? overrides.FORBID_TAGS : []
+  const overrideForbiddenAttributes = Array.isArray(overrides.FORBID_ATTR) ? overrides.FORBID_ATTR : []
+  return DOMPurify.sanitize(html, {
+    RETURN_DOM: false,
+    RETURN_DOM_FRAGMENT: false,
+    RETURN_TRUSTED_TYPE: false,
+    ...overrides,
+    FORBID_TAGS: [...overrideForbiddenTags, 'script'],
+    FORBID_ATTR: [...overrideForbiddenAttributes, 'onerror', 'onload', 'onclick', 'onmouseover'],
+  })
+}
+
+function renderCompatMarkdown(value: unknown, sanitizerOverrides: DomPurifyConfig = {}): string {
+  const html = markdownConverter.makeHtml(replaceVariableMacros(value))
+  return sanitizeFormattedHtml(html, sanitizerOverrides)
+}
+
+const markdownProcessor: StMarkdownProcessor = {
+  makeHtml: renderCompatMarkdown,
+}
+
+export function reloadMarkdownProcessor(): StMarkdownProcessor {
+  recordCompatDiagnostic(
+    'reloadMarkdownProcessor',
+    'partial',
+    'Returned a safe Showdown-compatible markdown processor without the full SillyTavern message-formatting settings pipeline.',
+  )
+  return markdownProcessor
+}
+
+export function messageFormatting(
+  message: unknown,
+  _chName = '',
+  _isSystem = false,
+  _isUser = false,
+  messageId?: unknown,
+  sanitizerOverrides: DomPurifyConfig = {},
+  _isReasoning = false,
+): string {
+  if (message == null || message === '') return ''
+  const macroContext: MacroLikeContext = Number.isInteger(Number(messageId)) ? { message_id: Number(messageId) } : {}
+  const html = markdownConverter.makeHtml(replaceVariableMacros(message, macroContext))
+  const formatted = sanitizeFormattedHtml(html, sanitizerOverrides)
+  recordCompatDiagnostic(
+    'messageFormatting',
+    'partial',
+    'Formatted markdown with macro substitution and DOMPurify sanitization; ST regex, power-user, reasoning, and display-text hooks are not fully mirrored.',
+  )
+  return formatted
+}
+
 export function registerMacroLike(regex: RegExp, replace: MacroLikeReplacement): { unregister: () => void } {
   if (!(regex instanceof RegExp) || typeof replace !== 'function') {
     return { unregister: () => {} }
@@ -712,12 +892,14 @@ export function getContext(): Record<string, unknown> {
     chat_metadata,
     getCurrentChatId: () => contextState.activeChatId,
     getRequestHeaders,
-    reloadCurrentChat: async () => {},
-    renameChat: async () => {},
+    reloadCurrentChat: async () => recordCompatDiagnostic('reloadCurrentChat', 'stub', 'Current chat reload is not wired to the native chat loader yet.'),
+    renameChat: async () => recordCompatDiagnostic('renameChat', 'stub', 'Chat rename through the ST compatibility context is not implemented yet.'),
     saveSettingsDebounced,
     onlineStatus: 'no_connection',
     maxContext: 0,
     chatMetadata: chat_metadata,
+    saveChatConditional,
+    saveChatConditionalDebounced,
     saveMetadataDebounced,
     eventSource,
     eventTypes: event_types,
@@ -725,23 +907,30 @@ export function getContext(): Record<string, unknown> {
     extension_settings,
     extensionPrompts: extension_prompts,
     variables: {
-      global: getGlobalVariables(),
-      local: getLocalVariables(),
+      global: global_variable_facade,
+      local: chat_variable_facade,
       getGlobalVariable,
       setGlobalVariable,
       getLocalVariable,
       setLocalVariable,
     },
     world_info,
-    writeExtensionField: () => {},
+    world_info_settings,
+    writeExtensionField: () => recordCompatDiagnostic('writeExtensionField', 'stub', 'Extension field writes require a typed permissioned persistence bridge.'),
     setExtensionPrompt,
     getExtensionPromptByName,
-    saveChat: async () => {},
+    saveChat: saveChatConditional,
     saveMetadata,
-    sendSystemMessage: () => {},
-    activateSendButtons: () => {},
-    deactivateSendButtons: () => {},
-    saveReply: async () => {},
+    sendSystemMessage: () => recordCompatDiagnostic('sendSystemMessage', 'stub', 'System message injection must go through native chat service semantics.'),
+    activateSendButtons: () => recordCompatDiagnostic('activateSendButtons', 'stub', 'Native React send controls are not exposed through ST DOM helpers.'),
+    deactivateSendButtons: () => recordCompatDiagnostic('deactivateSendButtons', 'stub', 'Native React send controls are not exposed through ST DOM helpers.'),
+    saveReply: async () => recordCompatDiagnostic('saveReply', 'stub', 'Direct saveReply is not wired to CraftTalker chat persistence yet.'),
+    updateMessageBlock,
+    printMessages,
+    clearChat,
+    addOneMessage,
+    appendMediaToMessage,
+    addCopyToCodeBlocks,
     substituteParams: replaceVariableMacros,
     substituteParamsExtended: replaceVariableMacros,
     SlashCommandParser,
@@ -758,12 +947,13 @@ export function getContext(): Record<string, unknown> {
     registerMacroLike,
     unregisterMacroLike,
     replaceVariableMacros,
+    messageFormatting,
+    reloadMarkdownProcessor,
     STscript,
     renderExtensionTemplate,
     renderExtensionTemplateAsync,
     mainApi: 'crafttalker',
     ModuleWorkerWrapper: SimpleMutex,
-    messageFormatting: (message: string) => message,
     shouldSendOnEnter: () => true,
     isMobile: () => window.matchMedia('(max-width: 768px)').matches,
     t: (strings: TemplateStringsArray | string, ...values: unknown[]) => {
@@ -806,9 +996,138 @@ export function getRequestHeaders(): Record<string, string> {
   return { 'Content-Type': 'application/json' }
 }
 
+export async function updateWorldInfoList(): Promise<void> {
+  const settings = await api.worlds.getSettings()
+  world_names.splice(0, world_names.length, ...settings.world_names)
+  selected_world_info.splice(0, selected_world_info.length, ...settings.selected_world_info)
+  syncWorldInfoSettings(settings)
+  replaceWorldInfo({
+    ...settings.world_info,
+    globalSelect: selected_world_info,
+  })
+  syncCompatWorldSelects()
+  recordCompatDiagnostic('updateWorldInfoList', 'partial', 'Worldbook names and global selections were loaded from CraftTalker world services.')
+}
+
+export async function loadWorldInfo(name: string): Promise<WorldBook | null> {
+  const worldName = String(name ?? '').trim()
+  if (!worldName) return null
+  try {
+    const world = await api.worlds.get(worldName)
+    cacheWorldInfo(world)
+    syncCompatWorldSelects()
+    recordCompatDiagnostic('loadWorldInfo', 'partial', 'Worldbook entries were read through CraftTalker world services.')
+    return structuredClone(world)
+  } catch (error) {
+    recordCompatDiagnostic('loadWorldInfo', 'stub', `Worldbook "${worldName}" could not be read through CraftTalker world services.`)
+    console.warn('[ST Compat] Failed to load world info', worldName, error)
+    return null
+  }
+}
+
+export function updateMessageBlock(
+  messageId: unknown,
+  message: unknown = chat[Number(messageId)],
+  options: Record<string, unknown> = {},
+): void {
+  const index = Number(messageId)
+  if (!Number.isInteger(index) || index < 0 || !message || typeof message !== 'object') {
+    recordCompatDiagnostic('updateMessageBlock', 'stub', 'Ignored message block update because the message id or payload was invalid.')
+    return
+  }
+
+  const next = message as CompatChatMessage
+  if (chat[index] && chat[index] !== next) {
+    Object.assign(chat[index], next)
+  } else if (!chat[index]) {
+    chat[index] = next
+  }
+  normalizeMessageVariableShape(chat[index])
+  syncCompatDomState()
+  if (options.rerenderMessage !== false) {
+    renderCompatMessageBlock(index, chat[index])
+  }
+  void emitMessageRendered(index, chat[index])
+  recordCompatDiagnostic('updateMessageBlock', 'partial', 'Updated the ST compatibility chat mirror and emitted render events without writing native chat storage.')
+}
+
+export async function printMessages(): Promise<void> {
+  syncCompatDomState()
+  chat.forEach((message, index) => renderCompatMessageBlock(index, message))
+  recordCompatDiagnostic('printMessages', 'partial', 'Rebuilt the hidden ST compatibility chat mirror from the in-memory chat array.')
+}
+
+export async function clearChat(options: Record<string, unknown> = {}): Promise<void> {
+  if (options.clearData === true) {
+    chat.splice(0, chat.length)
+  }
+  clearCompatChatDom()
+  recordCompatDiagnostic('clearChat', options.clearData === true ? 'partial' : 'stub', 'Cleared the ST compatibility chat DOM mirror; native chat storage is unchanged.')
+}
+
+export function addOneMessage(message: unknown, options: Record<string, unknown> = {}): unknown {
+  if (!message || typeof message !== 'object') {
+    recordCompatDiagnostic('addOneMessage', 'stub', 'Ignored addOneMessage because the payload was not a chat message object.')
+    return message
+  }
+
+  const next = message as CompatChatMessage
+  let index = chat.indexOf(next)
+  if (index === -1) {
+    const forced = Number(options.forceId)
+    const insertBefore = Number(options.insertBefore)
+    const insertAfter = Number(options.insertAfter)
+    if (Number.isInteger(forced) && forced >= 0 && chat[forced] === next) {
+      index = forced
+    } else if (Number.isInteger(insertBefore) && insertBefore >= 0 && insertBefore <= chat.length) {
+      chat.splice(insertBefore, 0, next)
+      index = insertBefore
+    } else if (Number.isInteger(insertAfter) && insertAfter >= 0 && insertAfter < chat.length) {
+      chat.splice(insertAfter + 1, 0, next)
+      index = insertAfter + 1
+    } else if (Number.isInteger(forced) && forced >= 0 && forced <= chat.length) {
+      chat.splice(forced, 0, next)
+      index = forced
+    } else {
+      chat.push(next)
+      index = chat.length - 1
+    }
+  }
+
+  normalizeMessageVariableShape(next)
+  syncCompatDomState()
+  renderCompatMessageBlock(index, next)
+  recordCompatDiagnostic('addOneMessage', 'partial', 'Added or refreshed one message in the ST compatibility chat mirror without native chat persistence.')
+  return message
+}
+
+export function appendMediaToMessage(): void {
+  recordCompatDiagnostic('appendMediaToMessage', 'stub', 'Media attachment rendering is not wired to the ST compatibility chat mirror yet.')
+}
+
+export function addCopyToCodeBlocks(container?: unknown): void {
+  const root = getElementFromMaybeJQuery(container) ?? document
+  root.querySelectorAll?.('pre code').forEach((code) => {
+    const pre = code.closest('pre')
+    if (!pre || pre.querySelector('[data-st-compat-copy-code]')) return
+    const button = document.createElement('button')
+    button.type = 'button'
+    button.dataset.stCompatCopyCode = 'true'
+    button.className = 'code-copy interactable'
+    button.textContent = 'Copy'
+    button.addEventListener('click', () => {
+      void navigator.clipboard?.writeText(code.textContent ?? '')
+    })
+    pre.appendChild(button)
+  })
+  recordCompatDiagnostic('addCopyToCodeBlocks', 'partial', 'Attached simple copy buttons to code blocks in the provided ST-compatible container.')
+}
+
 export async function saveSettings(): Promise<ExtensionSettings> {
+  normalizeExtensionSettingsShape()
   const saved = await api.extensions.saveSettings(extension_settings)
   mergeInto(extension_settings, saved)
+  normalizeExtensionSettingsShape()
   await eventSource.emit(event_types.SETTINGS_UPDATED)
   return extension_settings
 }
@@ -823,9 +1142,51 @@ export function saveSettingsDebounced(): void {
   }, 500)
 }
 
-export async function saveMetadata(): Promise<void> {}
+export async function saveMetadata(): Promise<void> {
+  const characterName = contextState.activeCharacter?.file_name
+  const chatId = contextState.activeChatId
+  await persistChatMetadata(characterName, chatId, structuredClone(chat_metadata))
+}
 
-export function saveMetadataDebounced(): void {}
+export async function saveChatConditional(): Promise<void> {
+  await saveMetadata()
+  await persistMessageVariables()
+}
+
+export function saveChatConditionalDebounced(): void {
+  if (saveChatTimer !== null) {
+    window.clearTimeout(saveChatTimer)
+  }
+  recordCompatDiagnostic('saveChatConditionalDebounced', 'partial', 'Queued ST chat compatibility persistence through typed CraftTalker bridges.')
+  saveChatTimer = window.setTimeout(() => {
+    saveChatTimer = null
+    void saveChatConditional().catch(error => {
+      recordCompatDiagnostic('saveChatConditional', 'stub', 'ST chat compatibility persistence failed; see console for the native API error.')
+      console.error('[ST Compat] Failed to save ST chat compatibility data', error)
+    })
+  }, 500)
+}
+
+export function saveMetadataDebounced(): void {
+  const characterName = contextState.activeCharacter?.file_name
+  const chatId = contextState.activeChatId
+  if (!characterName || !chatId) {
+    recordCompatDiagnostic('saveMetadataDebounced', 'stub', 'Debounced chat metadata was kept in memory because no active character/chat is available.')
+    return
+  }
+  const metadataSnapshot = structuredClone(chat_metadata)
+  if (saveMetadataTimer !== null) {
+    window.clearTimeout(saveMetadataTimer)
+  }
+  recordCompatDiagnostic('saveMetadataDebounced', 'partial', 'Queued chat metadata persistence through CraftTalker chat storage.')
+  saveMetadataTimer = window.setTimeout(() => {
+    saveMetadataTimer = null
+    void persistChatMetadata(characterName, chatId, metadataSnapshot).catch(error => {
+      recordCompatDiagnostic('saveMetadata', 'stub', 'Chat metadata persistence failed; see console for the native API error.')
+      console.error('[ST Compat] Failed to save chat metadata', error)
+    })
+  }, 500)
+}
 
 export function setExtensionPrompt(
   name: string,
@@ -919,12 +1280,17 @@ async function initializeStExtensionHostOnce(): Promise<void> {
   try {
     const settings = await api.extensions.getSettings()
     mergeInto(extension_settings, settings)
+    normalizeExtensionSettingsShape()
   } catch (error) {
     console.warn('[ST Compat] Failed to load extension settings', error)
   }
 
   await eventSource.emit(event_types.EXTENSION_SETTINGS_LOADED, extension_settings)
   await eventSource.emit(event_types.SETTINGS_LOADED)
+  await updateWorldInfoList().catch(error => {
+    recordCompatDiagnostic('updateWorldInfoList', 'stub', 'Worldbook settings could not be loaded from CraftTalker world services.')
+    console.warn('[ST Compat] Failed to load world info settings', error)
+  })
 
   let discovered: ExtensionDiscovery[] = []
   try {
@@ -1056,12 +1422,13 @@ function createDefaultExtensionSettings(): ExtensionSettings {
     translate: {},
     objective: {},
     quickReply: {},
+    quickReplyV2: { config: { setList: [] } },
     randomizer: { controls: [], fluctuation: 0.1, enabled: false },
     speech_recognition: {},
     rvc: {},
     hypebot: {},
     vectors: {},
-    variables: { global: {} },
+    variables: { global: global_variables },
     attachments: [],
     character_attachments: {},
     disabled_attachments: [],
@@ -1074,15 +1441,76 @@ function rebuildCompatState(): void {
     ? contextState.characters.findIndex(character => character.file_name === contextState.activeCharacter?.file_name)
     : -1
 
-  characters.splice(0, characters.length, ...contextState.characters.map((character, index) => ({
-    ...character,
-    avatar: character.avatar ?? '',
-    chat: character.file_name === contextState.activeCharacter?.file_name ? contextState.activeChatId : null,
-    chid: index,
-  })))
+  characters.splice(0, characters.length, ...contextState.characters.map((character, index) => createCompatCharacter(character, index)))
 
-  chat.splice(0, chat.length, ...contextState.chatLines)
+  chat.splice(0, chat.length, ...createCompatChatMessages(contextState.chatLines))
+  normalizeCompatMessageVariables()
   syncChatMetadataFromLines()
+  normalizeExtensionSettingsShape()
+  normalizeChatMetadataShape()
+}
+
+function createCompatCharacter(character: Character, index: number): Record<string, unknown> {
+  const source = character as Character & Record<string, unknown>
+  const sourceData = asRecord(source.data)
+  const sourceExtensions = asRecord(source.extensions)
+  const dataExtensions = asRecord(sourceData.extensions)
+  const extensions = {
+    ...structuredClone(dataExtensions),
+    ...structuredClone(sourceExtensions),
+  }
+  const world = String(source.world ?? sourceData.world ?? extensions.world ?? '')
+  if (world && extensions.world == null) extensions.world = world
+
+  const data: Record<string, unknown> = {
+    ...structuredClone(sourceData),
+    name: String(source.name ?? sourceData.name ?? ''),
+    description: String(source.description ?? sourceData.description ?? ''),
+    personality: String(source.personality ?? sourceData.personality ?? ''),
+    scenario: String(source.scenario ?? sourceData.scenario ?? ''),
+    first_mes: String(source.first_mes ?? sourceData.first_mes ?? ''),
+    mes_example: String(source.mes_example ?? sourceData.mes_example ?? ''),
+    creator_notes: String(source.creator_notes ?? sourceData.creator_notes ?? ''),
+    system_prompt: String(source.system_prompt ?? sourceData.system_prompt ?? ''),
+    post_history_instructions: String(source.post_history_instructions ?? sourceData.post_history_instructions ?? ''),
+    alternate_greetings: getStringArray(source.alternate_greetings ?? sourceData.alternate_greetings),
+    character_version: String(source.character_version ?? sourceData.character_version ?? ''),
+    creator: String(source.creator ?? sourceData.creator ?? ''),
+    tags: getStringArray(source.tags ?? sourceData.tags),
+    extensions,
+  }
+
+  const compatCharacter: Record<string, unknown> = {
+    ...source,
+    name: data.name,
+    avatar: source.avatar ?? '',
+    chat: source.file_name === contextState.activeCharacter?.file_name ? contextState.activeChatId : null,
+    chid: index,
+    description: data.description,
+    personality: data.personality,
+    scenario: data.scenario,
+    first_mes: data.first_mes,
+    mes_example: data.mes_example,
+    creator_notes: data.creator_notes,
+    system_prompt: data.system_prompt,
+    post_history_instructions: data.post_history_instructions,
+    alternate_greetings: data.alternate_greetings,
+    character_version: data.character_version,
+    creator: data.creator,
+    tags: data.tags,
+    extensions,
+    data,
+  }
+
+  if (typeof compatCharacter.json_data !== 'string') {
+    compatCharacter.json_data = JSON.stringify({
+      spec: source.spec ?? 'chara_card_v2',
+      spec_version: source.spec_version ?? '2.0',
+      data,
+    })
+  }
+
+  return compatCharacter
 }
 
 function mergeInto(target: Record<string, unknown>, source: Record<string, unknown>): void {
@@ -1093,17 +1521,32 @@ function mergeInto(target: Record<string, unknown>, source: Record<string, unkno
 
 function isExtensionDisabled(name: string): boolean {
   const disabled = extension_settings.disabledExtensions
-  return Array.isArray(disabled) && disabled.includes(name)
+  if (!Array.isArray(disabled)) return false
+  const shortName = name.includes('/') ? name.split('/').pop() : name
+  return disabled.includes(name)
+    || (shortName ? disabled.includes(shortName) : false)
+    || (!name.includes('/') && disabled.includes(`third-party/${name}`))
 }
 
 function hasRequiredExtensionDependencies(manifest: ExtensionManifest): boolean {
-  const dependencies = Array.isArray(manifest.dependencies) ? manifest.dependencies : manifest.requires
-  if (!Array.isArray(dependencies)) return true
+  const dependencies = getManifestDependencies(manifest)
   return dependencies.every(dependency =>
-    typeof dependency === 'string'
-    && hasLoadedManifest(dependency)
+    hasLoadedManifest(dependency)
     && !isExtensionDisabled(dependency),
   )
+}
+
+function getManifestDependencies(manifest: ExtensionManifest): string[] {
+  return [...new Set([
+    ...getStringArray(manifest.requires),
+    ...getStringArray(manifest.dependencies),
+  ])]
+}
+
+function getStringArray(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((entry): entry is string => typeof entry === 'string' && entry.trim() !== '')
+    : []
 }
 
 function hasLoadedManifest(name: string): boolean {
@@ -1175,13 +1618,120 @@ function getSlashCommandText(input: unknown, options: Record<string, unknown>): 
   return typeof optionText === 'string' ? optionText : String(input ?? '')
 }
 
+async function executeSingleSlashCommand(text: string, options: Record<string, unknown>, incomingPipe: unknown): Promise<unknown> {
+  const match = /^\/?([^\s]+)\s*(.*)$/.exec(text.trim())
+  if (!match) return incomingPipe
+
+  const command = SlashCommandParser.commands[match[1] ?? '']
+  if (!command?.callback) {
+    recordCompatDiagnostic('executeSlashCommands', 'stub', `Slash command "${match[1] ?? ''}" is not registered in the compatibility parser.`)
+    return text
+  }
+
+  const argumentText = match[2] ?? ''
+  const unnamed = getSlashUnnamedArgs(argumentText)
+  const pipe = await command.callback(
+    parseSlashNamedArgs(argumentText),
+    unnamed || stringifySlashPipe(incomingPipe),
+  )
+  return unwrapSlashPipe(pipe, options)
+}
+
+function splitSlashPipeline(text: string): string[] {
+  const result: string[] = []
+  let current = ''
+  let quote: '"' | "'" | null = null
+  let escaped = false
+  for (const char of text) {
+    if (escaped) {
+      current += char
+      escaped = false
+      continue
+    }
+    if (char === '\\') {
+      current += char
+      escaped = true
+      continue
+    }
+    if ((char === '"' || char === "'") && !escaped) {
+      quote = quote === char ? null : quote ?? char
+      current += char
+      continue
+    }
+    if (char === '|' && !quote) {
+      if (current.trim()) result.push(current.trim())
+      current = ''
+      continue
+    }
+    current += char
+  }
+  if (current.trim()) result.push(current.trim())
+  return result
+}
+
+function stringifySlashPipe(value: unknown): string {
+  if (value == null) return ''
+  return typeof value === 'string' ? value : JSON.stringify(value)
+}
+
+function createVariableScopeFacade(option: Record<string, unknown>): VariableScopeFacade {
+  const methods: Pick<VariableScopeFacade, 'get' | 'set' | 'delete' | 'replace' | 'assign' | 'all'> = {
+    get: path => getVariableValue(option, path),
+    set: (path, value) => {
+      setVariableValue(option, path, value)
+      scheduleVariableSave(option)
+      return value
+    },
+    delete: (path) => {
+      deleteVariableValue(option, path)
+      scheduleVariableSave(option)
+    },
+    replace: (variables) => replaceVariables(variables, option),
+    assign: (variables) => insertVariables(variables, option),
+    all: () => getVariables(option),
+  }
+
+  return new Proxy({} as VariableScopeFacade, {
+    get: (_target, property) => {
+      if (property in methods) return methods[property as keyof typeof methods]
+      if (property === 'toJSON') return () => structuredClone(getVariableStore(option))
+      if (typeof property === 'symbol') return undefined
+      return getVariableStore(option)[property]
+    },
+    set: (_target, property, value) => {
+      if (typeof property === 'symbol') return false
+      getVariableStore(option)[property] = value
+      scheduleVariableSave(option)
+      return true
+    },
+    deleteProperty: (_target, property) => {
+      if (typeof property === 'symbol') return false
+      delete getVariableStore(option)[property]
+      scheduleVariableSave(option)
+      return true
+    },
+    ownKeys: () => Reflect.ownKeys(getVariableStore(option)),
+    getOwnPropertyDescriptor: (_target, property) => {
+      const store = getVariableStore(option)
+      if (typeof property === 'symbol' || !Object.hasOwn(store, property)) return undefined
+      return {
+        configurable: true,
+        enumerable: true,
+        value: store[property],
+        writable: true,
+      }
+    },
+  })
+}
+
 function getGlobalVariables(): VariableScope {
-  const variables = ensureRecord(extension_settings, 'variables')
-  return ensureRecord(variables, 'global')
+  normalizeExtensionSettingsShape()
+  return global_variables
 }
 
 function getLocalVariables(): VariableScope {
-  return ensureRecord(chat_metadata, 'variables')
+  normalizeChatMetadataShape()
+  return chat_variables
 }
 
 function ensureRecord(target: Record<string, unknown>, key: string): VariableScope {
@@ -1198,11 +1748,310 @@ function syncChatMetadataFromLines(): void {
   const header = contextState.chatLines.find(line => line.chat_metadata && typeof line.chat_metadata === 'object')
   const next = header?.chat_metadata
   if (!next || typeof next !== 'object') {
+    replaceChatMetadata({ variables: {}, extensions: {} })
     return
   }
+  replaceChatMetadata(next)
+}
+
+function createCompatChatMessages(lines: ChatLine[]): CompatChatMessage[] {
+  return lines
+    .map((line, index) => ({ line, index }))
+    .filter(({ line }) => 'mes' in line)
+    .map(({ line, index }) => {
+      const message = cloneCompatValue(line) as CompatChatMessage
+      Object.defineProperties(message, {
+        _lineIndex: {
+          configurable: true,
+          enumerable: false,
+          value: index,
+          writable: true,
+        },
+        _hadVariables: {
+          configurable: true,
+          enumerable: false,
+          value: Object.hasOwn(line, 'variables'),
+          writable: true,
+        },
+        _hadVariablesInitialized: {
+          configurable: true,
+          enumerable: false,
+          value: Object.hasOwn(line, 'variables_initialized'),
+          writable: true,
+        },
+      })
+      return message
+    })
+}
+
+function hasPersistableMessageVariables(line: CompatChatMessage): boolean {
+  if (line._hadVariables || line._hadVariablesInitialized) return true
+  if (Array.isArray(line.variables) && line.variables.some(entry => (
+    entry !== null
+    && typeof entry === 'object'
+    && !Array.isArray(entry)
+    && Object.keys(entry).length > 0
+  ))) {
+    return true
+  }
+  return Array.isArray(line.variables_initialized) && line.variables_initialized.some(Boolean)
+}
+
+function replaceChatMetadata(next: Record<string, unknown>): void {
+  const nextVariables = getRecordValue(next.variables)
+  const nextExtensions = getRecordValue(next.extensions)
+  for (const key of Object.keys(chat_metadata)) {
+    delete chat_metadata[key]
+  }
   Object.assign(chat_metadata, next)
-  ensureRecord(chat_metadata, 'variables')
-  ensureRecord(chat_metadata, 'extensions')
+  replaceRecordContents(chat_variables, nextVariables)
+  replaceRecordContents(chat_extensions, nextExtensions)
+  chat_metadata.variables = chat_variables
+  chat_metadata.extensions = chat_extensions
+}
+
+function normalizeExtensionSettingsShape(): void {
+  const variables = ensureRecord(extension_settings, 'variables')
+  if (variables.global !== global_variables) {
+    replaceRecordContents(global_variables, getRecordValue(variables.global))
+    variables.global = global_variables
+  }
+  if (!Array.isArray(extension_settings.regex)) {
+    extension_settings.regex = []
+  }
+  if (!Array.isArray(extension_settings.regex_presets)) {
+    extension_settings.regex_presets = []
+  }
+  const quickReplyV2 = ensureRecord(extension_settings, 'quickReplyV2')
+  const quickReplyConfig = ensureRecord(quickReplyV2, 'config')
+  if (!Array.isArray(quickReplyConfig.setList)) {
+    quickReplyConfig.setList = []
+  }
+}
+
+function normalizeChatMetadataShape(): void {
+  if (chat_metadata.variables !== chat_variables) {
+    replaceRecordContents(chat_variables, getRecordValue(chat_metadata.variables))
+    chat_metadata.variables = chat_variables
+  }
+  if (chat_metadata.extensions !== chat_extensions) {
+    replaceRecordContents(chat_extensions, getRecordValue(chat_metadata.extensions))
+    chat_metadata.extensions = chat_extensions
+  }
+}
+
+function normalizeCompatMessageVariables(): void {
+  for (const line of chat) {
+    normalizeMessageVariableShape(line)
+  }
+}
+
+function normalizeMessageVariableShape(line: CompatChatMessage): void {
+  const swipeCount = getMessageSwipeCount(line)
+  const activeSwipeId = getMessageSwipeId(line, swipeCount)
+  line.swipe_id = activeSwipeId
+  line.variables = normalizeSwipeRecordArray(line.variables, swipeCount, activeSwipeId)
+  line.variables_initialized = normalizeSwipeInitializedArray(line.variables_initialized, swipeCount)
+}
+
+function getMessageSwipeCount(line: ChatLine): number {
+  return Math.max(1, Array.isArray(line.swipes) && line.swipes.length > 0 ? line.swipes.length : 1)
+}
+
+function getMessageSwipeId(line: ChatLine, swipeCount = getMessageSwipeCount(line)): number {
+  const numeric = Number(line.swipe_id)
+  if (!Number.isInteger(numeric)) return 0
+  return Math.min(Math.max(numeric, 0), Math.max(0, swipeCount - 1))
+}
+
+function normalizeSwipeRecordArray(value: unknown, swipeCount: number, activeSwipeId: number): VariableScope[] {
+  const source = Array.isArray(value)
+    ? value
+    : value && typeof value === 'object'
+      ? Object.assign([], value)
+      : []
+  const result: VariableScope[] = []
+  for (let index = 0; index < swipeCount; index += 1) {
+    const entry = source[index]
+    result[index] = entry && typeof entry === 'object' && !Array.isArray(entry)
+      ? entry as VariableScope
+      : {}
+  }
+  if (!result[activeSwipeId]) result[activeSwipeId] = {}
+  return result
+}
+
+function normalizeSwipeInitializedArray(value: unknown, swipeCount: number): boolean[] {
+  const source = Array.isArray(value)
+    ? value
+    : value && typeof value === 'object'
+      ? Object.assign([], value)
+      : []
+  const result: boolean[] = []
+  for (let index = 0; index < swipeCount; index += 1) {
+    result[index] = Boolean(source[index])
+  }
+  return result
+}
+
+function getRecordValue(value: unknown): VariableScope {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as VariableScope : {}
+}
+
+function replaceRecordContents(target: VariableScope, source: VariableScope): void {
+  if (target === source) return
+  for (const key of Object.keys(target)) {
+    delete target[key]
+  }
+  Object.assign(target, cloneCompatRecord(source))
+}
+
+function cloneCompatRecord(source: VariableScope): VariableScope {
+  try {
+    return structuredClone(source)
+  } catch {
+    return cloneCompatValue(source) as VariableScope
+  }
+}
+
+function cloneCompatValue(value: unknown, seen = new WeakMap<object, unknown>()): unknown {
+  if (!value || typeof value !== 'object') return value
+  if (seen.has(value)) return seen.get(value)
+  if (Array.isArray(value)) {
+    const next: unknown[] = []
+    seen.set(value, next)
+    next.push(...value.map(entry => cloneCompatValue(entry, seen)))
+    return next
+  }
+  const next: Record<string, unknown> = {}
+  seen.set(value, next)
+  for (const [key, entry] of Object.entries(value)) {
+    next[key] = cloneCompatValue(entry, seen)
+  }
+  return next
+}
+
+function createDefaultWorldInfoSettings(): StWorldInfoRuntimeSettings {
+  return {
+    world_info_include_names: true,
+    world_info_case_sensitive: false,
+    world_info_match_whole_words: false,
+    world_info_use_group_scoring: false,
+    world_info_max_recursion_steps: 10,
+    world_info_depth: 4,
+    world_info_min_activations: 0,
+    world_info_min_activations_depth_max: 0,
+    world_info_budget: 25,
+    world_info_budget_cap: 0,
+    world_info_recursive: false,
+    world_info_overflow_alert: false,
+    world_info_character_strategy: 0,
+  }
+}
+
+function syncWorldInfoSettings(settings: StWorldInfoSettings): void {
+  const defaults = createDefaultWorldInfoSettings()
+  world_info_settings.world_info_include_names = booleanSetting(settings.world_info_include_names, defaults.world_info_include_names)
+  world_info_settings.world_info_case_sensitive = booleanSetting(settings.world_info_case_sensitive, defaults.world_info_case_sensitive)
+  world_info_settings.world_info_match_whole_words = booleanSetting(settings.world_info_match_whole_words, defaults.world_info_match_whole_words)
+  world_info_settings.world_info_use_group_scoring = booleanSetting(settings.world_info_use_group_scoring, defaults.world_info_use_group_scoring)
+  world_info_settings.world_info_max_recursion_steps = numberSetting(settings.world_info_max_recursion_steps, defaults.world_info_max_recursion_steps)
+  world_info_settings.world_info_depth = numberSetting(settings.world_info_depth, defaults.world_info_depth)
+  world_info_settings.world_info_min_activations = numberSetting(settings.world_info_min_activations, defaults.world_info_min_activations)
+  world_info_settings.world_info_min_activations_depth_max = numberSetting(settings.world_info_min_activations_depth_max, defaults.world_info_min_activations_depth_max)
+  world_info_settings.world_info_budget = numberSetting(settings.world_info_budget, defaults.world_info_budget)
+  world_info_settings.world_info_budget_cap = numberSetting(settings.world_info_budget_cap, defaults.world_info_budget_cap)
+  world_info_settings.world_info_recursive = booleanSetting(settings.world_info_recursive, defaults.world_info_recursive)
+  world_info_settings.world_info_overflow_alert = booleanSetting(settings.world_info_overflow_alert, defaults.world_info_overflow_alert)
+  world_info_settings.world_info_character_strategy = numberSetting(settings.world_info_character_strategy, defaults.world_info_character_strategy)
+}
+
+function booleanSetting(value: unknown, fallback: boolean): boolean {
+  return typeof value === 'boolean' ? value : fallback
+}
+
+function numberSetting(value: unknown, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : fallback
+}
+
+function replaceWorldInfo(next: Record<string, unknown>): void {
+  for (const key of Object.keys(world_info)) {
+    delete world_info[key]
+  }
+  Object.assign(world_info, next)
+  world_info.globalSelect = selected_world_info
+  if (!Array.isArray(world_info.charLore)) world_info.charLore = []
+  if (!world_info.entries || typeof world_info.entries !== 'object' || Array.isArray(world_info.entries)) {
+    world_info.entries = {}
+  }
+}
+
+function cacheWorldInfo(world: WorldBook): void {
+  const entries = ensureRecord(world_info, 'entries')
+  entries[world.name] = structuredClone(world.entries)
+  if (!world_names.includes(world.name)) world_names.push(world.name)
+}
+
+async function persistChatMetadata(
+  characterName: string | undefined,
+  chatId: string | null | undefined,
+  metadata: Record<string, unknown>,
+): Promise<void> {
+  if (!characterName || !chatId) {
+    recordCompatDiagnostic('saveMetadata', 'stub', 'Chat metadata was kept in memory because no active character/chat is available.')
+    return
+  }
+  const saved = await api.chats.updateMetadata(characterName, chatId, metadata)
+  if (isCurrentChat(characterName, chatId)) {
+    replaceChatMetadata(saved.chat_metadata)
+  }
+  recordCompatDiagnostic('saveMetadata', 'partial', 'Chat metadata was written through CraftTalker chat persistence.')
+}
+
+async function persistMessageVariables(): Promise<void> {
+  const characterName = contextState.activeCharacter?.file_name
+  const chatId = contextState.activeChatId
+  if (!characterName || !chatId) {
+    recordCompatDiagnostic('saveChatConditional', 'stub', 'Message variables were kept in memory because no active character/chat is available.')
+    return
+  }
+
+  const updates = chat.flatMap((line) => {
+    if (typeof line._lineIndex !== 'number') return []
+    normalizeMessageVariableShape(line)
+    if (!hasPersistableMessageVariables(line)) return []
+    return [{
+      lineIndex: line._lineIndex,
+      variables: cloneCompatValue(line.variables),
+      variables_initialized: cloneCompatValue(line.variables_initialized),
+    }]
+  })
+
+  if (!updates.length) {
+    recordCompatDiagnostic('saveChatConditional', 'stub', 'No active ST message variables were available to persist.')
+    return
+  }
+
+  const result = await api.chats.updateMessageVariables(characterName, chatId, updates)
+  recordCompatDiagnostic(
+    'saveChatConditional',
+    result.updated > 0 ? 'partial' : 'stub',
+    'Persisted ST message variable arrays through the typed CraftTalker message-variable bridge.',
+  )
+}
+
+function isCurrentChat(characterName: string, chatId: string): boolean {
+  return contextState.activeCharacter?.file_name === characterName && contextState.activeChatId === chatId
+}
+
+function getRequestedWorldName(value?: unknown): string {
+  if (typeof value === 'string' && value.trim()) return value.trim()
+  const active = contextState.activeCharacter as (Character & { extensions?: Record<string, unknown> }) | null
+  const world = active?.world ?? active?.extensions?.world
+  if (typeof world === 'string' && world.trim()) return world.trim()
+  const chatWorld = chat_metadata.world_info
+  if (typeof chatWorld === 'string' && chatWorld.trim()) return chatWorld.trim()
+  return selected_world_info.find(name => typeof name === 'string' && name.trim()) ?? ''
 }
 
 function parseSlashNamedArgs(text: string): Record<string, unknown> {
@@ -1232,6 +2081,16 @@ function wrapSlashResult(value: unknown, options: Record<string, unknown>, isErr
 
 function isSlashResult(value: unknown): value is { pipe: unknown, isError?: boolean } {
   return Boolean(value && typeof value === 'object' && 'pipe' in value)
+}
+
+function unwrapSlashPipe(value: unknown, options: Record<string, unknown>): unknown {
+  if (isSlashResult(value)) {
+    if (value.isError && options.handleErrors === false) {
+      throw new Error(String((value as { errorMessage?: unknown }).errorMessage ?? value.pipe ?? 'Slash command failed'))
+    }
+    return value.pipe
+  }
+  return value
 }
 
 function getVariableStore(option: Record<string, unknown> = { type: 'chat' }): VariableScope {
@@ -1286,21 +2145,13 @@ function getMessageVariables(messageId: unknown): VariableScope {
   const line = index >= 0 ? chat[index] : undefined
   if (!line) return {}
 
-  const record = line as ChatLine & { variables?: unknown }
-  if (!record.variables || typeof record.variables !== 'object') {
-    record.variables = {}
+  normalizeMessageVariableShape(line)
+  const record = line.variables
+  if (Array.isArray(record)) {
+    const swipeId = getMessageSwipeId(line)
+    return record[swipeId] as VariableScope
   }
-  if (Array.isArray(record.variables)) {
-    const swipeId = Number.isInteger(record.swipe_id) ? Number(record.swipe_id) : 0
-    const value = record.variables[swipeId]
-    if (value && typeof value === 'object' && !Array.isArray(value)) {
-      return value as VariableScope
-    }
-    const next: VariableScope = {}
-    record.variables[swipeId] = next
-    return next
-  }
-  return record.variables as VariableScope
+  return {}
 }
 
 function resolveMessageIndex(messageId: unknown): number {
@@ -1344,7 +2195,8 @@ function parseVariablePath(path: unknown): Array<string | number> {
 function scheduleVariableSave(option: Record<string, unknown>): void {
   const scope = normalizeVariableScope(option.type)
   if (scope === 'global' || scope === 'extension') saveSettingsDebounced()
-  if (scope === 'chat' || scope === 'message') saveMetadataDebounced()
+  if (scope === 'chat') saveMetadataDebounced()
+  if (scope === 'message') saveChatConditionalDebounced()
 }
 
 function stringifyMacroValue(value: unknown): string {
@@ -1403,6 +2255,25 @@ function isPromiseLike<T>(value: T | Promise<T>): value is Promise<T> {
   return Boolean(value && typeof (value as { then?: unknown }).then === 'function')
 }
 
+function recordCompatDiagnostic(id: string, status: CompatDiagnosticStatus, note: string): void {
+  const current = diagnostics.get(id)
+  diagnostics.set(id, {
+    id,
+    status,
+    note,
+    count: (current?.count ?? 0) + 1,
+    lastCalledAt: new Date().toISOString(),
+  })
+}
+
+export function getDiagnostics(): CompatDiagnosticEntry[] {
+  return structuredClone([...diagnostics.values()].sort((a, b) => a.id.localeCompare(b.id)))
+}
+
+export function resetDiagnostics(): void {
+  diagnostics.clear()
+}
+
 function createBuiltinFacade(): Record<string, unknown> {
   return {
     getContext,
@@ -1425,7 +2296,427 @@ function createBuiltinFacade(): Record<string, unknown> {
     deleteVariable,
     saveSettingsDebounced,
     saveMetadataDebounced,
+    saveChatConditional,
+    saveChatConditionalDebounced,
+    messageFormatting,
+    reloadMarkdownProcessor,
+    updateMessageBlock,
+    printMessages,
+    clearChat,
+    addOneMessage,
+    appendMediaToMessage,
+    addCopyToCodeBlocks,
   }
+}
+
+async function runTavernHelperGeneration(
+  diagnosticId: 'TavernHelper.generate' | 'TavernHelper.generateRaw',
+  input: unknown,
+  usePreset: boolean,
+): Promise<string> {
+  const config = normalizeTavernHelperGenerationConfig(input)
+  const request = buildTavernHelperGenerationRequest(config, usePreset)
+  if (!request) {
+    recordCompatDiagnostic(diagnosticId, 'stub', 'Background generation needs custom_api or ST oai_settings with an endpoint/key/model before it can call the governed backend bridge.')
+    return ''
+  }
+
+  if (tavernHelperGenerations.has(request.generationId)) {
+    recordCompatDiagnostic(diagnosticId, 'blocked', `Background generation "${request.generationId}" is already running.`)
+    throw new Error(`TavernHelper generation "${request.generationId}" is already running.`)
+  }
+
+  const controller = new AbortController()
+  tavernHelperGenerations.set(request.generationId, { controller })
+
+  try {
+    await eventSource.emit(event_types.GENERATION_STARTED, request.generationId)
+    await eventSource.emit(event_types.JS_GENERATION_STARTED, request.generationId)
+    await eventSource.emit(event_types.CHAT_COMPLETION_SETTINGS_READY, structuredClone(request.payload))
+
+    const response = await fetch('/api/backends/chat-completions/generate', {
+      method: 'POST',
+      headers: getRequestHeaders(),
+      cache: 'no-cache',
+      body: JSON.stringify(request.payload),
+      signal: controller.signal,
+    })
+
+    if (!response.ok) {
+      throw new Error(await response.text() || `Backend generation failed with HTTP ${response.status}`)
+    }
+
+    const text = request.stream
+      ? await readTavernHelperStream(response, request.generationId)
+      : extractCompletionText(await response.json())
+    const beforeEndPayload = { message: text }
+
+    await eventSource.emit(event_types.GENERATION_BEFORE_END, beforeEndPayload, request.generationId)
+    const finalText = String(beforeEndPayload.message ?? '')
+    await eventSource.emit(event_types.JS_GENERATION_ENDED, finalText, request.generationId)
+    await eventSource.emit(event_types.GENERATION_ENDED, finalText, request.generationId)
+    recordCompatDiagnostic(diagnosticId, 'partial', 'Background generation used CraftTalker ST backend bridge without writing chat rows, runs, or plugin state.')
+    return finalText
+  } catch (error) {
+    if (isAbortError(error)) {
+      recordCompatDiagnostic(diagnosticId, 'partial', `Background generation "${request.generationId}" was stopped through the governed cancellation bridge.`)
+      return ''
+    }
+    recordCompatDiagnostic(diagnosticId, 'stub', 'Background generation failed through the CraftTalker ST backend bridge; see console for the provider error.')
+    console.warn('[ST Compat] TavernHelper background generation failed', error)
+    return ''
+  } finally {
+    tavernHelperGenerations.delete(request.generationId)
+  }
+}
+
+function stopTavernHelperGenerationById(generationId: unknown): boolean {
+  const id = String(generationId ?? '').trim()
+  const entry = tavernHelperGenerations.get(id)
+  if (!id || !entry) {
+    recordCompatDiagnostic('TavernHelper.stopGenerationById', 'stub', 'No matching TavernHelper background generation was active.')
+    return false
+  }
+
+  entry.controller.abort()
+  tavernHelperGenerations.delete(id)
+  void eventSource.emit(event_types.GENERATION_STOPPED, id)
+  recordCompatDiagnostic('TavernHelper.stopGenerationById', 'partial', 'Stopped one TavernHelper background generation through AbortController.')
+  return true
+}
+
+function stopAllTavernHelperGenerations(): boolean {
+  const entries = [...tavernHelperGenerations.entries()]
+  if (!entries.length) {
+    recordCompatDiagnostic('TavernHelper.stopAllGeneration', 'stub', 'No TavernHelper background generations were active.')
+    return false
+  }
+
+  for (const [id, entry] of entries) {
+    entry.controller.abort()
+    void eventSource.emit(event_types.GENERATION_STOPPED, id)
+  }
+  tavernHelperGenerations.clear()
+  recordCompatDiagnostic('TavernHelper.stopAllGeneration', 'partial', 'Stopped all TavernHelper background generations through AbortController.')
+  return true
+}
+
+function normalizeTavernHelperGenerationConfig(input: unknown): TavernHelperGenerationConfig {
+  if (typeof input === 'string') return { user_input: input }
+  if (isPlainRecord(input)) return input as TavernHelperGenerationConfig
+  return {}
+}
+
+function buildTavernHelperGenerationRequest(
+  config: TavernHelperGenerationConfig,
+  usePreset: boolean,
+): TavernHelperGenerationRequest | null {
+  const customApi = asRecord(config.custom_api)
+  const settings = getStOaiSettings()
+  if (!hasTavernHelperBackendConfig(customApi, settings)) return null
+
+  const source = stringField(customApi, 'source')
+    || stringField(settings, 'chat_completion_source')
+    || 'openai'
+  const apiUrl = normalizeBaseUrl(stringField(customApi, 'apiurl')
+    || stringField(settings, 'reverse_proxy')
+    || stringField(settings, 'custom_url'))
+  const apiKey = stringField(customApi, 'key') || stringField(settings, 'proxy_password')
+  const model = stringField(customApi, 'model')
+    || stringField(settings, 'model')
+    || stringField(settings, 'openai_model')
+  const stream = Boolean(config.should_stream)
+  const payload: Record<string, unknown> = {
+    chat_completion_source: source,
+    messages: createTavernHelperMessages(config, usePreset),
+    stream,
+  }
+
+  setPayloadString(payload, 'model', model)
+  setPayloadString(payload, 'reverse_proxy', apiUrl)
+  setPayloadString(payload, 'proxy_password', apiKey)
+  if (source === 'custom') setPayloadString(payload, 'custom_url', apiUrl)
+  setPayloadString(payload, 'apiKeySessionId', stringField(customApi, 'apiKeySessionId') || stringField(settings, 'apiKeySessionId'))
+  setPayloadString(payload, 'custom_include_headers', stringField(customApi, 'custom_include_headers') || stringField(settings, 'custom_include_headers'))
+  setPayloadString(payload, 'custom_include_body', stringField(customApi, 'custom_include_body') || stringField(settings, 'custom_include_body'))
+  setPayloadString(payload, 'custom_exclude_body', stringField(customApi, 'custom_exclude_body') || stringField(settings, 'custom_exclude_body'))
+  setPayloadString(payload, 'azure_base_url', stringField(customApi, 'azure_base_url') || stringField(settings, 'azure_base_url'))
+  setPayloadString(payload, 'azure_deployment_name', stringField(customApi, 'azure_deployment_name') || stringField(settings, 'azure_deployment_name'))
+  setPayloadString(payload, 'azure_api_version', stringField(customApi, 'azure_api_version') || stringField(settings, 'azure_api_version'))
+  setPayloadNumber(payload, 'max_tokens', customApi.max_tokens, settings.openai_max_tokens)
+  setPayloadNumber(payload, 'temperature', customApi.temperature, settings.temp_openai)
+  setPayloadNumber(payload, 'top_p', customApi.top_p, settings.top_p_openai)
+  setPayloadNumber(payload, 'top_k', customApi.top_k, settings.top_k_openai)
+  setPayloadNumber(payload, 'frequency_penalty', customApi.frequency_penalty, settings.freq_pen_openai)
+  setPayloadNumber(payload, 'presence_penalty', customApi.presence_penalty, settings.pres_pen_openai)
+  setPayloadNumber(payload, 'repetition_penalty', customApi.repetition_penalty, settings.repetition_penalty_openai)
+
+  if (Array.isArray(config.tools) && config.tools.length > 0) payload.tools = structuredClone(config.tools)
+  if (config.tool_choice !== undefined) payload.tool_choice = structuredClone(config.tool_choice)
+  if (config.json_schema !== undefined) payload.json_schema = structuredClone(config.json_schema)
+
+  return {
+    generationId: stringField(config, 'generation_id') || createTavernHelperGenerationId(),
+    payload: removeUndefinedFields(payload),
+    stream,
+  }
+}
+
+function hasTavernHelperBackendConfig(customApi: Record<string, unknown>, settings: Record<string, unknown>): boolean {
+  return Boolean(
+    stringField(customApi, 'apiurl')
+    || stringField(customApi, 'key')
+    || stringField(settings, 'reverse_proxy')
+    || stringField(settings, 'custom_url')
+    || stringField(settings, 'proxy_password')
+    || stringField(settings, 'apiKeySessionId')
+    || stringField(settings, 'azure_base_url')
+    || stringField(settings, 'azure_deployment_name'),
+  )
+}
+
+function createTavernHelperMessages(config: TavernHelperGenerationConfig, usePreset: boolean): StGenerationMessage[] {
+  const explicit = normalizeGenerationMessages(config.messages ?? config.prompt)
+  if (explicit.length) return explicit
+
+  const ordered = Array.isArray(config.ordered_prompts) ? config.ordered_prompts : []
+  if (ordered.length) {
+    const messages = ordered.flatMap(prompt => messagesFromOrderedPrompt(prompt, config))
+    return messages.length ? messages : [{ role: 'user', content: getGenerationUserInput(config) }]
+  }
+
+  const messages: StGenerationMessage[] = []
+  if (usePreset) {
+    const description = getPromptPlaceholderText('char_description', config)
+    if (description) messages.push({ role: 'system', content: description })
+  }
+  messages.push(...messagesFromInjects(config.injects))
+  messages.push(...chatHistoryMessages(config.max_chat_history))
+  messages.push({ role: 'user', content: getGenerationUserInput(config) })
+  return messages.filter(message => message.content.trim() !== '')
+}
+
+function messagesFromOrderedPrompt(prompt: unknown, config: TavernHelperGenerationConfig): StGenerationMessage[] {
+  if (isPlainRecord(prompt)) {
+    const content = stringField(prompt, 'content')
+    if (!content) return []
+    return [{ role: normalizeGenerationRole(prompt.role), content: replaceVariableMacros(content) }]
+  }
+  const placeholder = String(prompt ?? '').trim()
+  if (!placeholder) return []
+  if (placeholder === 'chat_history') return chatHistoryMessages(config.max_chat_history)
+  if (placeholder === 'user_input') return [{ role: 'user', content: getGenerationUserInput(config) }]
+  const content = getPromptPlaceholderText(placeholder, config)
+  return content ? [{ role: 'system', content }] : []
+}
+
+function messagesFromInjects(injects: unknown): StGenerationMessage[] {
+  if (!Array.isArray(injects)) return []
+  return injects.flatMap((inject) => {
+    if (!isPlainRecord(inject)) return []
+    const content = stringField(inject, 'content')
+    if (!content) return []
+    return [{ role: normalizeGenerationRole(inject.role), content: replaceVariableMacros(content) }]
+  })
+}
+
+function normalizeGenerationMessages(value: unknown): StGenerationMessage[] {
+  if (!Array.isArray(value)) return []
+  return value.flatMap((entry) => {
+    if (!isPlainRecord(entry)) return []
+    const content = generationContentToText(entry.content)
+    if (!content.trim()) return []
+    return [{ role: normalizeGenerationRole(entry.role), content }]
+  })
+}
+
+function chatHistoryMessages(maxChatHistory: unknown): StGenerationMessage[] {
+  const limit = getChatHistoryLimit(maxChatHistory)
+  if (limit === 0) return []
+  const source = limit === Infinity ? chat : chat.slice(Math.max(0, chat.length - limit))
+  return source
+    .filter(line => typeof line.mes === 'string' && line.mes.trim() !== '')
+    .map(line => ({
+      role: line.is_system ? 'system' : line.is_user ? 'user' : 'assistant',
+      content: line.mes ?? '',
+    }))
+}
+
+function getChatHistoryLimit(maxChatHistory: unknown): number {
+  if (maxChatHistory === 'all') return Infinity
+  const numeric = Number(maxChatHistory)
+  if (Number.isFinite(numeric)) return Math.max(0, Math.floor(numeric))
+  return 20
+}
+
+function getPromptPlaceholderText(placeholder: string, config: TavernHelperGenerationConfig): string {
+  const overrides = asRecord(config.overrides)
+  const character = contextState.activeCharacter as (Character & Record<string, unknown>) | null
+  const value = stringField(overrides, placeholder)
+  if (value) return replaceVariableMacros(value)
+
+  switch (placeholder) {
+    case 'char_description':
+      return replaceVariableMacros(character?.description ?? '')
+    case 'char_personality':
+      return replaceVariableMacros(String(character?.personality ?? ''))
+    case 'scenario':
+      return replaceVariableMacros(String(character?.scenario ?? ''))
+    case 'dialogue_examples':
+      return replaceVariableMacros(String(character?.mes_example ?? ''))
+    case 'world_info_before':
+    case 'world_info_after':
+    case 'persona_description':
+      return ''
+    default:
+      return ''
+  }
+}
+
+function getGenerationUserInput(config: TavernHelperGenerationConfig): string {
+  const value = config.user_input
+    || stringField(config, 'text')
+    || stringField(config, 'content')
+    || (typeof config.prompt === 'string' ? config.prompt : '')
+  return replaceVariableMacros(value)
+}
+
+async function readTavernHelperStream(response: Response, generationId: string): Promise<string> {
+  const reader = response.body?.getReader()
+  if (!reader) return ''
+  const decoder = new TextDecoder()
+  let buffer = ''
+  let text = ''
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      const parts = buffer.split(/\r?\n\r?\n/)
+      buffer = parts.pop() ?? ''
+      for (const part of parts) {
+        const chunk = parseSseTextChunk(part)
+        if (chunk === null) continue
+        if (chunk === '[DONE]') return text
+        const incremental = extractCompletionText(parseJsonSafely(chunk))
+        if (!incremental) continue
+        text += incremental
+        await eventSource.emit(event_types.STREAM_TOKEN_RECEIVED_FULLY, text, generationId)
+        await eventSource.emit(event_types.STREAM_TOKEN_RECEIVED_INCREMENTALLY, incremental, generationId)
+        await eventSource.emit(event_types.STREAM_TOKEN_RECEIVED, text, generationId)
+      }
+    }
+  } finally {
+    reader.releaseLock()
+  }
+
+  return text
+}
+
+function parseSseTextChunk(rawEvent: string): string | null {
+  const lines = rawEvent.split(/\r?\n/)
+  const data = lines
+    .filter(line => line.startsWith('data:'))
+    .map(line => line.slice(5).trimStart())
+    .join('\n')
+    .trim()
+  return data || null
+}
+
+function extractCompletionText(data: unknown): string {
+  if (!isPlainRecord(data)) return ''
+  const choices = Array.isArray(data.choices) ? data.choices : []
+  const first = choices[0]
+  if (isPlainRecord(first)) {
+    if (isPlainRecord(first.delta)) {
+      const deltaContent = generationContentToText(first.delta.content)
+      if (deltaContent) return deltaContent
+    }
+    if (isPlainRecord(first.message)) {
+      const messageContent = generationContentToText(first.message.content)
+      if (messageContent) return messageContent
+    }
+    const text = generationContentToText(first.text)
+    if (text) return text
+  }
+  return generationContentToText(data.content ?? data.message)
+}
+
+function generationContentToText(content: unknown): string {
+  if (typeof content === 'string') return content
+  if (Array.isArray(content)) {
+    return content
+      .map(part => {
+        if (typeof part === 'string') return part
+        if (isPlainRecord(part) && typeof part.text === 'string') return part.text
+        return ''
+      })
+      .filter(Boolean)
+      .join('\n')
+  }
+  if (isPlainRecord(content) && typeof content.text === 'string') return content.text
+  return ''
+}
+
+function parseJsonSafely(text: string): unknown {
+  try {
+    return JSON.parse(text)
+  } catch {
+    return {}
+  }
+}
+
+function getStOaiSettings(): Record<string, unknown> {
+  return window.oai_settings ?? window.openai_settings ?? {}
+}
+
+function normalizeGenerationRole(value: unknown): StGenerationRole {
+  return value === 'system' || value === 'assistant' || value === 'user' ? value : 'user'
+}
+
+function normalizeBaseUrl(value: string): string {
+  return value.trim().replace(/\/+$/, '')
+}
+
+function setPayloadString(payload: Record<string, unknown>, key: string, value: string): void {
+  if (value) payload[key] = value
+}
+
+function setPayloadNumber(payload: Record<string, unknown>, key: string, ...values: unknown[]): void {
+  for (const value of values) {
+    if (value === 'same_as_preset' || value === 'unset') continue
+    const numeric = Number(value)
+    if (Number.isFinite(numeric)) {
+      payload[key] = numeric
+      return
+    }
+  }
+}
+
+function removeUndefinedFields(value: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(value).filter(([, entry]) => entry !== undefined && entry !== ''))
+}
+
+function stringField(source: Record<string, unknown>, key: string): string {
+  const value = source[key]
+  return typeof value === 'string' ? value.trim() : ''
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return isPlainRecord(value) ? value : {}
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === 'object' && !Array.isArray(value))
+}
+
+function isAbortError(error: unknown): boolean {
+  return Boolean(error && typeof error === 'object' && (error as { name?: unknown }).name === 'AbortError')
+}
+
+function createTavernHelperGenerationId(): string {
+  return `crafttalker-th-${Date.now()}-${Math.random().toString(36).slice(2)}`
 }
 
 function createTavernHelperFacade(): Record<string, unknown> {
@@ -1457,22 +2748,34 @@ function createTavernHelperFacade(): Record<string, unknown> {
     getCurrentCharacterName: () => contextState.activeCharacter?.name ?? '',
     getCurrentCharacterId: () => currentCharacterIndex,
     getCharacter: (id?: unknown) => structuredClone(characters[Number(id ?? currentCharacterIndex)] ?? null),
-    getWorldbookNames: () => structuredClone(world_info.globalSelect ?? []),
-    getGlobalWorldbookNames: () => structuredClone(world_info.globalSelect ?? []),
-    getWorldbook: async () => [],
-    getLorebooks: () => [],
-    getLorebookSettings: () => ({}),
-    generate: async () => '',
-    generateRaw: async () => '',
-    stopGenerationById: () => {},
-    stopAllGeneration: () => {},
-    playAudio: () => {},
-    pauseAudio: () => {},
+    getWorldbookNames: () => structuredClone(world_names),
+    getGlobalWorldbookNames: () => structuredClone(selected_world_info),
+    getWorldbook: async (name?: unknown) => {
+      const worldName = getRequestedWorldName(name)
+      if (!worldName) {
+        recordCompatDiagnostic('TavernHelper.getWorldbook', 'stub', 'No active or requested worldbook was available for a read-only lookup.')
+        return []
+      }
+      const world = await loadWorldInfo(worldName)
+      recordCompatDiagnostic('TavernHelper.getWorldbook', world ? 'partial' : 'stub', 'Worldbook reads use CraftTalker world services in read-only mode.')
+      return world ? Object.values(world.entries) : []
+    },
+    getLorebooks: async () => {
+      await updateWorldInfoList().catch(() => {})
+      return structuredClone(world_names)
+    },
+    getLorebookSettings: () => structuredClone(world_info),
+    generate: (config?: unknown) => runTavernHelperGeneration('TavernHelper.generate', config, true),
+    generateRaw: (config?: unknown) => runTavernHelperGeneration('TavernHelper.generateRaw', config, false),
+    stopGenerationById: (generationId?: unknown) => stopTavernHelperGenerationById(generationId),
+    stopAllGeneration: () => stopAllTavernHelperGenerations(),
+    playAudio: () => recordCompatDiagnostic('TavernHelper.playAudio', 'stub', 'Plugin audio playback is not wired to a native media bridge yet.'),
+    pauseAudio: () => recordCompatDiagnostic('TavernHelper.pauseAudio', 'stub', 'Plugin audio playback is not wired to a native media bridge yet.'),
     getAudioList: () => [],
-    replaceAudioList: () => {},
-    appendAudioList: () => {},
+    replaceAudioList: () => recordCompatDiagnostic('TavernHelper.replaceAudioList', 'stub', 'Plugin audio queues are not persisted or played by CraftTalker yet.'),
+    appendAudioList: () => recordCompatDiagnostic('TavernHelper.appendAudioList', 'stub', 'Plugin audio queues are not persisted or played by CraftTalker yet.'),
     getAudioSettings: () => ({}),
-    setAudioSettings: () => {},
+    setAudioSettings: () => recordCompatDiagnostic('TavernHelper.setAudioSettings', 'stub', 'Plugin audio settings are not wired to native settings yet.'),
     getCurrentAudio: () => null,
     _bind: {
       _eventOn: eventSource.on.bind(eventSource),
@@ -1634,9 +2937,13 @@ const stHost: StHostApi = {
   extensionTypes,
   extension_prompts,
   chat_metadata,
+  world_info,
+  world_info_settings,
+  world_names,
+  selected_world_info,
   variables: {
-    global: getGlobalVariables(),
-    local: getLocalVariables(),
+    global: global_variable_facade,
+    local: chat_variable_facade,
     getGlobalVariable,
     setGlobalVariable,
     getLocalVariable,
@@ -1645,6 +2952,8 @@ const stHost: StHostApi = {
   getContext,
   getExtensionManifest,
   getRequestHeaders,
+  loadWorldInfo,
+  updateWorldInfoList,
   initialize: initializeStExtensionHost,
   ModuleWorkerWrapper: SimpleMutex,
   registerMacro,
@@ -1652,12 +2961,22 @@ const stHost: StHostApi = {
   registerMacroLike,
   unregisterMacroLike,
   replaceVariableMacros,
+  messageFormatting,
+  reloadMarkdownProcessor,
   registerSlashCommand,
   STscript,
   executeSlashCommands,
   executeSlashCommandsWithOptions,
   renderExtensionTemplate,
   renderExtensionTemplateAsync,
+  updateMessageBlock,
+  printMessages,
+  clearChat,
+  addOneMessage,
+  appendMediaToMessage,
+  addCopyToCodeBlocks,
+  saveChatConditional,
+  saveChatConditionalDebounced,
   saveMetadata,
   saveMetadataDebounced,
   saveSettings,
@@ -1679,15 +2998,20 @@ const stHost: StHostApi = {
   xiaobaixStreamingGeneration,
   updateTemplateVariables,
   updateContext: updateStExtensionContext,
+  recordCompatDiagnostic,
+  getDiagnostics,
+  resetDiagnostics,
 }
 
 function publishGlobals(): void {
   installGlobalLibraries()
+  ensureStCompatDomAnchors()
+  syncCompatDomState()
 
   stHost.extensionNames = extensionNames
   stHost.extensionTypes = extensionTypes
-  stHost.variables.global = getGlobalVariables()
-  stHost.variables.local = getLocalVariables()
+  stHost.variables.global = global_variable_facade
+  stHost.variables.local = chat_variable_facade
 
   window.CraftTalker = {
     ...(window.CraftTalker ?? {}),
@@ -1699,6 +3023,8 @@ function publishGlobals(): void {
   window.chat_metadata = chat_metadata
   window.getContext = getContext
   window.saveSettingsDebounced = saveSettingsDebounced
+  window.saveChatConditional = saveChatConditional
+  window.saveChatConditionalDebounced = saveChatConditionalDebounced
   window.STscript = STscript
   window.TavernHelper = tavernHelperFacade
   window.builtin = builtinFacade
@@ -1708,6 +3034,12 @@ function publishGlobals(): void {
   window.updateTemplateVariables = updateTemplateVariables
   window.executeSlashCommands = executeSlashCommands
   window.executeSlashCommandsWithOptions = executeSlashCommandsWithOptions
+  window.messageFormatting = messageFormatting
+  window.reloadMarkdownProcessor = reloadMarkdownProcessor
+  window.updateMessageBlock = updateMessageBlock
+  window.printMessages = printMessages
+  window.clearChat = clearChat
+  window.addOneMessage = addOneMessage
 }
 
 function installGlobalLibraries(): void {
@@ -1721,6 +3053,75 @@ function installGlobalLibraries(): void {
   window.YAML ??= createYamlFacade()
   window.z ??= createZodFacade()
   installSortableShim(window.$)
+}
+
+function syncCompatDomState(): void {
+  syncStCompatDomState({
+    chat,
+    selectedWorldInfo: selected_world_info,
+    worldNames: world_names,
+  })
+}
+
+function getCompatChatRootElement(): HTMLElement | null {
+  return document.querySelector<HTMLElement>('#crafttalker-st-compat-root [data-st-compat-anchor="chat"]')
+    ?? document.querySelector<HTMLElement>('#crafttalker-st-compat-root #chat')
+}
+
+function getCompatMessageElement(index: number): HTMLElement | null {
+  return getCompatChatRootElement()?.querySelector<HTMLElement>(`.mes[mesid="${index}"]`) ?? null
+}
+
+function renderCompatMessageBlock(index: number, message: CompatChatMessage): void {
+  const element = getCompatMessageElement(index)
+  if (!element) return
+  element.setAttribute('mesid', String(index))
+  element.setAttribute('ch_name', String(message.name ?? ''))
+  element.setAttribute('is_user', String(Boolean(message.is_user)))
+  element.setAttribute('is_system', String(Boolean(message.is_system)))
+  element.setAttribute('swipeid', String(message.swipe_id ?? 0))
+
+  const name = element.querySelector<HTMLElement>('.ch_name .name_text')
+  if (name) name.textContent = String(message.name ?? '')
+
+  const text = element.querySelector<HTMLElement>('.mes_text')
+  if (text) {
+    text.innerHTML = messageFormatting(
+      message.mes ?? '',
+      String(message.name ?? ''),
+      Boolean(message.is_system),
+      Boolean(message.is_user),
+      index,
+    )
+  }
+}
+
+function clearCompatChatDom(): void {
+  const chatRoot = getCompatChatRootElement()
+  if (!chatRoot) return
+  chatRoot.querySelectorAll('.mes').forEach(message => message.remove())
+}
+
+async function emitMessageRendered(index: number, message: CompatChatMessage): Promise<void> {
+  await eventSource.emit(
+    message.is_user ? event_types.USER_MESSAGE_RENDERED : event_types.CHARACTER_MESSAGE_RENDERED,
+    index,
+  )
+}
+
+function getElementFromMaybeJQuery(value: unknown): Element | null {
+  if (value instanceof Element) return value
+  if (!value || typeof value !== 'object') return null
+  const maybeJQuery = value as { get?: (index: number) => unknown; 0?: unknown }
+  const element = typeof maybeJQuery.get === 'function' ? maybeJQuery.get(0) : maybeJQuery[0]
+  return element instanceof Element ? element : null
+}
+
+function syncCompatWorldSelects(): void {
+  syncStCompatWorldSelects({
+    selectedWorldInfo: selected_world_info,
+    worldNames: world_names,
+  })
 }
 
 function installSortableShim($: typeof jquery | undefined): void {

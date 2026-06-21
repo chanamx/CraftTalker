@@ -1,17 +1,26 @@
-import { useCallback } from 'react'
+import { lazy, Suspense, useCallback } from 'react'
 import { Outlet, useNavigate, useLocation } from 'react-router'
 import { useQueryClient } from '@tanstack/react-query'
-import { AnimatePresence } from 'framer-motion'
 import { AppLayout } from '@/components/layout/AppLayout'
 import { defaultCharacter } from '@/stores/chat-store'
 import { useSettingsStore } from '@/stores/settings-store'
 import { useUIStore } from '@/stores/ui-store'
 import { useAppState } from '@/hooks/use-app-state'
 import { useChatActions } from '@/hooks/use-chat-actions'
-import { CharacterEditor } from '@/components/character/CharacterEditor'
-import { OnboardingWizard, useOnboarding } from '@/components/onboarding/OnboardingWizard'
+import { useOnboarding } from '@/components/onboarding/use-onboarding'
 import { api } from '@/lib/api'
 import { useToast } from '@/lib/toast'
+
+const CharacterEditor = lazy(() => import('@/components/character/CharacterEditor').then(m => ({ default: m.CharacterEditor })))
+const OnboardingWizard = lazy(() => import('@/components/onboarding/OnboardingWizard').then(m => ({ default: m.OnboardingWizard })))
+
+function ModalFallback({ zClass = 'z-50' }: { zClass?: string }) {
+  return (
+    <div className={`fixed inset-0 ${zClass} flex items-center justify-center bg-black/20`}>
+      <div className="h-8 w-8 rounded-full border-2 border-[var(--color-accent)] border-t-transparent animate-spin" />
+    </div>
+  )
+}
 
 export function AppShell() {
   const navigate = useNavigate()
@@ -116,26 +125,34 @@ export function AppShell() {
         }}
       />
       {isDialogRoute && <Outlet />}
-      <CharacterEditor
-        open={characterEditorOpen}
-        onClose={() => setCharacterEditorOpen(false)}
-        onSave={handleCreateCharacter}
-      />
-      <CharacterEditor
-        open={editingCharacter !== null}
-        onClose={() => setEditingCharacter(null)}
-        onSave={handleEditCharacter}
-        initial={editingCharacter}
-      />
-      <AnimatePresence>
-        {showOnboarding && (
+      {characterEditorOpen && (
+        <Suspense fallback={<ModalFallback />}>
+          <CharacterEditor
+            open={true}
+            onClose={() => setCharacterEditorOpen(false)}
+            onSave={handleCreateCharacter}
+          />
+        </Suspense>
+      )}
+      {editingCharacter !== null && (
+        <Suspense fallback={<ModalFallback />}>
+          <CharacterEditor
+            open={true}
+            onClose={() => setEditingCharacter(null)}
+            onSave={handleEditCharacter}
+            initial={editingCharacter}
+          />
+        </Suspense>
+      )}
+      {showOnboarding && (
+        <Suspense fallback={<ModalFallback zClass="z-[100]" />}>
           <OnboardingWizard
             characters={characters}
             onSelectCharacter={handleSelectCharacter}
             onComplete={completeOnboarding}
           />
-        )}
-      </AnimatePresence>
+        </Suspense>
+      )}
     </>
   )
 }

@@ -1,11 +1,11 @@
 import { useCallback, useEffect, useRef, useMemo, useState } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
-import { useCharacters, useCreateCharacter, useUpdateCharacter } from '@/hooks/use-characters'
+import { useCharacter, useCharacters, useCreateCharacter, useUpdateCharacter } from '@/hooks/use-characters'
 import { useChats, useChat, useCreateChat, useDeleteChat } from '@/hooks/use-chats'
 import { mapCharacterIndex, mapChatLineToMessage, type Character } from '@/types'
 import { useChatStore } from '@/stores/chat-store'
 import { useToast } from '@/lib/toast'
-import { updateStExtensionContext } from '@/lib/st-extension-host'
+import { updateStExtensionContextBridge } from '@/lib/st-extension-bridge'
 import type { CharacterDetail } from '@/lib/api'
 
 export function useAppState() {
@@ -20,6 +20,7 @@ export function useAppState() {
   const pendingCharRef = useRef<string | null>(null)
 
   const { data: charactersData, isLoading: charactersLoading } = useCharacters()
+  const { data: activeCharacterDetail } = useCharacter(activeCharacter?.file_name ?? null)
   const { data: chatsData } = useChats(activeCharacter?.file_name ?? null)
   const { data: chatData } = useChat(activeCharacter?.file_name ?? null, activeChatId)
   const createChat = useCreateChat()
@@ -43,15 +44,38 @@ export function useAppState() {
       .map(({ line, fileIndex }) => mapChatLineToMessage(line, fileIndex))
   }, [chatData])
 
+  const stCharacters = useMemo(() => {
+    if (!activeCharacterDetail) return characters
+    return characters.map(character => {
+      if (character.file_name !== activeCharacterDetail.file_name) return character
+      return {
+        ...character,
+        ...activeCharacterDetail,
+        id: character.id,
+        model: character.model,
+        lastMessage: character.lastMessage,
+        pinned: character.pinned,
+        world: activeCharacterDetail.world ?? character.world ?? null,
+      }
+    })
+  }, [activeCharacterDetail, characters])
+
+  const stActiveCharacter = useMemo(() => {
+    if (!activeCharacter || !activeCharacterDetail || activeCharacter.file_name !== activeCharacterDetail.file_name) {
+      return activeCharacter
+    }
+    return stCharacters.find(character => character.file_name === activeCharacter.file_name) ?? activeCharacter
+  }, [activeCharacter, activeCharacterDetail, stCharacters])
+
   useEffect(() => {
-    updateStExtensionContext({
-      activeCharacter,
+    updateStExtensionContextBridge({
+      activeCharacter: stActiveCharacter,
       activeChatId,
-      characters,
+      characters: stCharacters,
       messages,
       chatLines: chatData?.lines ?? [],
     })
-  }, [activeCharacter, activeChatId, characters, messages, chatData])
+  }, [stActiveCharacter, activeChatId, stCharacters, messages, chatData])
 
   useEffect(() => {
     if (!activeCharacter || !chatsData) return

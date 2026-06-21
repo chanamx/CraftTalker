@@ -3,6 +3,9 @@ import type {
   ChatDetail,
   ChatInfo,
   ChatLine,
+  ChatMetadataUpdateResponse,
+  ChatMessageVariablesUpdate,
+  ChatMessageVariablesUpdateResponse,
   GenerationOverrides,
   LlmRequestConfig,
   PresetType,
@@ -106,6 +109,20 @@ export const chatsApi = {
     request<ChatLine>(`${chatPath(characterName, chatId)}/messages/${lineIndex}`, {
       method: 'PATCH',
       body: JSON.stringify({ content }),
+    }),
+  updateMetadata: (characterName: string, chatId: string, chatMetadata: Record<string, unknown>) =>
+    request<ChatMetadataUpdateResponse>(`${chatPath(characterName, chatId)}/metadata`, {
+      method: 'PATCH',
+      body: JSON.stringify({ chat_metadata: chatMetadata }),
+    }),
+  updateMessageVariables: (
+    characterName: string,
+    chatId: string,
+    updates: ChatMessageVariablesUpdate[],
+  ) =>
+    request<ChatMessageVariablesUpdateResponse>(`${chatPath(characterName, chatId)}/message-variables`, {
+      method: 'PATCH',
+      body: JSON.stringify({ updates }),
     }),
   rename: (characterName: string, chatId: string, chatName: string) =>
     request<{ success: boolean }>(chatPath(characterName, chatId), {

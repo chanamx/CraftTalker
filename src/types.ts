@@ -7,6 +7,22 @@ export interface Character {
   name: string
   avatar: string | null
   description: string
+  tags?: string[]
+  creator?: string
+  spec?: string
+  spec_version?: string
+  created_at?: number
+  updated_at?: number
+  personality?: string
+  scenario?: string
+  first_mes?: string
+  mes_example?: string
+  creator_notes?: string
+  system_prompt?: string
+  post_history_instructions?: string
+  alternate_greetings?: string[]
+  character_version?: string
+  extensions?: Record<string, unknown>
   model: string
   lastMessage: string
   pinned: boolean
@@ -72,6 +88,12 @@ export function mapCharacterIndex(c: CharacterIndex): Character {
     name: c.name,
     avatar: c.avatar,
     description: c.description,
+    tags: c.tags,
+    creator: c.creator,
+    spec: c.spec,
+    spec_version: c.spec_version,
+    created_at: c.created_at,
+    updated_at: c.updated_at,
     model: 'default',
     lastMessage: '',
     pinned: false,
