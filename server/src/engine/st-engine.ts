@@ -1,8 +1,10 @@
 import { Worker } from 'node:worker_threads'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import type { Engine, EngineRequest, EngineResponse } from './types.js'
-import type { LLMConfig } from '../lib/llm-config.js'
+import { NativeEngine } from './native.js'
+import type { EngineRequest, EngineMessage } from './types.js'
+import { buildSTPrompt } from '../lib/prompt-builder.js'
+import type { MacroEnv } from '../lib/macros.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
@@ -13,10 +15,14 @@ interface WorkerMessage {
 }
 
 /**
- * ST Engine - 通过 Worker Thread 加载 SillyTavern 的 prompt 构建逻辑
- * 目前为骨架实现，后续将加载 ST 的 JS 模块
+ * ST Engine compatibility shell.
+ *
+ * It keeps the public "sillytavern" engine entry point for plugins and
+ * compatibility code, while delegating all provider transport to NativeEngine.
+ * The worker remains available for future isolated ST runtime work, but it no
+ * longer owns LLM networking.
  */
-export class STEngine implements Engine {
+export class STEngine extends NativeEngine {
   readonly name = 'sillytavern'
   private worker: Worker | null = null
   private stPath: string | null = null
@@ -28,6 +34,7 @@ export class STEngine implements Engine {
   }>()
 
   constructor(stPath?: string) {
+    super()
     this.stPath = stPath ?? null
   }
 
@@ -90,44 +97,27 @@ export class STEngine implements Engine {
     })
   }
 
-  async generate(request: EngineRequest): Promise<EngineResponse> {
-    return this.sendRequest<EngineResponse>('generate', request)
-  }
-
-  async *generateStream(request: EngineRequest): AsyncGenerator<string, void, unknown> {
-    const id = crypto.randomUUID()
-    const chunks: string[] = []
-    let done = false
-    let error: Error | null = null
-    let resolver: (() => void) | null = null
-
-    this.pendingRequests.set(id, {
-      resolve: () => { done = true; resolver?.() },
-      reject: (err) => { error = err; done = true; resolver?.() },
-      onChunk: (chunk) => { chunks.push(chunk); resolver?.() },
+  protected override buildPromptInput(request: EngineRequest, macroEnv: MacroEnv): {
+    chatMessages: EngineMessage[]
+    prompt: string
+  } {
+    const { messages } = buildSTPrompt({
+      character: request.character,
+      messages: request.messages,
+      userName: macroEnv.user,
+      worldInfo: request.worldEntries?.map(entry => entry.content),
     })
-
-    const worker = await this.ensureWorker()
-    worker.postMessage({ id, type: 'stream', payload: request })
-
-    while (!done || chunks.length > 0) {
-      if (chunks.length > 0) {
-        yield chunks.shift()!
-      } else if (!done) {
-        await new Promise<void>((r) => { resolver = r })
-      }
+    return {
+      chatMessages: messages,
+      prompt: messages.map(message => message.content).join('\n\n'),
     }
-
-    this.pendingRequests.delete(id)
-    if (error) throw error
   }
 
-  async testConnection(config: LLMConfig): Promise<boolean> {
-    try {
-      return await this.sendRequest<boolean>('test', config)
-    } catch {
-      return false
+  async buildCompatPrompt(request: EngineRequest): Promise<EngineMessage[]> {
+    if (this.worker) {
+      return this.sendRequest<EngineMessage[]>('build-prompt', request)
     }
+    return this.buildPromptInput(request, { user: request.userName || 'User', char: request.character.name }).chatMessages
   }
 
   async dispose(): Promise<void> {

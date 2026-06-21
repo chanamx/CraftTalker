@@ -38,6 +38,11 @@ interface NativeRequestContext {
   signal?: AbortSignal
 }
 
+interface NativePromptInput {
+  chatMessages: ChatMessage
+  prompt: string
+}
+
 interface OpenAIStreamChunk {
   choices?: Array<{
     delta?: { content?: string }
@@ -157,7 +162,7 @@ function geminiTextFromCandidate(candidate: GeminiCandidate): string {
 }
 
 export class NativeEngine implements Engine {
-  readonly name = 'native'
+  readonly name: string = 'native'
 
   async generate(request: EngineRequest): Promise<EngineResponse> {
     const context = this.buildRequestContext(request)
@@ -225,15 +230,14 @@ export class NativeEngine implements Engine {
     }
   }
 
-  private buildRequestContext(request: EngineRequest): NativeRequestContext {
-    const { config, preset, character, messages, userName, worldEntries, signal } = request
+  protected buildRequestContext(request: EngineRequest): NativeRequestContext {
+    const { config, preset, character, userName, signal } = request
     const provider = providerFromConfig(config)
     const apiFormat = apiFormatFromConfig(config)
     const baseUrl = baseUrlFromConfig(config, provider)
     const headers = headersFromConfig(config, provider)
     const macroEnv: MacroEnv = { user: userName || '用户', char: character.name }
-    const chatMessages = buildOpenAIMessages(messages, character, macroEnv, worldEntries)
-    const prompt = buildCompletionPrompt(messages, character, macroEnv, worldEntries)
+    const { chatMessages, prompt } = this.buildPromptInput(request, macroEnv)
 
     return {
       config,
@@ -244,6 +248,13 @@ export class NativeEngine implements Engine {
       chatMessages,
       prompt,
       signal,
+    }
+  }
+
+  protected buildPromptInput(request: EngineRequest, macroEnv: MacroEnv): NativePromptInput {
+    return {
+      chatMessages: buildOpenAIMessages(request.messages, request.character, macroEnv, request.worldEntries),
+      prompt: buildCompletionPrompt(request.messages, request.character, macroEnv, request.worldEntries),
     }
   }
 

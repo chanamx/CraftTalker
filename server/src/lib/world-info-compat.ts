@@ -342,6 +342,13 @@ interface CheckWorldInfoRuntime {
   tokenCounter: TokenCounter
 }
 
+type CheckWorldInfoExecutionEffect =
+  | { type: 'apply-vector-activations'; runtime: CheckWorldInfoRuntime; settings: WorldInfoScanSettings }
+  | { type: 'count-tokens'; tokenCounter: TokenCounter; text: string }
+  | { type: 'emit-scan-done-hooks'; settings: WorldInfoScanSettings; input: WorldInfoScanHookInput }
+
+type CheckWorldInfoExecutionResult = void | number | WorldInfoScanHookPatch
+
 export function getSortedWorldInfoEntries(
   sources: WorldInfoSource[],
   settings: WorldInfoScanSettings = {},
@@ -393,9 +400,29 @@ export function checkWorldInfoSync(input: CheckWorldInfoInput): WorldInfoPromptR
 }
 
 async function runCheckWorldInfo(input: CheckWorldInfoInput): Promise<WorldInfoPromptResult> {
+  const execution = executeCheckWorldInfo(input)
+  let step = execution.next()
+  while (!step.done) {
+    step = execution.next(await runCheckWorldInfoEffect(step.value))
+  }
+  return step.value
+}
+
+function runCheckWorldInfoSync(input: CheckWorldInfoInput): WorldInfoPromptResult {
+  const execution = executeCheckWorldInfo(input)
+  let step = execution.next()
+  while (!step.done) {
+    step = execution.next(runCheckWorldInfoEffectSync(step.value))
+  }
+  return step.value
+}
+
+function* executeCheckWorldInfo(
+  input: CheckWorldInfoInput,
+): Generator<CheckWorldInfoExecutionEffect, WorldInfoPromptResult, CheckWorldInfoExecutionResult> {
   const settings = normalizeScanSettings(input.settings)
   const runtime = createRuntime(input, settings)
-  await applyVectorActivations(runtime, settings)
+  yield { type: 'apply-vector-activations', runtime, settings }
 
   while (runtime.scanState) {
     runtime.loopCount += 1
@@ -456,7 +483,11 @@ async function runCheckWorldInfo(input: CheckWorldInfoInput): Promise<WorldInfoP
 
     const successfulEntries: WorldInfoCompatEntry[] = []
     let newContent = ''
-    const activatedTokens = await countTokens(runtime.tokenCounter, runtime.activatedText)
+    const activatedTokens = (yield {
+      type: 'count-tokens',
+      tokenCounter: runtime.tokenCounter,
+      text: runtime.activatedText,
+    }) as number
     let remainingIgnoresBudget = newEntries.filter(entry => entry.ignoreBudget).length
 
     for (const entry of newEntries) {
@@ -470,7 +501,11 @@ async function runCheckWorldInfo(input: CheckWorldInfoInput): Promise<WorldInfoP
 
       const activatedEntry = resolveEntryForActivation(entry, settings)
       newContent += `${activatedEntry.content}\n`
-      const prospectiveTokens = activatedTokens + await countTokens(runtime.tokenCounter, newContent)
+      const prospectiveTokens = activatedTokens + ((yield {
+        type: 'count-tokens',
+        tokenCounter: runtime.tokenCounter,
+        text: newContent,
+      }) as number)
       if (!entry.ignoreBudget && prospectiveTokens >= runtime.budget) {
         runtime.overflowed = true
         continue
@@ -483,10 +518,18 @@ async function runCheckWorldInfo(input: CheckWorldInfoInput): Promise<WorldInfoP
     const successfulForRecursion = successfulEntries.filter(entry => !entry.preventRecursion)
     const baseNextScanState = getNextScanState(runtime, settings, successfulForRecursion)
     updateRecursionBuffer(runtime, baseNextScanState, successfulForRecursion)
-    const usedTokens = await countTokens(runtime.tokenCounter, getActivatedText(runtime.activated))
+    const usedTokens = (yield {
+      type: 'count-tokens',
+      tokenCounter: runtime.tokenCounter,
+      text: getActivatedText(runtime.activated),
+    }) as number
     const budgetRemaining = Math.max(0, runtime.budget - usedTokens)
     const hookInput = buildScanHookInput(runtime, settings, newEntries, successfulEntries, baseNextScanState, budgetRemaining)
-    const hookPatch = await emitScanDoneHooks(settings, hookInput)
+    const hookPatch = (yield {
+      type: 'emit-scan-done-hooks',
+      settings,
+      input: hookInput,
+    }) as WorldInfoScanHookPatch
     const patchResult = applyScanHookPatch(runtime, hookInput, hookPatch, usedTokens)
 
     runtime.scanEvents.push({
@@ -506,118 +549,26 @@ async function runCheckWorldInfo(input: CheckWorldInfoInput): Promise<WorldInfoP
   return buildPromptResult([...runtime.activated.values()], runtime.overflowed, runtime.timedEffects, runtime.scanEvents)
 }
 
-function runCheckWorldInfoSync(input: CheckWorldInfoInput): WorldInfoPromptResult {
-  const settings = normalizeScanSettings(input.settings)
-  const runtime = createRuntime(input, settings)
-  applyVectorActivationsSync(runtime, settings)
-
-  while (runtime.scanState) {
-    runtime.loopCount += 1
-    if (settings.maxRecursionSteps && runtime.loopCount > settings.maxRecursionSteps) break
-
-    const possibleEntries: WorldInfoCompatEntry[] = []
-
-    for (const entry of runtime.sortedEntries) {
-      const key = entryId(entry)
-      if (runtime.activated.has(key) || runtime.failedProbability.has(key)) continue
-      if (!entry.enabled) continue
-      if (!isEntryAllowedForScan(entry, settings)) continue
-      const isSticky = isTimedEffectActive(runtime.timedEffects, 'sticky', entry)
-      if (isTimedEffectActive(runtime.timedEffects, 'delay', entry)) continue
-      if (isTimedEffectActive(runtime.timedEffects, 'cooldown', entry) && !isSticky) continue
-      if (runtime.scanState === 'recursion' && entry.excludeRecursion && !isSticky) continue
-      if (runtime.scanState !== 'recursion' && entry.delayUntilRecursion > 0 && !isSticky) continue
-      if (runtime.scanState === 'recursion' && entry.delayUntilRecursion > runtime.currentRecursionDelayLevel && !isSticky) continue
-
-      if (entry.decorators.includes('@@dont_activate')) continue
-      if (entry.decorators.includes('@@activate')) {
-        possibleEntries.push(entry)
-        continue
-      }
-
-      const forcedEntry = getForcedActivation(runtime, entry)
-      if (forcedEntry) {
-        possibleEntries.push(forcedEntry)
-        continue
-      }
-
-      if (!entry.content) continue
-
-      if (entry.vectorized) {
-        pushVectorizedSkippedEvent(runtime, entry)
-        continue
-      }
-
-      if (isSticky) {
-        possibleEntries.push(entry)
-        continue
-      }
-
-      const score = getActivationScore(entry, runtime.buffer, runtime.scanState, settings)
-      if (entry.constant || score > 0) {
-        possibleEntries.push(entry)
-      }
-    }
-
-    const newEntries = filterByInclusionGroups(
-      sortScanCandidates(possibleEntries, runtime),
-      runtime.activated,
-      runtime.buffer,
-      runtime.scanState,
-      settings,
-      runtime.timedEffects,
-    )
-
-    const successfulEntries: WorldInfoCompatEntry[] = []
-    let newContent = ''
-    const activatedTokens = countTokensSync(runtime.tokenCounter, runtime.activatedText)
-    let remainingIgnoresBudget = newEntries.filter(entry => entry.ignoreBudget).length
-
-    for (const entry of newEntries) {
-      if (entry.ignoreBudget) remainingIgnoresBudget -= 1
-      if (runtime.overflowed && !entry.ignoreBudget) {
-        if (remainingIgnoresBudget > 0) continue
-        break
-      }
-
-      if (!passesProbabilityCheck(runtime, entry)) continue
-
-      const activatedEntry = resolveEntryForActivation(entry, settings)
-      newContent += `${activatedEntry.content}\n`
-      const prospectiveTokens = activatedTokens + countTokensSync(runtime.tokenCounter, newContent)
-      if (!entry.ignoreBudget && prospectiveTokens >= runtime.budget) {
-        runtime.overflowed = true
-        continue
-      }
-
-      runtime.activated.set(entryId(entry), activatedEntry)
-      successfulEntries.push(activatedEntry)
-    }
-
-    const successfulForRecursion = successfulEntries.filter(entry => !entry.preventRecursion)
-    const baseNextScanState = getNextScanState(runtime, settings, successfulForRecursion)
-    updateRecursionBuffer(runtime, baseNextScanState, successfulForRecursion)
-    const usedTokens = countTokensSync(runtime.tokenCounter, getActivatedText(runtime.activated))
-    const budgetRemaining = Math.max(0, runtime.budget - usedTokens)
-    const hookInput = buildScanHookInput(runtime, settings, newEntries, successfulEntries, baseNextScanState, budgetRemaining)
-    const hookPatch = emitScanDoneHooksSync(settings, hookInput)
-    const patchResult = applyScanHookPatch(runtime, hookInput, hookPatch, usedTokens)
-
-    runtime.scanEvents.push({
-      type: 'scan_done',
-      loopCount: runtime.loopCount,
-      currentState: runtime.scanState,
-      nextState: patchResult.nextState,
-      activatedCount: runtime.activated.size,
-      overflowed: patchResult.overflowed,
-    })
-
-    runtime.overflowed = patchResult.overflowed
-    runtime.scanState = patchResult.nextState
+async function runCheckWorldInfoEffect(effect: CheckWorldInfoExecutionEffect): Promise<CheckWorldInfoExecutionResult> {
+  switch (effect.type) {
+    case 'apply-vector-activations':
+      return applyVectorActivations(effect.runtime, effect.settings)
+    case 'count-tokens':
+      return countTokens(effect.tokenCounter, effect.text)
+    case 'emit-scan-done-hooks':
+      return emitScanDoneHooks(effect.settings, effect.input)
   }
+}
 
-  setTimedEffects(runtime.timedEffects, [...runtime.activated.values()], settings.dryRun === true)
-  return buildPromptResult([...runtime.activated.values()], runtime.overflowed, runtime.timedEffects, runtime.scanEvents)
+function runCheckWorldInfoEffectSync(effect: CheckWorldInfoExecutionEffect): CheckWorldInfoExecutionResult {
+  switch (effect.type) {
+    case 'apply-vector-activations':
+      return applyVectorActivationsSync(effect.runtime, effect.settings)
+    case 'count-tokens':
+      return countTokensSync(effect.tokenCounter, effect.text)
+    case 'emit-scan-done-hooks':
+      return emitScanDoneHooksSync(effect.settings, effect.input)
+  }
 }
 
 function normalizeScanSettings(settings: WorldInfoScanSettings | undefined): WorldInfoScanSettings {
