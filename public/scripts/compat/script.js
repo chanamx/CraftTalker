@@ -68,11 +68,13 @@ export function substituteParamsExtended(value) {
   return host.replaceVariableMacros(value)
 }
 
-export function messageFormatting(value) {
-  return String(value ?? '')
+export function messageFormatting(...args) {
+  return host.messageFormatting(...args)
 }
 
-export function reloadMarkdownProcessor() {}
+export function reloadMarkdownProcessor() {
+  return host.reloadMarkdownProcessor()
+}
 
 export function getCurrentChatId() {
   return host.getContext().getCurrentChatId?.() ?? host.getContext().chatId ?? null
@@ -80,7 +82,7 @@ export function getCurrentChatId() {
 
 export function reloadCurrentChat() {}
 export function saveChatConditional() {
-  return Promise.resolve()
+  return host.saveChatConditional()
 }
 export function saveMetadata() {
   return host.saveMetadata()
@@ -95,16 +97,25 @@ export function stopGeneration() {
 export function activateSendButtons() {}
 export function deactivateSendButtons() {}
 export function updateChatMetadata() {}
-export function updateMessageBlock() {}
-export function appendMediaToMessage() {}
-export function addCopyToCodeBlocks() {}
-export function printMessages() {}
-export function clearChat() {}
+export function updateMessageBlock(...args) {
+  return host.updateMessageBlock(...args)
+}
+export function appendMediaToMessage(...args) {
+  return host.appendMediaToMessage(...args)
+}
+export function addCopyToCodeBlocks(...args) {
+  return host.addCopyToCodeBlocks(...args)
+}
+export function printMessages(...args) {
+  return host.printMessages(...args)
+}
+export function clearChat(...args) {
+  return host.clearChat(...args)
+}
 export function deleteLastMessage() {}
 export function deleteMessage() {}
-export function addOneMessage(message) {
-  if (message && typeof message === 'object') host.chat.push(message)
-  return message
+export function addOneMessage(...args) {
+  return host.addOneMessage(...args)
 }
 export function getPastCharacterChats() {
   return Promise.resolve([])

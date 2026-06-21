@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import fs from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
@@ -7,6 +7,7 @@ import { cancelRun, createGenerationRun, failRun, updateRunPartial } from '../se
 import { createChat, getChat } from '../services/chat.service.js'
 import { clearGenerationLocksForTest, tryAcquireGenerationLock } from '../lib/generation-locks.js'
 import { clearLlmKeySessionsForTest } from '../services/llm-session.service.js'
+import { writeChatFile } from '../lib/jsonl.js'
 
 type Json = Record<string, unknown>
 
@@ -25,6 +26,7 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  vi.unstubAllGlobals()
   clearGenerationLocksForTest()
   clearLlmKeySessionsForTest()
   delete process.env.LUKER_DATA_DIR
@@ -92,6 +94,30 @@ describe('API Routes', () => {
 
     const getRes = await app.request(`/api/llm-sessions/${body.sessionId}`)
     expect(getRes.status).toBe(404)
+  })
+
+  it('POST /api/backends/chat-completions/status exposes the ST host compatibility bridge', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      data: [{ id: 'local-model' }],
+    }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+    const app = createApp()
+
+    const res = await app.request('/api/backends/chat-completions/status', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_completion_source: 'openai',
+        reverse_proxy: 'http://localhost:1234/v1',
+        model: 'local-model',
+      }),
+    })
+
+    expect(res.status).toBe(200)
+    expect(await res.json()).toEqual({ data: [{ id: 'local-model' }] })
   })
 
   it('GET /api/runs marks stale persisted running runs as interrupted', async () => {
@@ -301,6 +327,106 @@ describe('API Routes', () => {
     const body = await res.json() as Json
     expect(body).toHaveProperty('chatId')
     expect(body.chatId).toBeTypeOf('string')
+  })
+
+  it('PATCH /api/chats/:name/:chatId/metadata writes ST-compatible chat metadata', async () => {
+    const app = createApp()
+    const chat = await createChat('MetaBot', 'User')
+
+    const res = await app.request(`/api/chats/MetaBot/${chat.chatId}/metadata`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_metadata: {
+          variables: { mood: 'steady' },
+          extensions: { LittleWhiteBox: { enabled: true } },
+          customField: 'keep-me',
+        },
+      }),
+    })
+
+    expect(res.status).toBe(200)
+    const body = await res.json() as { chat_metadata: Record<string, unknown> }
+    expect(body.chat_metadata).toMatchObject({
+      variables: { mood: 'steady' },
+      extensions: { LittleWhiteBox: { enabled: true } },
+      customField: 'keep-me',
+    })
+    expect(body.chat_metadata.modified).toBeTypeOf('string')
+    const stored = await getChat('MetaBot', chat.chatId)
+    expect(stored.lines[0]).toMatchObject({
+      chat_metadata: expect.objectContaining({
+        variables: { mood: 'steady' },
+        customField: 'keep-me',
+      }),
+      user_name: 'User',
+      character_name: 'MetaBot',
+    })
+  })
+
+  it('PATCH /api/chats/:name/:chatId/message-variables persists only ST message variable fields', async () => {
+    const app = createApp()
+    const chat = await createChat('MetaBot', 'User')
+    const chatPath = path.join(testDataDir, 'chats', 'MetaBot', `${chat.chatId}.jsonl`)
+    await writeChatFile(chatPath, [
+      {
+        chat_metadata: { variables: { scene: 'quiet' }, customField: 'keep-header' },
+        user_name: 'User',
+        character_name: 'MetaBot',
+      },
+      {
+        name: 'User',
+        is_user: true,
+        is_system: false,
+        send_date: '2026-06-18T00:00:00.000Z',
+        mes: 'Hello',
+        extra: { source: 'original' },
+        unknown_top_level: 'preserve-me',
+      },
+      {
+        name: 'MetaBot',
+        is_user: false,
+        is_system: false,
+        send_date: '2026-06-18T00:00:01.000Z',
+        mes: 'Hi',
+        extra: {},
+        variables: [{ existing: true }],
+        variables_initialized: [true],
+      },
+    ])
+
+    const res = await app.request(`/api/chats/MetaBot/${chat.chatId}/message-variables`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        updates: [
+          { lineIndex: 0, variables: [{ should: 'ignore-header' }] },
+          { lineIndex: 1, variables: [{ hp: 10 }], variables_initialized: [true] },
+          { lineIndex: 99, variables: [{ should: 'ignore-missing' }] },
+        ],
+      }),
+    })
+
+    expect(res.status).toBe(200)
+    expect(await res.json()).toEqual({ updated: 1 })
+    const stored = await getChat('MetaBot', chat.chatId)
+    expect(stored.lines[0]).toMatchObject({
+      chat_metadata: { variables: { scene: 'quiet' }, customField: 'keep-header' },
+      user_name: 'User',
+      character_name: 'MetaBot',
+    })
+    expect(stored.lines[1]).toMatchObject({
+      mes: 'Hello',
+      extra: { source: 'original' },
+      unknown_top_level: 'preserve-me',
+      variables: [{ hp: 10 }],
+      variables_initialized: [true],
+    })
+    expect(stored.lines[2]).toMatchObject({
+      mes: 'Hi',
+      variables: [{ existing: true }],
+      variables_initialized: [true],
+    })
   })
 
   it('POST /api/chats/:name/:chatId/stream accepts request and returns SSE content type', async () => {
@@ -597,6 +723,148 @@ describe('API Routes', () => {
     const world = await res.json() as Json
     expect(world.global_enabled).toBe(true)
     expect(world.enabled).toBe(true)
+  })
+
+  it('serves ST-compatible read-only world info settings', async () => {
+    const app = createApp()
+    fs.writeFileSync(
+      path.join(testDataDir, 'worlds', 'GlobalLore.json'),
+      JSON.stringify({
+        name: 'GlobalLore',
+        enabled: true,
+        global_enabled: true,
+        entries: {},
+      }),
+      'utf8',
+    )
+    fs.writeFileSync(
+      path.join(testDataDir, 'worlds', 'LocalLore.json'),
+      JSON.stringify({
+        name: 'LocalLore',
+        enabled: true,
+        global_enabled: false,
+        entries: {},
+      }),
+      'utf8',
+    )
+
+    const worldsRes = await app.request('/api/worlds/settings')
+    const stRes = await app.request('/api/settings/get', { method: 'POST' })
+
+    expect(worldsRes.status).toBe(200)
+    expect(stRes.status).toBe(200)
+    for (const body of [await worldsRes.json(), await stRes.json()] as Array<Json>) {
+      expect(body.world_names).toEqual(expect.arrayContaining(['GlobalLore', 'LocalLore']))
+      expect(body.selected_world_info).toEqual(['GlobalLore'])
+      expect(body.world_info).toMatchObject({ globalSelect: ['GlobalLore'], charLore: [], entries: {} })
+      expect(body.world_info_max_recursion_steps).toBe(10)
+      expect(body.world_info_depth).toBe(4)
+      expect(body.world_info_min_activations).toBe(0)
+      expect(body.world_info_min_activations_depth_max).toBe(0)
+      expect(body.world_info_budget).toBe(25)
+      expect(body.world_info_budget_cap).toBe(0)
+      expect(body.world_info_recursive).toBe(false)
+      expect(body.world_info_overflow_alert).toBe(false)
+      expect(body.world_info_character_strategy).toBe(0)
+    }
+  })
+
+  it('serves the ST-compatible read-only worldinfo get endpoint', async () => {
+    const app = createApp()
+    fs.writeFileSync(
+      path.join(testDataDir, 'worlds', 'FileLore.json'),
+      JSON.stringify({
+        name: 'EmbeddedLore',
+        enabled: true,
+        global_enabled: true,
+        entries: [
+          {
+            id: '0',
+            keys: ['gate'],
+            content: 'The gate hums.',
+            extensions: { display_index: 12 },
+          },
+        ],
+      }),
+      'utf8',
+    )
+
+    const res = await app.request('/api/worldinfo/get', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'FileLore' }),
+    })
+
+    expect(res.status).toBe(200)
+    const body = await res.json() as Json & { entries: Record<string, Json> }
+    expect(body.name).toBe('FileLore')
+    expect(body.entries['0']).toMatchObject({
+      uid: 0,
+      key: ['gate'],
+      content: 'The gate hums.',
+      display_index: 12,
+    })
+  })
+
+  it('serves ST-compatible read-only worldinfo prompt checks', async () => {
+    const app = createApp()
+    fs.writeFileSync(
+      path.join(testDataDir, 'worlds', 'GlobalLore.json'),
+      JSON.stringify({
+        name: 'GlobalLore',
+        enabled: true,
+        global_enabled: true,
+        scan_depth: 4,
+        token_budget: 100,
+        entries: {
+          1: {
+            uid: 1,
+            key: ['dragon'],
+            content: 'The dragon remembers the old gate.',
+            enabled: true,
+            position: 0,
+            insertion_order: 10,
+          },
+        },
+      }),
+      'utf8',
+    )
+
+    const res = await app.request('/api/worldinfo/check', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat: [{ name: 'You', content: 'A dragon waits near the gate.' }],
+        maxContext: 4096,
+        isDryRun: true,
+      }),
+    })
+
+    expect(res.status).toBe(200)
+    const body = await res.json() as Json & {
+      matchedEntries: Array<Json & { content: string }>
+      worldInfoBefore: string
+      worldInfoAfter: string
+      allActivatedEntries: Array<Json & { world: string; uid: number }>
+    }
+    expect(body.matchedEntries).toHaveLength(1)
+    expect(body.matchedEntries[0]?.content).toBe('The dragon remembers the old gate.')
+    expect(body.worldInfoBefore).toContain('The dragon remembers the old gate.')
+    expect(body.worldInfoAfter).toBe('')
+    expect(body.allActivatedEntries[0]).toMatchObject({ world: 'GlobalLore', uid: 1 })
+  })
+
+  it('rejects ST-compatible worldinfo get requests without a name', async () => {
+    const app = createApp()
+
+    const res = await app.request('/api/worldinfo/get', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    })
+
+    expect(res.status).toBe(400)
+    await expect(res.json()).resolves.toMatchObject({ error: 'World info name is required' })
   })
 
   it('round-trips ST outlet and extension-backed world book entry fields through the API', async () => {

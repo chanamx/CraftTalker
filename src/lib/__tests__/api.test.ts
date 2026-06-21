@@ -14,6 +14,15 @@ describe('api facade', () => {
       presets: expect.any(Object),
       extensions: expect.any(Object),
     })
+    expect(api.extensions).toEqual(expect.objectContaining({
+      discover: expect.any(Function),
+      getCompatibilityReport: expect.any(Function),
+      getSettings: expect.any(Function),
+      saveSettings: expect.any(Function),
+    }))
+    expect(api.worlds).toEqual(expect.objectContaining({
+      getSettings: expect.any(Function),
+    }))
   })
 
   it('keeps stream endpoints under the API base path', async () => {
@@ -24,6 +33,12 @@ describe('api facade', () => {
     await api.chats.generate('Char Name', 'chat 1.jsonl', config, 'openai', 'default')
     await api.chats.regenerate('Char Name', 'chat 1.jsonl', config)
     await api.chats.continue('Char Name', 'chat 1.jsonl', config)
+    await api.chats.updateMetadata('Char Name', 'chat 1.jsonl', { variables: { mood: 'bright' } })
+    await api.chats.updateMessageVariables('Char Name', 'chat 1.jsonl', [{
+      lineIndex: 1,
+      variables: [{ hp: 10 }],
+      variables_initialized: [true],
+    }])
 
     expect(fetchMock).toHaveBeenNthCalledWith(
       1,
@@ -39,6 +54,16 @@ describe('api facade', () => {
       3,
       '/api/chats/Char%20Name/chat%201.jsonl/continue',
       expect.objectContaining({ method: 'POST' }),
+    )
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      4,
+      '/api/chats/Char%20Name/chat%201.jsonl/metadata',
+      expect.objectContaining({ method: 'PATCH' }),
+    )
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      5,
+      '/api/chats/Char%20Name/chat%201.jsonl/message-variables',
+      expect.objectContaining({ method: 'PATCH' }),
     )
   })
 })

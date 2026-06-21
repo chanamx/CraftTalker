@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import fs from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
@@ -19,6 +19,7 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  vi.useRealTimers()
   delete process.env.LUKER_DATA_DIR
   fs.rmSync(testDataDir, { recursive: true, force: true })
 })
@@ -89,6 +90,31 @@ describe('generation run service', () => {
   })
 
   it('lists runs by most recent update first', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'))
+    const first = await createGenerationRun({
+      characterName: 'RunBot',
+      chatId: 'first',
+      operation: 'generate',
+    })
+    vi.setSystemTime(new Date('2026-01-01T00:00:00.001Z'))
+    const second = await createGenerationRun({
+      characterName: 'RunBot',
+      chatId: 'second',
+      operation: 'generate',
+    })
+
+    vi.setSystemTime(new Date('2026-01-01T00:00:00.002Z'))
+    await updateRunPartial(first.runId, 'later')
+    const runs = await listGenerationRuns()
+
+    expect(runs[0]?.runId).toBe(first.runId)
+    expect(runs.some(run => run.runId === second.runId)).toBe(true)
+  })
+
+  it('keeps list ordering deterministic when timestamps tie', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'))
     const first = await createGenerationRun({
       characterName: 'RunBot',
       chatId: 'first',
@@ -100,10 +126,10 @@ describe('generation run service', () => {
       operation: 'generate',
     })
 
-    await updateRunPartial(first.runId, 'later')
     const runs = await listGenerationRuns()
 
-    expect(runs[0]?.runId).toBe(first.runId)
-    expect(runs.some(run => run.runId === second.runId)).toBe(true)
+    expect(runs.map(run => run.runId)).toEqual(
+      [first.runId, second.runId].sort((a, b) => b.localeCompare(a)),
+    )
   })
 })

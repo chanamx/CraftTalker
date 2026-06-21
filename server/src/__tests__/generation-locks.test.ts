@@ -16,7 +16,8 @@ let lastEngineRequest: EngineRequest | null = null
 class SlowStreamEngine implements Engine {
   readonly name = 'slow-test'
 
-  async generate(): Promise<EngineResponse> {
+  async generate(request: EngineRequest): Promise<EngineResponse> {
+    lastEngineRequest = request
     await new Promise(resolve => setTimeout(resolve, 50))
     return { content: 'full', finishReason: 'stop' }
   }
@@ -30,6 +31,20 @@ class SlowStreamEngine implements Engine {
 
   async testConnection(): Promise<boolean> {
     return true
+  }
+}
+
+class EmptyGenerateEngine extends SlowStreamEngine {
+  async generate(request: EngineRequest): Promise<EngineResponse> {
+    lastEngineRequest = request
+    return { content: '', finishReason: 'stop' }
+  }
+}
+
+class FailingGenerateEngine extends SlowStreamEngine {
+  async generate(request: EngineRequest): Promise<EngineResponse> {
+    lastEngineRequest = request
+    throw new Error('test generation failed')
   }
 }
 
@@ -92,8 +107,38 @@ function streamRequest(app: ReturnType<typeof createApp>, characterName: string,
   })
 }
 
+function generateRequest(app: ReturnType<typeof createApp>, characterName: string, chatId: string) {
+  return app.request(`/api/chats/${characterName}/${chatId}/generate`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      config: {
+        apiUrl: 'http://localhost:1234/v1',
+        apiKey: '',
+        model: 'test-model',
+        type: 'openai',
+      },
+    }),
+  })
+}
+
 function regenerateRequest(app: ReturnType<typeof createApp>, characterName: string, chatId: string) {
   return app.request(`/api/chats/${characterName}/${chatId}/regenerate`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      config: {
+        apiUrl: 'http://localhost:1234/v1',
+        apiKey: '',
+        model: 'test-model',
+        type: 'openai',
+      },
+    }),
+  })
+}
+
+function continueRequest(app: ReturnType<typeof createApp>, characterName: string, chatId: string) {
+  return app.request(`/api/chats/${characterName}/${chatId}/continue`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -112,6 +157,106 @@ async function drain(res: Response) {
 }
 
 describe('generation locks', () => {
+  it('saves non-stream generation content and completes the run', async () => {
+    const app = createApp()
+    writeCharacter('FullBot')
+    const chatId = await createChat(app, 'FullBot')
+
+    const res = await generateRequest(app, 'FullBot', chatId)
+    expect(res.status).toBe(200)
+    const body = await res.json() as { content: string; finishReason: string }
+    expect(body.content).toBe('full')
+    expect(body.finishReason).toBe('stop')
+
+    const chat = await getChat('FullBot', chatId)
+    const assistantLines = chat.lines.filter(line => 'mes' in line && !line.is_user)
+    expect(assistantLines).toHaveLength(1)
+    expect(assistantLines[0]?.mes).toBe('full')
+
+    const runs = await listGenerationRuns()
+    const completed = runs.find(run => run.characterName === 'FullBot' && run.chatId === chatId)
+    expect(completed).toMatchObject({
+      operation: 'generate',
+      status: 'completed',
+      partialContent: 'full',
+      committedLineIndex: 1,
+    })
+  })
+
+  it('does not save an empty non-stream generation message', async () => {
+    setEngine(new EmptyGenerateEngine())
+    const app = createApp()
+    writeCharacter('EmptyBot')
+    const chatId = await createChat(app, 'EmptyBot')
+
+    const res = await generateRequest(app, 'EmptyBot', chatId)
+    expect(res.status).toBe(200)
+    const body = await res.json() as { content: string }
+    expect(body.content).toBe('')
+
+    const chat = await getChat('EmptyBot', chatId)
+    expect(chat.lines.filter(line => 'mes' in line && !line.is_user)).toHaveLength(0)
+
+    const runs = await listGenerationRuns()
+    const completed = runs.find(run => run.characterName === 'EmptyBot' && run.chatId === chatId)
+    expect(completed).toMatchObject({
+      status: 'completed',
+      partialContent: '',
+    })
+    expect(completed?.committedLineIndex).toBeUndefined()
+  })
+
+  it('marks non-stream generation failures and releases the chat lock', async () => {
+    setEngine(new FailingGenerateEngine())
+    const app = createApp()
+    writeCharacter('FailBot')
+    const chatId = await createChat(app, 'FailBot')
+
+    const failed = await generateRequest(app, 'FailBot', chatId)
+    expect(failed.status).toBe(500)
+    const failedBody = await failed.json() as { error: string }
+    expect(failedBody.error).toBe('服务器内部错误')
+
+    const runs = await listGenerationRuns()
+    const failedRun = runs.find(run => run.characterName === 'FailBot' && run.chatId === chatId)
+    expect(failedRun).toMatchObject({
+      status: 'failed',
+      error: 'test generation failed',
+      partialContent: '',
+    })
+
+    setEngine(new SlowStreamEngine())
+    const afterFailure = await streamRequest(app, 'FailBot', chatId)
+    expect(afterFailure.status).toBe(200)
+    await drain(afterFailure)
+  })
+
+  it('appends streamed continue output to the last assistant message', async () => {
+    const app = createApp()
+    writeCharacter('ContinueBot')
+    const chatId = await createChat(app, 'ContinueBot')
+    await addMessage('ContinueBot', chatId, true, 'Prompt')
+    await addMessage('ContinueBot', chatId, false, 'First half')
+
+    const res = await continueRequest(app, 'ContinueBot', chatId)
+    expect(res.status).toBe(200)
+    await drain(res)
+
+    const chat = await getChat('ContinueBot', chatId)
+    const assistantLines = chat.lines.filter(line => 'mes' in line && !line.is_user)
+    expect(assistantLines).toHaveLength(1)
+    expect(assistantLines[0]?.mes).toBe('First halfpart-1part-2')
+
+    const runs = await listGenerationRuns()
+    const completed = runs.find(run => run.characterName === 'ContinueBot' && run.chatId === chatId)
+    expect(completed).toMatchObject({
+      operation: 'continue',
+      status: 'completed',
+      partialContent: 'part-1part-2',
+      committedLineIndex: 2,
+    })
+  })
+
   it('rejects concurrent generation for the same chat but allows other chats', async () => {
     const app = createApp()
     writeCharacter('LockBot')

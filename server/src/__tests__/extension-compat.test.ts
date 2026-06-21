@@ -3,6 +3,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { createApp } from '../app.js'
+import type { ExtensionCompatibilityReport } from '../services/extension.service.js'
 
 let testDataDir = ''
 
@@ -186,6 +187,67 @@ describe('SillyTavern extension compatibility routes', () => {
       disabledExtensions: ['third-party/TestExt'],
       samplePlugin: { enabled: true, nested: { value: 42 } },
     })
+  })
+
+  it('reports extension compatibility state without executing plugins', async () => {
+    writeTestExtension('WorkingExt', {
+      display_name: 'Working Extension',
+      loading_order: 5,
+      js: 'index.js',
+      css: 'style.css',
+    })
+    writeTestExtension('NeedsMissingDependency', {
+      display_name: 'Needs Missing Dependency',
+      js: 'index.js',
+      requires: ['MissingExt'],
+    })
+    writeTestExtension('UsesDependenciesField', {
+      display_name: 'Uses Dependencies Field',
+      js: 'index.js',
+      requires: [],
+      dependencies: ['WorkingExt'],
+    })
+    const brokenDir = writeTestExtension('BrokenExt', {
+      display_name: 'Broken Extension',
+      js: 'missing.js',
+    })
+    fs.rmSync(path.join(brokenDir, 'index.js'), { force: true })
+    const app = createApp()
+
+    const res = await app.request('/api/extensions/compatibility-report')
+
+    expect(res.status).toBe(200)
+    const report = await res.json() as ExtensionCompatibilityReport
+    expect(report.totals).toMatchObject({ discovered: expect.any(Number), withErrors: expect.any(Number) })
+    expect(report.runtimeCapabilities).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'resource-loading', status: 'supported' }),
+      expect.objectContaining({ id: 'dom-anchors', status: 'partial' }),
+      expect.objectContaining({ id: 'worldbook-api', status: 'partial' }),
+      expect.objectContaining({ id: 'generation-api', status: 'partial' }),
+      expect.objectContaining({ id: 'unsafe-script-runtime', status: 'blocked' }),
+    ]))
+    expect(report.extensions).toContainEqual(expect.objectContaining({
+      name: 'third-party/WorkingExt',
+      displayName: 'Working Extension',
+      manifestOk: true,
+      scriptOk: true,
+      cssOk: true,
+      enabled: true,
+    }))
+    expect(report.extensions).toContainEqual(expect.objectContaining({
+      name: 'third-party/NeedsMissingDependency',
+      missingRequiredDependencies: ['MissingExt'],
+    }))
+    expect(report.extensions).toContainEqual(expect.objectContaining({
+      name: 'third-party/UsesDependenciesField',
+      requires: ['WorkingExt'],
+      missingRequiredDependencies: [],
+    }))
+    expect(report.extensions).toContainEqual(expect.objectContaining({
+      name: 'third-party/BrokenExt',
+      scriptPath: 'missing.js',
+      scriptOk: false,
+    }))
   })
 
   it('blocks extension resource traversal attempts', async () => {
