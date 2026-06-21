@@ -115,7 +115,13 @@ export async function listGenerationRuns(): Promise<GenerationRunRecord[]> {
 
   return records
     .filter((record): record is GenerationRunRecord => record !== null)
-    .sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt))
+    .sort((a, b) => {
+      const updatedOrder = Date.parse(b.updatedAt) - Date.parse(a.updatedAt)
+      if (updatedOrder !== 0) return updatedOrder
+      const createdOrder = Date.parse(b.createdAt) - Date.parse(a.createdAt)
+      if (createdOrder !== 0) return createdOrder
+      return b.runId.localeCompare(a.runId)
+    })
 }
 
 async function updateGenerationRun(

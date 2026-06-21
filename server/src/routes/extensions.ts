@@ -3,6 +3,7 @@ import { zValidator } from '@hono/zod-validator'
 import { z } from 'zod'
 import {
   discoverExtensions,
+  getExtensionCompatibilityReport,
   readExtensionSettings,
   saveExtensionSettings,
 } from '../services/extension.service.js'
@@ -19,6 +20,11 @@ extensionsRoute.get('/discover', async (c) => {
 extensionsRoute.get('/settings', async (c) => {
   const settings = await readExtensionSettings()
   return c.json(settings)
+})
+
+extensionsRoute.get('/compatibility-report', async (c) => {
+  const report = await getExtensionCompatibilityReport()
+  return c.json(report)
 })
 
 extensionsRoute.post('/settings', zValidator('json', extensionSettingsSchema), async (c) => {

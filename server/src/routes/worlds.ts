@@ -11,6 +11,11 @@ worldsRoute.get('/', async (c) => {
   return c.json(worlds)
 })
 
+worldsRoute.get('/settings', async (c) => {
+  const settings = await worldService.getStWorldInfoSettings()
+  return c.json(settings)
+})
+
 worldsRoute.get('/:name', async (c) => {
   const name = decodeURIComponent(c.req.param('name'))
   const world = await worldService.getWorld(name)

@@ -26,11 +26,58 @@ export interface ExtensionManifest {
   js?: string
   css?: string
   loading_order?: number
+  requires?: string[]
+  dependencies?: string[]
+  optional?: string[]
+  minimum_client_version?: string
+  homePage?: string
+  auto_update?: boolean
+  generate_interceptor?: string
   [key: string]: unknown
 }
 
 interface ExtensionLocation extends ExtensionDiscovery {
   dir: string
+}
+
+export type ExtensionRuntimeCapabilityStatus = 'supported' | 'partial' | 'stub' | 'blocked'
+
+export interface ExtensionRuntimeCapability {
+  id: string
+  status: ExtensionRuntimeCapabilityStatus
+  note: string
+}
+
+export interface ExtensionCompatibilityReportItem extends ExtensionDiscovery {
+  displayName: string
+  version: string
+  author: string
+  enabled: boolean
+  manifestOk: boolean
+  manifestError?: string
+  scriptPath: string | null
+  scriptOk: boolean
+  cssPath: string | null
+  cssOk: boolean
+  loadingOrder: number
+  requires: string[]
+  missingRequiredDependencies: string[]
+  optional: string[]
+  minimumClientVersion: string | null
+  homePage: string | null
+  autoUpdate: boolean
+  generateInterceptor: string | null
+}
+
+export interface ExtensionCompatibilityReport {
+  generatedAt: string
+  totals: {
+    discovered: number
+    enabled: number
+    withErrors: number
+  }
+  extensions: ExtensionCompatibilityReportItem[]
+  runtimeCapabilities: ExtensionRuntimeCapability[]
 }
 
 function getDataDir(): string {
@@ -285,6 +332,44 @@ export async function saveExtensionSettings(settings: Record<string, unknown>): 
   return merged
 }
 
+export async function getExtensionCompatibilityReport(): Promise<ExtensionCompatibilityReport> {
+  const [locations, settings] = await Promise.all([
+    getExtensionLocations(),
+    readExtensionSettings(),
+  ])
+  const disabledExtensions = getDisabledExtensions(settings)
+
+  const seen = new Set<string>()
+  const uniqueLocations: ExtensionLocation[] = []
+  for (const location of locations) {
+    if (seen.has(location.name)) continue
+    seen.add(location.name)
+    uniqueLocations.push(location)
+  }
+
+  const manifestNameSet = new Set(uniqueLocations.map(location => location.name))
+  const extensions = await Promise.all(uniqueLocations.map(location =>
+    buildExtensionCompatibilityReportItem(location, disabledExtensions, manifestNameSet),
+  ))
+  const withErrors = extensions.filter(item =>
+    !item.manifestOk
+    || !item.scriptOk
+    || !item.cssOk
+    || item.missingRequiredDependencies.length > 0,
+  ).length
+
+  return {
+    generatedAt: new Date().toISOString(),
+    totals: {
+      discovered: extensions.length,
+      enabled: extensions.filter(item => item.enabled).length,
+      withErrors,
+    },
+    extensions,
+    runtimeCapabilities: getExtensionRuntimeCapabilities(),
+  }
+}
+
 export function getDefaultExtensionSettings(): Record<string, unknown> {
   return {
     apiUrl: 'http://localhost:5100',
@@ -349,6 +434,147 @@ export function getDefaultExtensionSettings(): Record<string, unknown> {
       sort: 'dateAsc',
     },
   }
+}
+
+async function buildExtensionCompatibilityReportItem(
+  location: ExtensionLocation,
+  disabledExtensions: Set<string>,
+  manifestNameSet: Set<string>,
+): Promise<ExtensionCompatibilityReportItem> {
+  let manifest: ExtensionManifest | null = null
+  let manifestError: string | undefined
+  try {
+    manifest = await readManifestFromLocation(location)
+  } catch (error) {
+    manifestError = error instanceof Error ? error.message : String(error)
+  }
+
+  const scriptPath = getManifestPathValue(manifest?.js)
+  const cssPath = getManifestPathValue(manifest?.css)
+  const requires = getManifestDependencies(manifest)
+  return {
+    type: location.type,
+    name: location.name,
+    displayName: String(manifest?.display_name ?? location.name),
+    version: String(manifest?.version ?? ''),
+    author: String(manifest?.author ?? ''),
+    enabled: !disabledExtensions.has(location.name),
+    manifestOk: manifest !== null,
+    ...(manifestError ? { manifestError } : {}),
+    scriptPath,
+    scriptOk: scriptPath === null ? true : await resourceExists(location, scriptPath),
+    cssPath,
+    cssOk: cssPath === null ? true : await resourceExists(location, cssPath),
+    loadingOrder: getManifestLoadingOrder(manifest),
+    requires,
+    missingRequiredDependencies: requires.filter(dependency => !hasManifestDependency(manifestNameSet, dependency)),
+    optional: getStringArray(manifest?.optional),
+    minimumClientVersion: typeof manifest?.minimum_client_version === 'string' ? manifest.minimum_client_version : null,
+    homePage: typeof manifest?.homePage === 'string' ? manifest.homePage : null,
+    autoUpdate: manifest?.auto_update === true,
+    generateInterceptor: typeof manifest?.generate_interceptor === 'string' ? manifest.generate_interceptor : null,
+  }
+}
+
+async function readManifestFromLocation(location: ExtensionLocation): Promise<ExtensionManifest> {
+  const manifestPath = validatePathInBase(path.join(location.dir, 'manifest.json'), location.dir)
+  const raw = await fs.readFile(manifestPath, 'utf8')
+  const parsed = JSON.parse(raw) as unknown
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw createError(ErrorCode.VALIDATION_ERROR, 'Extension manifest must be a JSON object')
+  }
+  return parsed as ExtensionManifest
+}
+
+async function resourceExists(location: ExtensionLocation, resourcePath: string): Promise<boolean> {
+  try {
+    const safePath = assertSafeRelativePath(resourcePath)
+    const filePath = validatePathInBase(path.join(location.dir, safePath), location.dir)
+    await fs.access(filePath)
+    return true
+  } catch {
+    return false
+  }
+}
+
+function getDisabledExtensions(settings: Record<string, unknown>): Set<string> {
+  const disabled = settings.disabledExtensions
+  return new Set(Array.isArray(disabled) ? disabled.filter((value): value is string => typeof value === 'string') : [])
+}
+
+function getManifestPathValue(value: unknown): string | null {
+  const text = typeof value === 'string' ? value.trim() : ''
+  return text ? text : null
+}
+
+function getManifestLoadingOrder(manifest: ExtensionManifest | null): number {
+  const order = Number(manifest?.loading_order)
+  return Number.isFinite(order) ? order : 0
+}
+
+function getStringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === 'string' && entry.trim() !== '') : []
+}
+
+function getManifestDependencies(manifest: ExtensionManifest | null): string[] {
+  return [...new Set([
+    ...getStringArray(manifest?.requires),
+    ...getStringArray(manifest?.dependencies),
+  ])]
+}
+
+function hasManifestDependency(manifestNameSet: Set<string>, dependency: string): boolean {
+  return manifestNameSet.has(dependency) || manifestNameSet.has(`third-party/${dependency}`)
+}
+
+function getExtensionRuntimeCapabilities(): ExtensionRuntimeCapability[] {
+  return [
+    {
+      id: 'resource-loading',
+      status: 'supported',
+      note: 'Discovers local/global/system extensions and serves manifests, scripts, styles, chunks, workers, templates, locales, and ST root script shims.',
+    },
+    {
+      id: 'settings',
+      status: 'supported',
+      note: 'Persists extension settings while preserving unknown plugin keys.',
+    },
+    {
+      id: 'st-public-shims',
+      status: 'partial',
+      note: 'Provides common SillyTavern public module exports, globals, events, slash commands, macros, chat-completion source constants, ChatCompletionService bridge, jQuery, lodash, toastr, YAML, and a permissive z facade.',
+    },
+    {
+      id: 'dom-anchors',
+      status: 'partial',
+      note: 'Provides stable extension settings anchors plus offscreen mirrors for common chat, send-form, quick-reply, and worldbook DOM selectors without replacing the native React UI.',
+    },
+    {
+      id: 'metadata-persistence',
+      status: 'partial',
+      note: 'Active chat metadata can write through CraftTalker chat persistence; message-variable and broader ST field writes still need typed bridges.',
+    },
+    {
+      id: 'worldbook-api',
+      status: 'partial',
+      note: 'Worldbook names, global selections, and entries are available through read-only CraftTalker world-service bridges; plugin write operations remain blocked or stubbed.',
+    },
+    {
+      id: 'generation-api',
+      status: 'partial',
+      note: 'ST host chat-completions status/generate endpoints proxy direct provider calls through CraftTalker provider rules across common OpenAI-compatible, Claude, Gemini, and custom sources; TavernHelper generate/generateRaw can run governed background requests with explicit custom_api/oai_settings, streaming token events, and AbortController cancellation without writing chats, runs, or plugin state.',
+    },
+    {
+      id: 'extension-management',
+      status: 'blocked',
+      note: 'Install, update, delete, move, branch switching, and version checks remain disabled server-side.',
+    },
+    {
+      id: 'unsafe-script-runtime',
+      status: 'blocked',
+      note: 'Arbitrary TaskJS/system-level script execution is not exposed without a trust, permission, and journal boundary.',
+    },
+  ]
 }
 
 function getContentType(filePath: string): string {

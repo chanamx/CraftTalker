@@ -157,6 +157,44 @@ export async function updateChatMetadata(
   return updateChatMetadataLine(filePath, { chat_metadata: chatMetadata })
 }
 
+export interface MessageVariableUpdate {
+  lineIndex: number
+  variables?: unknown
+  variables_initialized?: unknown
+}
+
+export async function updateMessageVariables(
+  characterName: string,
+  chatId: string,
+  updates: MessageVariableUpdate[],
+): Promise<number> {
+  const filePath = getChatPath(characterName, chatId)
+  const lines = await readChatFile(filePath)
+  if (lines.length === 0) return 0
+
+  let updated = 0
+  for (const update of updates) {
+    const hasVariables = Object.hasOwn(update, 'variables')
+    const hasInitialized = Object.hasOwn(update, 'variables_initialized')
+    if (!hasVariables && !hasInitialized) continue
+
+    const line = lines[update.lineIndex]
+    if (!line || !('mes' in line)) continue
+    if (hasVariables) {
+      line.variables = update.variables
+    }
+    if (hasInitialized) {
+      line.variables_initialized = update.variables_initialized
+    }
+    updated += 1
+  }
+
+  if (updated > 0) {
+    await writeChatFile(filePath, lines)
+  }
+  return updated
+}
+
 export async function addSwipe(characterName: string, chatId: string, lineIndex: number, content: string): Promise<ChatLine | null> {
   const filePath = getChatPath(characterName, chatId)
   const lines = await readChatFile(filePath)

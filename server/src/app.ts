@@ -10,6 +10,8 @@ import { runsRoute } from './routes/runs.js'
 import { llmSessionsRoute } from './routes/llm-sessions.js'
 import { llmRoutes } from './routes/llm.routes.js'
 import { extensionsRoute } from './routes/extensions.js'
+import { stBackendsRoute } from './routes/st-backends.js'
+import { stWorldInfoRoute } from './routes/st-worldinfo.js'
 import { appErrorHandler } from './middleware/errorHandler.js'
 import { applyCsrf } from './middleware/csrf.js'
 import { corsOrigin } from './config/origins.js'
@@ -133,6 +135,8 @@ export function createApp() {
     return c.body(resource.body)
   })
 
+  app.route('/api', stWorldInfoRoute)
+
   // CSRF protection applies to this routed API app in production.
   const protectedApp = new Hono()
   applyCsrf(protectedApp)
@@ -145,6 +149,7 @@ export function createApp() {
   protectedApp.route('/api/llm-sessions', llmSessionsRoute)
   protectedApp.route('/api/llm', llmRoutes)
   protectedApp.route('/api/extensions', extensionsRoute)
+  protectedApp.route('/api/backends', stBackendsRoute)
 
   app.route('/', protectedApp)
 
