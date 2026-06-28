@@ -44,6 +44,7 @@ server/data/worlds/
 server/data/presets/
 server/data/extensions/
 server/data/backups/
+server/data/user/
 
 # Preserve directory structure with .gitkeep
 !server/data/.gitkeep
@@ -58,3 +59,6 @@ illytavern
 # OS generated files
 Desktop.ini
 ehthumbs.db
+
+# Test/debug screenshots
+.browser-st-*.png
