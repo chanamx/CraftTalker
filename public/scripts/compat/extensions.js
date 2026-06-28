@@ -14,6 +14,8 @@ export const ModuleWorkerWrapper = host.ModuleWorkerWrapper
 export const renderExtensionTemplate = host.renderExtensionTemplate
 export const renderExtensionTemplateAsync = host.renderExtensionTemplateAsync
 export const saveMetadataDebounced = host.saveMetadataDebounced
+export const writeExtensionField = host.writeExtensionField
+export const writeExtensionFieldBulk = host.writeExtensionFieldBulk
 export const TavernHelper = host.TavernHelper
 export const builtin = host.builtin
 export const registerMacroLike = host.registerMacroLike
@@ -36,8 +38,6 @@ export async function doExtrasFetch(endpoint, args = {}) {
 
 export function cancelDebouncedMetadataSave() {}
 export function openThirdPartyExtensionMenu() {}
-export function writeExtensionField() {}
-export function writeExtensionFieldBulk() {}
 export function loadExtensionSettings(settings = {}) {
   Object.assign(extension_settings, settings.extension_settings ?? settings)
   return Promise.resolve()
@@ -61,6 +61,8 @@ export default {
   renderExtensionTemplate,
   renderExtensionTemplateAsync,
   saveMetadataDebounced,
+  writeExtensionField,
+  writeExtensionFieldBulk,
   TavernHelper,
   builtin,
   registerMacroLike,

@@ -1,5 +1,77 @@
 import { getHost } from './host.js'
 export { callPopup, callGenericPopup, POPUP_RESULT, POPUP_TYPE, Popup } from './popup.js'
+import { user_avatar as persona_user_avatar } from './personas.js'
+export { getUserAvatars, setUserAvatar, user_avatar } from './personas.js'
+export {
+  promptManager,
+  setOpenAIMessageExamples,
+  setOpenAIMessages,
+  prepareOpenAIMessages,
+  ChatCompletion,
+  Message,
+  MessageCollection,
+  isImageInliningSupported,
+  oai_settings,
+  setupChatCompletionPromptManager,
+  proxies,
+  getChatCompletionModel,
+  getStreamingReply,
+  sendOpenAIRequest,
+  tryParseStreamingError,
+  openai_max_stop_strings,
+  createGenerationParameters,
+} from './openai.js'
+export {
+  parseRegexFromString,
+  getWorldInfoPrompt,
+  wi_anchor_position,
+  world_info_include_names,
+  saveWorldInfo,
+  world_names,
+  convertCharacterBook,
+  createNewWorldInfo,
+  deleteWorldInfo,
+  getWorldInfoSettings,
+  METADATA_KEY,
+  selected_world_info,
+  setWorldInfoButtonClass,
+  world_info,
+  loadWorldInfo,
+  DEFAULT_DEPTH,
+  DEFAULT_WEIGHT,
+  newWorldInfoEntryTemplate,
+  world_info_logic,
+  world_info_position,
+} from './world-info.js'
+export {
+  uuidv4,
+  delay,
+  Stopwatch,
+  getBase64Async,
+  isDataURL,
+  ensureImageFormatSupported,
+  getCharaFilename,
+  getSanitizedFilename,
+  getStringHash,
+  getImageSizeFromDataURL,
+  download,
+  copyText,
+  saveBase64AsFile,
+  showFontAwesomePicker,
+} from './utils.js'
+export { v1CharData, RegexScriptData } from './char-data.js'
+export { favsToHotswap, isMobile } from './RossAscends-mods.js'
+export { isAdmin } from './user.js'
+export { metadata_keys, NOTE_MODULE_NAME, shouldWIAddPrompt } from './authors-note.js'
+export { getRegexedString, regex_placement } from './extensions/regex/engine.js'
+export { persona_description_positions, power_user, flushEphemeralStoppingStrings, getCustomStoppingStrings } from './power-user.js'
+export { getEventSourceStream } from './sse-stream.js'
+export { executeSlashCommandsWithOptions } from './slash-commands.js'
+export { getTokenCountAsync } from './tokenizers.js'
+export { getPresetManager } from './preset-manager.js'
+export { MacrosParser, getLastMessageId } from './macros.js'
+export { commonEnumProviders, enumIcons } from './slash-commands/SlashCommandCommonEnumsProvider.js'
+export { enumTypes } from './slash-commands/SlashCommandEnumValue.js'
 
 const host = getHost()
 
@@ -30,6 +102,7 @@ export const extension_prompt_roles = {
   USER: 1,
   ASSISTANT: 2,
 }
+export const GenerateOptions = Object.freeze({})
 
 export let this_chid = -1
 export let name1 = 'You'
@@ -37,11 +110,12 @@ export let name2 = ''
 export let online_status = 'no_connection'
 export let main_api = 'crafttalker'
 export let max_context = 0
-export let user_avatar = 'user.png'
 export let system_avatar = 'system.png'
 export let default_avatar = 'img/ai4.png'
-export let default_user_avatar = 'img/user-default.png'
+export let default_user_avatar = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII='
 export let is_send_press = false
+export const depth_prompt_depth_default = 4
+export const depth_prompt_role_default = 'system'
 export const MAX_INJECTION_DEPTH = 1000
 export const nai_settings = {
   model_novel: '',
@@ -57,8 +131,26 @@ function refreshContextExports() {
 }
 
 refreshContextExports()
-host.eventSource.on(host.event_types.CHAT_CHANGED, refreshContextExports)
-host.eventSource.on(host.event_types.APP_READY, refreshContextExports)
+for (const eventName of new Set([
+  host.event_types.CHAT_CHANGED,
+  host.event_types.CHAT_LOADED,
+  host.event_types.APP_READY,
+  host.event_types.CHARACTER_PAGE_LOADED,
+  host.event_types.CHARACTER_EDITED,
+].filter(Boolean))) {
+  host.eventSource.on(eventName, refreshContextExports)
+}
+installContextRefreshHooks()
+
+function installContextRefreshHooks() {
+  const documentEvents = ['pointerdown', 'click', 'focusin']
+  if (globalThis.document?.addEventListener) {
+    for (const eventName of documentEvents) {
+      document.addEventListener(eventName, refreshContextExports, true)
+    }
+  }
+  globalThis.window?.addEventListener?.('focus', refreshContextExports)
+}
 
 export function substituteParams(value) {
   return host.replaceVariableMacros(value)
@@ -66,6 +158,21 @@ export function substituteParams(value) {
 
 export function substituteParamsExtended(value) {
   return host.replaceVariableMacros(value)
+}
+
+export function parseMesExamples(examplesStr, isInstruct = false) {
+  let text = String(examplesStr ?? '').trim()
+  if (!text || text === '<START>') return []
+  if (!/^<START>/i.test(text)) text = `<START>\n${text}`
+
+  const context = host.getContext?.() ?? {}
+  const separator = String(context.example_separator ?? context.power_user?.context?.example_separator ?? '').trim()
+  const blockHeading = isInstruct ? '<START>\n' : (separator ? `${host.replaceVariableMacros?.(separator) ?? separator}\n` : '')
+  return text
+    .split(/<START>/gi)
+    .slice(1)
+    .map(block => `${blockHeading}${block.trim()}\n`)
+    .filter(block => block.trim())
 }
 
 export function messageFormatting(...args) {
@@ -80,7 +187,54 @@ export function getCurrentChatId() {
   return host.getContext().getCurrentChatId?.() ?? host.getContext().chatId ?? null
 }
 
-export function reloadCurrentChat() {}
+export function setCharacterId(value) {
+  if (typeof value === 'bigint' || typeof value === 'number') {
+    this_chid = Number(value)
+    return
+  }
+  if (typeof value === 'string') {
+    const numeric = Number(value)
+    this_chid = Number.isInteger(numeric) ? numeric : -1
+    return
+  }
+  if (value && typeof value === 'object') {
+    const index = characters.indexOf(value)
+    this_chid = index >= 0 ? index : -1
+    return
+  }
+  this_chid = -1
+}
+
+export function setCharacterName(value) {
+  name2 = String(value ?? '')
+}
+
+export async function select_selected_character(chid = this_chid) {
+  setCharacterId(chid)
+  const character = characters[Number(this_chid)]
+  setCharacterName(character?.name ?? '')
+  if (character && typeof host.updateContext === 'function') {
+    host.updateContext({ activeCharacter: character })
+  }
+  await host.eventSource?.emit?.(host.event_types.CHARACTER_PAGE_LOADED, {
+    id: this_chid,
+    character,
+  })
+  return Boolean(character)
+}
+
+function callHostOrContextFunction(name, ...args) {
+  const direct = host?.[name]
+  if (typeof direct === 'function') return direct(...args)
+  const context = typeof host?.getContext === 'function' ? host.getContext() : null
+  const fromContext = context?.[name]
+  if (typeof fromContext === 'function') return fromContext(...args)
+  return undefined
+}
+
+export function reloadCurrentChat(...args) {
+  return callHostOrContextFunction('reloadCurrentChat', ...args)
+}
 export function saveChatConditional() {
   return host.saveChatConditional()
 }
@@ -90,13 +244,21 @@ export function saveMetadata() {
 export function saveMetadataDebounced() {
   return host.saveMetadataDebounced()
 }
-export function sendSystemMessage() {}
+export function sendSystemMessage(...args) {
+  return callHostOrContextFunction('sendSystemMessage', ...args)
+}
 export function stopGeneration() {
   host.eventSource.emit(host.event_types.GENERATION_STOPPED)
 }
-export function activateSendButtons() {}
-export function deactivateSendButtons() {}
-export function updateChatMetadata() {}
+export function activateSendButtons(...args) {
+  return callHostOrContextFunction('activateSendButtons', ...args)
+}
+export function deactivateSendButtons(...args) {
+  return callHostOrContextFunction('deactivateSendButtons', ...args)
+}
+export function updateChatMetadata(...args) {
+  return callHostOrContextFunction('updateChatMetadata', ...args)
+}
 export function updateMessageBlock(...args) {
   return host.updateMessageBlock(...args)
 }
@@ -117,29 +279,75 @@ export function deleteMessage() {}
 export function addOneMessage(...args) {
   return host.addOneMessage(...args)
 }
-export function getPastCharacterChats() {
-  return Promise.resolve([])
+export async function getPastCharacterChats(index = this_chid) {
+  const character = host.characters?.[Number(index)]
+  const characterName = String(character?.file_name ?? character?.name ?? '')
+  if (!characterName) return []
+
+  try {
+    const response = await fetch(`/api/chats/${encodeURIComponent(characterName)}`, {
+      method: 'GET',
+      headers: host.getRequestHeaders?.({ omitContentType: true }) ?? {},
+    })
+    if (!response.ok) return []
+
+    const chats = await response.json()
+    if (!Array.isArray(chats)) return []
+    return chats.map(chatInfo => {
+      const fileId = String(chatInfo?.file_id ?? '').trim()
+      const fileName = fileId ? `${fileId}.jsonl` : String(chatInfo?.file_name ?? '')
+      return {
+        ...chatInfo,
+        file_name: fileName,
+        display_name: chatInfo?.file_name,
+        ch_name: characterName,
+        character_name: characterName,
+        avatar_url: String(character?.avatar ?? ''),
+      }
+    })
+  } catch {
+    return []
+  }
 }
-export function showSwipeButtons() {}
-export function saveCharacterDebounced() {}
+export function showSwipeButtons(...args) {
+  return callHostOrContextFunction('showSwipeButtons', ...args)
+}
+export function saveCharacterDebounced(...args) {
+  return callHostOrContextFunction('saveCharacterDebounced', ...args)
+}
 export function getOneCharacter(id) {
-  return host.characters[Number(id)] ?? null
+  if (typeof host.getOneCharacter === 'function') {
+    return host.getOneCharacter(id)
+  }
+  return resolveCompatCharacter(id)
 }
 export function selectCharacterById() {
   return Promise.resolve(false)
 }
-export function printCharacters() {}
+export function printCharacters(...args) {
+  return callHostOrContextFunction('printCharacters', ...args)
+}
 export function unshallowCharacter(character) {
-  return Promise.resolve(character)
+  if (typeof host.unshallowCharacter === 'function') {
+    return host.unshallowCharacter(character)
+  }
+  return Promise.resolve(resolveCompatCharacter(character) ?? character)
 }
 export function deleteCharacter() {
   return Promise.resolve(false)
 }
 export function getCharacters() {
+  if (typeof host.getCharacters === 'function') {
+    return host.getCharacters()
+  }
   return Promise.resolve(host.characters)
 }
-export function scrollChatToBottom() {}
-export function setGenerationProgress() {}
+export function scrollChatToBottom(...args) {
+  return callHostOrContextFunction('scrollChatToBottom', ...args)
+}
+export function setGenerationProgress(...args) {
+  return callHostOrContextFunction('setGenerationProgress', ...args)
+}
 export function baseChatReplace(value) {
   return value
 }
@@ -174,11 +382,87 @@ export function Generate() {
 export function processCommands(command) {
   return host.executeSlashCommands(String(command ?? ''))
 }
+function getUserAvatarUrl(file = persona_user_avatar) {
+  const value = String(file ?? '').trim()
+  return value ? `/User%20Avatars/${encodeURIComponent(value)}` : ''
+}
+
 export function getThumbnailUrl(type, file) {
+  if (type === 'persona') return getUserAvatarUrl(file)
+  if (type === 'avatar') {
+    const value = getAvatarThumbnailFile(file)
+    return value ? `/thumbnail?type=avatar&file=${encodeURIComponent(value)}` : ''
+  }
   return file ? String(file) : ''
 }
-export function getUserAvatar(file = user_avatar) {
-  return getThumbnailUrl('avatar', file)
+
+function getAvatarThumbnailFile(file) {
+  const value = String(file ?? '').trim()
+  if (!value) return ''
+
+  const url = toUrl(value)
+  if (url) {
+    const queryFile = url.searchParams.get('file')
+    if (queryFile) return queryFile
+
+    const apiMatch = url.pathname.match(/^\/api\/characters\/([^/]+)\/avatar$/)
+    if (apiMatch?.[1]) return `${safeDecode(apiMatch[1])}.png`
+
+    const legacyMatch = url.pathname.match(/^\/characters\/([^/]+)$/)
+    if (legacyMatch?.[1]) return safeDecode(legacyMatch[1])
+
+    const pathBase = url.pathname.split('/').filter(Boolean).pop()
+    if (pathBase) return safeDecode(pathBase)
+  }
+
+  return value.split(/[\\/]/).pop()?.split('?')[0]?.split('#')[0] ?? value
+}
+
+function toUrl(value) {
+  try {
+    return new URL(value, globalThis.location?.origin ?? 'http://localhost')
+  } catch {
+    return null
+  }
+}
+
+function resolveCompatCharacter(id) {
+  if (id === undefined || id === null || id === 'current') {
+    const current = Number(host.getContext?.().this_chid ?? host.getContext?.().characterId ?? -1)
+    return host.characters?.[current] ?? null
+  }
+
+  const numeric = Number(id)
+  if (Number.isInteger(numeric) && numeric >= 0) {
+    return host.characters?.[numeric] ?? null
+  }
+
+  const target = normalizeCharacterLookup(id)
+  if (!target) return null
+  return host.characters?.find(character => {
+    const name = String(character?.name ?? '').toLowerCase()
+    const fileName = String(character?.file_name ?? '').toLowerCase()
+    const avatar = String(character?.avatar ?? '').toLowerCase()
+    return target === name || target === fileName || target === avatar || target === `${fileName}.png`.toLowerCase()
+  }) ?? null
+}
+
+function normalizeCharacterLookup(value) {
+  const text = String(value ?? '').trim()
+  if (!text) return ''
+  const avatar = getAvatarThumbnailFile(text)
+  return String(avatar || text).replace(/\.(?:png|jpe?g|webp|gif)$/i, '').toLowerCase()
+}
+
+function safeDecode(value) {
+  try {
+    return decodeURIComponent(value)
+  } catch {
+    return value
+  }
+}
+export function getUserAvatar(file = persona_user_avatar) {
+  return getUserAvatarUrl(file)
 }
 export function getRequestHeadersForCompat() {
   return host.getRequestHeaders()

@@ -49,9 +49,48 @@ export function getGroupCharacterCardsLazy() {
 export function getGroupDepthPrompts() {
   return []
 }
+export function getGroupMembers() {
+  return []
+}
+export function getGroupNames(groupId = selected_group) {
+  const host = globalThis.CraftTalker?.stHost ?? globalThis.SillyTavern
+  let context = {}
+  try {
+    context = typeof host?.getContext === 'function' ? host.getContext() : {}
+  } catch {
+    context = {}
+  }
+
+  const selectedGroup = groupId ?? context.selected_group ?? context.groupId
+  if (!selectedGroup) return []
+
+  const sourceGroups = groups.length
+    ? groups
+    : Array.isArray(host?.groups)
+      ? host.groups
+      : Array.isArray(context.groups)
+        ? context.groups
+        : []
+  const sourceCharacters = Array.isArray(host?.characters)
+    ? host.characters
+    : Array.isArray(context.characters)
+      ? context.characters
+      : []
+  const group = sourceGroups.find(item => item?.id == selectedGroup)
+  const members = Array.isArray(group?.members) ? group.members : []
+
+  return members
+    .map(member => {
+      if (member && typeof member === 'object') return member.name
+      return sourceCharacters.find(character => character?.avatar === member)?.name ?? member
+    })
+    .filter(name => typeof name === 'string' && name.trim())
+}
 
 export default {
   groups,
   selected_group,
   getGroups,
+  getGroupMembers,
+  getGroupNames,
 }

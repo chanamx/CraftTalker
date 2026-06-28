@@ -4,6 +4,26 @@ export class v1CharData {
   }
 }
 
+export class RegexScriptData {
+  constructor(data = {}) {
+    Object.assign(this, {
+      id: globalThis.crypto?.randomUUID?.() ?? String(Date.now()),
+      scriptName: '',
+      findRegex: '',
+      replaceString: '',
+      trimStrings: [],
+      placement: [],
+      disabled: false,
+      markdownOnly: false,
+      promptOnly: false,
+      runOnEdit: false,
+      substituteRegex: 0,
+      minDepth: null,
+      maxDepth: null,
+    }, data)
+  }
+}
+
 export const defaultCharacterData = {
   name: '',
   description: '',
@@ -19,5 +39,6 @@ export const defaultCharacterData = {
 
 export default {
   v1CharData,
+  RegexScriptData,
   defaultCharacterData,
 }

@@ -30,11 +30,12 @@ export const world_info_logic = {
 export const world_info_position = {
   before: 0,
   after: 1,
-  atDepth: 2,
-  ANTop: 3,
-  ANBottom: 4,
+  ANTop: 2,
+  ANBottom: 3,
+  atDepth: 4,
   EMTop: 5,
   EMBottom: 6,
+  outlet: 7,
 }
 export const wi_anchor_position = {
   before: 0,
@@ -101,6 +102,19 @@ export async function getWorldInfoPrompt(chat = [], maxContext, isDryRun = false
     )
     console.warn('[ST Compat] Failed to scan world info prompt', error)
     return emptyWorldInfoPromptResult()
+  }
+}
+
+export async function checkWorldInfo(chat = [], maxContext, isDryRun = false, globalScanData = {}) {
+  const result = await getWorldInfoPrompt(chat, maxContext, isDryRun, globalScanData)
+  return {
+    ...result,
+    allActivatedEntries: result.allActivatedEntries ?? result.matchedEntries ?? [],
+    EMEntries: result.EMEntries ?? result.worldInfoExamples ?? [],
+    WIDepthEntries: result.WIDepthEntries ?? result.worldInfoDepth ?? [],
+    ANBeforeEntries: result.ANBeforeEntries ?? result.anBefore ?? [],
+    ANAfterEntries: result.ANAfterEntries ?? result.anAfter ?? [],
+    outletEntries: result.outletEntries ?? {},
   }
 }
 
@@ -226,6 +240,10 @@ export function deleteWorldInfo() {
   return Promise.resolve(blockWorldInfoWrite('deleteWorldInfo', false))
 }
 
+export function charUpdatePrimaryWorld() {
+  return Promise.resolve(blockWorldInfoWrite('charUpdatePrimaryWorld', false))
+}
+
 export const originalWIDataKeyMap = new Map()
 
 export function setWIOriginalDataValue(entry, key, value) {
@@ -261,7 +279,9 @@ export default {
   saveWorldInfo,
   updateWorldInfoList,
   getWorldInfoPrompt,
+  checkWorldInfo,
   getWorldInfoSettings,
+  charUpdatePrimaryWorld,
   reloadEditor,
   convertCharacterBook,
 }
