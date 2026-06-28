@@ -41,7 +41,17 @@ function DialogRouteFallback() {
   )
 }
 
-createRoot(document.getElementById('root')!).render(
+const rootElement = document.getElementById('root') as (HTMLElement & {
+  __crafttalkerReactRoot?: ReturnType<typeof createRoot>
+}) | null
+
+if (!rootElement) {
+  throw new Error('CraftTalker root element was not found.')
+}
+
+const root = rootElement.__crafttalkerReactRoot ??= createRoot(rootElement)
+
+root.render(
   <StrictMode>
     <BrowserRouter>
       <QueryClientProvider client={queryClient}>

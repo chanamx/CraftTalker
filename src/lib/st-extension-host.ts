@@ -1,4 +1,4 @@
-import { api, type ChatLine, type ExtensionDiscovery, type ExtensionManifest, type ExtensionSettings, type StWorldInfoSettings, type WorldBook } from '@/lib/api'
+import { api, type CharacterDetail, type CharacterIndex, type ChatLine, type ExtensionDiscovery, type ExtensionManifest, type ExtensionSettings, type StWorldInfoSettings, type WorldBook } from '@/lib/api'
 import { ensureStCompatDomAnchors, syncStCompatDomState, syncStCompatWorldSelects } from '@/lib/st-compat-dom'
 import type { Character, ChatMessage } from '@/types'
 import * as Popper from '@popperjs/core'
@@ -82,6 +82,7 @@ type CompatChatMessage = ChatLine & {
   _hadVariables?: boolean
   _hadVariablesInitialized?: boolean
 }
+type CompatCharacter = Character & Record<string, unknown>
 export type CompatDiagnosticStatus = 'supported' | 'partial' | 'stub' | 'blocked'
 export type CompatDiagnosticEntry = {
   id: string
@@ -162,6 +163,12 @@ interface StHostApi {
   executeSlashCommandsWithOptions: typeof executeSlashCommandsWithOptions
   renderExtensionTemplate: typeof renderExtensionTemplate
   renderExtensionTemplateAsync: typeof renderExtensionTemplateAsync
+  getCharacter: typeof getCharacter
+  getCharacters: typeof getCharacters
+  getOneCharacter: typeof getOneCharacter
+  unshallowCharacter: typeof unshallowCharacter
+  writeExtensionField: typeof writeExtensionField
+  writeExtensionFieldBulk: typeof writeExtensionFieldBulk
   updateMessageBlock: typeof updateMessageBlock
   printMessages: typeof printMessages
   clearChat: typeof clearChat
@@ -217,6 +224,9 @@ declare global {
     saveSettingsDebounced?: typeof saveSettingsDebounced
     saveChatConditional?: typeof saveChatConditional
     saveChatConditionalDebounced?: typeof saveChatConditionalDebounced
+    getCharacters?: typeof getCharacters
+    getOneCharacter?: typeof getOneCharacter
+    unshallowCharacter?: typeof unshallowCharacter
     executeSlashCommands?: typeof executeSlashCommands
     executeSlashCommandsWithOptions?: typeof executeSlashCommandsWithOptions
     messageFormatting?: typeof messageFormatting
@@ -663,6 +673,10 @@ export async function executeSlashCommandsWithOptions(input: unknown = '', optio
   }
 }
 
+function executeSlashCommandsWithResultObject(input: unknown = '', options: Record<string, unknown> = {}): Promise<unknown> {
+  return executeSlashCommandsWithOptions(input, { ...options, returnResultObject: true })
+}
+
 export function getGlobalVariable(name: unknown): unknown {
   return getVariableValue({ type: 'global' }, name)
 }
@@ -902,6 +916,7 @@ export function getContext(): Record<string, unknown> {
     saveChatConditionalDebounced,
     saveMetadataDebounced,
     eventSource,
+    event_types,
     eventTypes: event_types,
     extensionSettings: extension_settings,
     extension_settings,
@@ -916,7 +931,8 @@ export function getContext(): Record<string, unknown> {
     },
     world_info,
     world_info_settings,
-    writeExtensionField: () => recordCompatDiagnostic('writeExtensionField', 'stub', 'Extension field writes require a typed permissioned persistence bridge.'),
+    world_names,
+    selected_world_info,
     setExtensionPrompt,
     getExtensionPromptByName,
     saveChat: saveChatConditional,
@@ -940,7 +956,7 @@ export function getContext(): Record<string, unknown> {
     SlashCommandEnumValue,
     ARGUMENT_TYPE,
     executeSlashCommands,
-    executeSlashCommandsWithOptions,
+    executeSlashCommandsWithOptions: executeSlashCommandsWithResultObject,
     registerSlashCommand,
     registerMacro,
     unregisterMacro,
@@ -952,6 +968,12 @@ export function getContext(): Record<string, unknown> {
     STscript,
     renderExtensionTemplate,
     renderExtensionTemplateAsync,
+    getCharacter,
+    getCharacters,
+    getOneCharacter,
+    unshallowCharacter,
+    writeExtensionField,
+    writeExtensionFieldBulk,
     mainApi: 'crafttalker',
     ModuleWorkerWrapper: SimpleMutex,
     shouldSendOnEnter: () => true,
@@ -1023,6 +1045,126 @@ export async function loadWorldInfo(name: string): Promise<WorldBook | null> {
     console.warn('[ST Compat] Failed to load world info', worldName, error)
     return null
   }
+}
+
+export function getCharacter(idOrName: unknown = 'current'): Record<string, unknown> | null {
+  const index = resolveCharacterIndex(idOrName)
+  return index >= 0 ? characters[index] ?? null : null
+}
+
+export async function getCharacters(): Promise<Array<Record<string, unknown>>> {
+  try {
+    const snapshot = await api.characters.list()
+    applyCharacterListSnapshot(snapshot)
+    recordCompatDiagnostic('getCharacters', 'partial', 'Refreshed the ST compatibility character mirror from CraftTalker character storage.')
+  } catch (error) {
+    recordCompatDiagnostic('getCharacters', 'stub', 'Character list refresh failed; returning the existing in-memory ST compatibility mirror.')
+    console.warn('[ST Compat] Failed to refresh character list', error)
+  }
+  return characters
+}
+
+export async function getOneCharacter(idOrName: unknown = 'current'): Promise<Record<string, unknown> | null> {
+  const resolvedName = resolveCharacterFileName(idOrName)
+  if (!resolvedName) {
+    recordCompatDiagnostic('getOneCharacter', 'stub', 'Could not resolve a CraftTalker character file name for the requested ST character lookup.')
+    return getCharacter(idOrName)
+  }
+
+  try {
+    const detail = await api.characters.get(resolvedName)
+    const index = upsertCharacterSnapshot(detail)
+    recordCompatDiagnostic('getOneCharacter', 'partial', 'Refreshed one ST compatibility character mirror entry from CraftTalker character storage.')
+    return index >= 0 ? characters[index] ?? null : null
+  } catch (error) {
+    recordCompatDiagnostic('getOneCharacter', 'stub', `Character "${resolvedName}" could not be refreshed through CraftTalker character storage.`)
+    console.warn('[ST Compat] Failed to refresh character', resolvedName, error)
+    return getCharacter(idOrName)
+  }
+}
+
+export async function unshallowCharacter(idOrName: unknown = currentCharacterIndex): Promise<Record<string, unknown> | null> {
+  const character = getCharacter(idOrName)
+  if (!character) {
+    recordCompatDiagnostic('unshallowCharacter', 'stub', 'Ignored ST unshallow request because the character could not be resolved.')
+    return null
+  }
+  if (character.shallow !== true) return character
+  return getOneCharacter(character.avatar ?? idOrName)
+}
+
+export async function writeExtensionField(
+  characterIdOrField: unknown,
+  fieldOrValue?: unknown,
+  value?: unknown,
+  _affectMemory = true,
+): Promise<boolean> {
+  const twoArgumentForm = arguments.length <= 2
+  const characterIndex = twoArgumentForm ? currentCharacterIndex : resolveCharacterIndex(characterIdOrField)
+  const field = twoArgumentForm ? characterIdOrField : fieldOrValue
+  const segments = parseExtensionFieldPath(field)
+  if (characterIndex < 0 || !characters[characterIndex] || !segments.length) {
+    recordCompatDiagnostic('writeExtensionField', 'stub', 'Ignored extension field write because the character id or field path was invalid.')
+    return false
+  }
+
+  const compatCharacter = characters[characterIndex]
+  const data = ensureRecord(compatCharacter, 'data')
+  const extensions = ensureRecord(data, 'extensions')
+  compatCharacter.extensions = extensions
+
+  const nextValue = twoArgumentForm ? fieldOrValue : value
+  if (nextValue === undefined) {
+    lodash.unset(extensions, segments)
+  } else {
+    lodash.set(extensions, segments, cloneCompatValue(nextValue))
+  }
+
+  syncCharacterJsonData(compatCharacter, extensions)
+  syncSourceCharacterExtensions(characterIndex, extensions)
+
+  const characterName = getPersistableCharacterName(compatCharacter)
+  if (!characterName) {
+    recordCompatDiagnostic('writeExtensionField', 'stub', 'Updated the in-memory extension field but could not resolve a CraftTalker character file name for persistence.')
+    return false
+  }
+
+  try {
+    const saved = await api.characters.update(characterName, {
+      extensions: cloneCompatRecord(extensions),
+    })
+    mergeSavedCharacter(characterIndex, saved as unknown as Character & Record<string, unknown>)
+    recordCompatDiagnostic('writeExtensionField', 'partial', 'Persisted a constrained character data.extensions field through CraftTalker character storage.')
+    return true
+  } catch (error) {
+    recordCompatDiagnostic('writeExtensionField', 'stub', 'Character extension field persistence failed; the in-memory ST compatibility mirror was updated only.')
+    console.error('[ST Compat] Failed to persist character extension field', error)
+    return false
+  }
+}
+
+export async function writeExtensionFieldBulk(
+  characterId: unknown,
+  fields: Record<string, unknown> | Array<{ key?: unknown, field?: unknown, value?: unknown }>,
+): Promise<boolean> {
+  if (Array.isArray(fields)) {
+    const results: boolean[] = []
+    for (const entry of fields) {
+      results.push(await writeExtensionField(characterId, entry.key ?? entry.field, entry.value))
+    }
+    return results.every(Boolean)
+  }
+
+  if (!fields || typeof fields !== 'object') {
+    recordCompatDiagnostic('writeExtensionFieldBulk', 'stub', 'Ignored bulk extension field write because the field map was invalid.')
+    return false
+  }
+
+  const results: boolean[] = []
+  for (const [field, fieldValue] of Object.entries(fields)) {
+    results.push(await writeExtensionField(characterId, field, fieldValue))
+  }
+  return results.every(Boolean)
 }
 
 export function updateMessageBlock(
@@ -1450,6 +1592,100 @@ function rebuildCompatState(): void {
   normalizeChatMetadataShape()
 }
 
+function applyCharacterListSnapshot(snapshot: CharacterIndex[]): void {
+  const existingByFileName = new Map(
+    contextState.characters.map(character => [character.file_name, character]),
+  )
+  const nextCharacters = snapshot.map(entry => {
+    const existing = existingByFileName.get(entry.file_name)
+    return normalizeApiCharacter(entry, existing)
+  })
+
+  const activeFileName = contextState.activeCharacter?.file_name
+  contextState = {
+    ...contextState,
+    activeCharacter: activeFileName
+      ? nextCharacters.find(character => character.file_name === activeFileName) ?? null
+      : contextState.activeCharacter,
+    characters: nextCharacters,
+  }
+  rebuildCompatState()
+  publishGlobals()
+}
+
+function upsertCharacterSnapshot(detail: CharacterDetail): number {
+  const next = normalizeApiCharacter(detail)
+  const index = contextState.characters.findIndex(character =>
+    character.file_name === next.file_name
+    || character.name === next.name
+    || getCompatCharacterAvatar(character as unknown as Record<string, unknown>) === getCompatCharacterAvatar(next as unknown as Record<string, unknown>),
+  )
+  const nextCharacters = [...contextState.characters]
+  if (index >= 0) {
+    nextCharacters[index] = {
+      ...nextCharacters[index],
+      ...next,
+      shallow: false,
+    } as CompatCharacter
+  } else {
+    nextCharacters.push(next)
+  }
+
+  const activeFileName = contextState.activeCharacter?.file_name
+  contextState = {
+    ...contextState,
+    activeCharacter: activeFileName
+      ? nextCharacters.find(character => character.file_name === activeFileName) ?? contextState.activeCharacter
+      : contextState.activeCharacter,
+    characters: nextCharacters,
+  }
+  rebuildCompatState()
+  publishGlobals()
+  return index >= 0 ? index : nextCharacters.length - 1
+}
+
+function normalizeApiCharacter(entry: CharacterIndex | CharacterDetail, existing?: Character): CompatCharacter {
+  const source = entry as (CharacterIndex | CharacterDetail) & Record<string, unknown>
+  const existingSource = (existing ?? {}) as Character & Record<string, unknown>
+  const hasDetailFields = 'first_mes' in source
+    || 'personality' in source
+    || 'scenario' in source
+    || 'mes_example' in source
+    || 'extensions' in source
+  const hasExistingDetailFields = Boolean(existing) && (
+    existingSource.first_mes !== undefined
+    || existingSource.personality !== undefined
+    || existingSource.scenario !== undefined
+    || existingSource.mes_example !== undefined
+    || existingSource.extensions !== undefined
+  )
+
+  return {
+    ...existingSource,
+    ...source,
+    id: getStringField(source, 'file_name', stringField(source, 'name') || existing?.id || ''),
+    name: getStringField(source, 'name', existing?.name ?? ''),
+    avatar: typeof source.avatar === 'string' ? source.avatar : null,
+    description: getStringField(source, 'description', existing?.description ?? ''),
+    tags: getStringArray(source.tags ?? existing?.tags),
+    creator: getStringField(source, 'creator', existing?.creator ?? ''),
+    spec: getStringField(source, 'spec', existing?.spec ?? 'chara_card_v2'),
+    spec_version: getStringField(source, 'spec_version', existing?.spec_version ?? '2.0'),
+    created_at: typeof source.created_at === 'number' ? source.created_at : existing?.created_at,
+    updated_at: typeof source.updated_at === 'number' ? source.updated_at : existing?.updated_at,
+    model: existing?.model ?? 'default',
+    lastMessage: existing?.lastMessage ?? '',
+    pinned: existing?.pinned ?? false,
+    file_name: getStringField(source, 'file_name', existing?.file_name ?? stringField(source, 'name')),
+    world: typeof source.world === 'string' ? source.world : existing?.world ?? null,
+    shallow: hasDetailFields ? false : !hasExistingDetailFields && existingSource.shallow !== false,
+  } as CompatCharacter
+}
+
+function getStringField(source: Record<string, unknown>, key: string, fallback = ''): string {
+  return typeof source[key] === 'string' ? String(source[key]) : fallback
+}
+
 function createCompatCharacter(character: Character, index: number): Record<string, unknown> {
   const source = character as Character & Record<string, unknown>
   const sourceData = asRecord(source.data)
@@ -1483,7 +1719,7 @@ function createCompatCharacter(character: Character, index: number): Record<stri
   const compatCharacter: Record<string, unknown> = {
     ...source,
     name: data.name,
-    avatar: source.avatar ?? '',
+    avatar: getCompatCharacterAvatar(source),
     chat: source.file_name === contextState.activeCharacter?.file_name ? contextState.activeChatId : null,
     chid: index,
     description: data.description,
@@ -1511,6 +1747,159 @@ function createCompatCharacter(character: Character, index: number): Record<stri
   }
 
   return compatCharacter
+}
+
+function resolveCharacterIndex(idOrName: unknown): number {
+  if (idOrName === undefined || idOrName === null || idOrName === 'current') {
+    return currentCharacterIndex
+  }
+  if (typeof idOrName === 'string' && idOrName.trim() === '') return -1
+
+  const numeric = Number(idOrName)
+  if (Number.isInteger(numeric) && numeric >= 0 && numeric < characters.length) {
+    return numeric
+  }
+
+  const text = String(idOrName).trim().toLowerCase()
+  if (!text) return -1
+  return characters.findIndex(character => {
+    const name = String(character.name ?? '').toLowerCase()
+    const fileName = String(character.file_name ?? '').toLowerCase()
+    const avatar = String(character.avatar ?? '').toLowerCase()
+    return text === name || text === fileName || text === avatar
+  })
+}
+
+function resolveCharacterFileName(idOrName: unknown): string {
+  const indexed = getCharacter(idOrName)
+  if (indexed) return getPersistableCharacterName(indexed)
+
+  const raw = String(idOrName ?? '').trim()
+  if (!raw || raw === 'current') {
+    return contextState.activeCharacter?.file_name ?? ''
+  }
+
+  const urlFileName = resolveCharacterFileNameFromUrl(raw)
+  if (urlFileName) return urlFileName
+
+  if (isLegacyAvatarFileName(raw)) {
+    return stripLegacyAvatarExtension(raw)
+  }
+
+  return raw.includes('/') || raw.includes('\\') ? '' : raw
+}
+
+function resolveCharacterFileNameFromUrl(value: string): string {
+  let url: URL
+  try {
+    url = new URL(value, window.location.origin)
+  } catch {
+    return ''
+  }
+
+  const thumbnailFile = url.searchParams.get('file')
+  if (thumbnailFile && isLegacyAvatarFileName(thumbnailFile)) {
+    return stripLegacyAvatarExtension(thumbnailFile)
+  }
+
+  const apiMatch = url.pathname.match(/^\/api\/characters\/([^/]+)\/avatar$/)
+  if (apiMatch?.[1]) return safeDecode(apiMatch[1])
+
+  const basename = safeDecode(url.pathname.split('/').pop() ?? '')
+  return isLegacyAvatarFileName(basename) ? stripLegacyAvatarExtension(basename) : ''
+}
+
+function getCompatCharacterAvatar(character: Record<string, unknown>): string {
+  const avatar = stringField(character, 'avatar')
+  if (!avatar) return ''
+  if (isLegacyAvatarFileName(avatar)) return avatar
+
+  const fileName = stringField(character, 'file_name') || stringField(character, 'name')
+  if (fileName) return isLegacyAvatarFileName(fileName) ? fileName : `${fileName}.png`
+
+  return avatar
+}
+
+function isLegacyAvatarFileName(value: string): boolean {
+  return /^[^/?#\\]+\.(?:png|jpe?g|webp|gif)$/i.test(value)
+}
+
+function stripLegacyAvatarExtension(value: string): string {
+  return value.replace(/\.(?:png|jpe?g|webp|gif)$/i, '')
+}
+
+function safeDecode(value: string): string {
+  try {
+    return decodeURIComponent(value)
+  } catch {
+    return value
+  }
+}
+
+function parseExtensionFieldPath(field: unknown): Array<string | number> {
+  const segments = parseVariablePath(field)
+  return segments.every(isSafeObjectPathSegment) ? segments : []
+}
+
+function isSafeObjectPathSegment(segment: string | number): boolean {
+  if (typeof segment === 'number') return Number.isInteger(segment) && segment >= 0
+  return Boolean(segment)
+    && segment !== '__proto__'
+    && segment !== 'prototype'
+    && segment !== 'constructor'
+}
+
+function syncCharacterJsonData(compatCharacter: Record<string, unknown>, extensions: VariableScope): void {
+  let raw: Record<string, unknown> = {}
+  if (typeof compatCharacter.json_data === 'string' && compatCharacter.json_data.trim()) {
+    try {
+      raw = asRecord(JSON.parse(compatCharacter.json_data))
+    } catch {
+      raw = {}
+    }
+  }
+
+  const data = ensureRecord(raw, 'data')
+  data.extensions = cloneCompatRecord(extensions)
+  compatCharacter.json_data = JSON.stringify(raw)
+}
+
+function syncSourceCharacterExtensions(characterIndex: number, extensions: VariableScope): void {
+  const source = contextState.characters[characterIndex] as (Character & Record<string, unknown>) | undefined
+  if (!source) return
+
+  source.extensions = cloneCompatRecord(extensions)
+  const data = ensureRecord(source, 'data')
+  data.extensions = cloneCompatRecord(extensions)
+  const world = extensions.world
+  if (typeof world === 'string') source.world = world
+}
+
+function getPersistableCharacterName(compatCharacter: Record<string, unknown>): string {
+  return stringField(compatCharacter, 'file_name') || stringField(compatCharacter, 'name')
+}
+
+function mergeSavedCharacter(characterIndex: number, saved: Character & Record<string, unknown>): void {
+  const source = contextState.characters[characterIndex] as (Character & Record<string, unknown>) | undefined
+  if (source) {
+    Object.assign(source, saved)
+  }
+
+  const compatCharacter = characters[characterIndex]
+  if (!compatCharacter) return
+
+  for (const key of ['created_at', 'updated_at', 'file_name', 'world'] as const) {
+    if (saved[key] !== undefined) compatCharacter[key] = saved[key]
+  }
+  if (saved.avatar !== undefined) compatCharacter.avatar = getCompatCharacterAvatar(saved)
+
+  const data = ensureRecord(compatCharacter, 'data')
+  const extensions = ensureRecord(data, 'extensions')
+  if (isPlainRecord(saved.extensions)) {
+    replaceRecordContents(extensions, saved.extensions)
+    compatCharacter.extensions = extensions
+    syncCharacterJsonData(compatCharacter, extensions)
+  }
 }
 
 function mergeInto(target: Record<string, unknown>, source: Record<string, unknown>): void {
@@ -2966,9 +3355,15 @@ const stHost: StHostApi = {
   registerSlashCommand,
   STscript,
   executeSlashCommands,
-  executeSlashCommandsWithOptions,
+  executeSlashCommandsWithOptions: executeSlashCommandsWithResultObject,
   renderExtensionTemplate,
   renderExtensionTemplateAsync,
+  getCharacter,
+  getCharacters,
+  getOneCharacter,
+  unshallowCharacter,
+  writeExtensionField,
+  writeExtensionFieldBulk,
   updateMessageBlock,
   printMessages,
   clearChat,
@@ -3025,6 +3420,9 @@ function publishGlobals(): void {
   window.saveSettingsDebounced = saveSettingsDebounced
   window.saveChatConditional = saveChatConditional
   window.saveChatConditionalDebounced = saveChatConditionalDebounced
+  window.getCharacters = getCharacters
+  window.getOneCharacter = getOneCharacter
+  window.unshallowCharacter = unshallowCharacter
   window.STscript = STscript
   window.TavernHelper = tavernHelperFacade
   window.builtin = builtinFacade
@@ -3033,7 +3431,7 @@ function publishGlobals(): void {
   window.xiaobaixStreamingGeneration = xiaobaixStreamingGeneration
   window.updateTemplateVariables = updateTemplateVariables
   window.executeSlashCommands = executeSlashCommands
-  window.executeSlashCommandsWithOptions = executeSlashCommandsWithOptions
+  window.executeSlashCommandsWithOptions = executeSlashCommandsWithResultObject
   window.messageFormatting = messageFormatting
   window.reloadMarkdownProcessor = reloadMarkdownProcessor
   window.updateMessageBlock = updateMessageBlock

@@ -74,6 +74,15 @@ export function AppLayout({
 
   const mobileSidebarProps: SidebarProps = { ...sidebar, onSelect: handleSidebarSelect }
 
+  useEffect(() => {
+    const root = document.documentElement
+    const rightOffset = !isMobile && !panelCollapsed ? '300px' : '0px'
+    root.style.setProperty('--crafttalker-st-compat-right-offset', rightOffset)
+    return () => {
+      root.style.removeProperty('--crafttalker-st-compat-right-offset')
+    }
+  }, [isMobile, panelCollapsed])
+
   const headerContent = (
     <header className="flex items-center justify-between h-12 px-4 border-b border-[var(--color-border-subtle)] bg-[var(--color-bg-elevated)] flex-shrink-0">
       <div className="flex items-center gap-2 min-w-0">

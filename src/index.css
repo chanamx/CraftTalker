@@ -96,3 +96,25 @@ body {
   background: rgba(0, 0, 0, 0.2);
   border: 1px solid rgba(255, 255, 255, 0.06);
 }
+
+/* Tailwind v4 emits some responsive utilities with nested @media syntax in dev.
+   Keep critical layout display variants working in browsers without that support. */
+@media (width >= 40rem) {
+  .sm\:block {
+    display: block;
+  }
+
+  .sm\:inline {
+    display: inline;
+  }
+}
+
+@media (width >= 48rem) {
+  .md\:block {
+    display: block;
+  }
+
+  .md\:hidden {
+    display: none;
+  }
+}

@@ -7,6 +7,9 @@ import {
   executeSlashCommandsWithOptions,
   getDiagnostics,
   getContext,
+  getCharacter,
+  getCharacters,
+  getOneCharacter,
   getGlobalVariable,
   getLocalVariable,
   getExtensionManifest,
@@ -31,6 +34,9 @@ import {
   updateStExtensionContext,
   updateMessageBlock,
   addOneMessage,
+  writeExtensionField,
+  writeExtensionFieldBulk,
+  unshallowCharacter,
 } from '@/lib/st-extension-host'
 
 afterEach(() => {
@@ -174,6 +180,239 @@ describe('SillyTavern extension host compatibility', () => {
       extensions: { world: 'DetailLore', regex_scripts: [{ scriptName: 'sample' }] },
     })
     expect(jsonData.data).toMatchObject(data)
+  })
+
+  it('normalizes native character avatar URLs to ST-style avatar filenames in the plugin host', () => {
+    updateStExtensionContext({
+      activeCharacter: {
+        id: 'native-avatar',
+        name: 'NativeAvatarBot',
+        avatar: '/api/characters/NativeAvatarBot/avatar',
+        description: '',
+        model: 'default',
+        lastMessage: '',
+        pinned: false,
+        file_name: 'NativeAvatarBot',
+        world: null,
+      },
+      activeChatId: 'native-avatar-chat',
+      characters: [{
+        id: 'native-avatar',
+        name: 'NativeAvatarBot',
+        avatar: '/api/characters/NativeAvatarBot/avatar',
+        description: '',
+        model: 'default',
+        lastMessage: '',
+        pinned: false,
+        file_name: 'NativeAvatarBot',
+        world: null,
+      }],
+      messages: [],
+      chatLines: [],
+    })
+
+    expect((getContext().characters as Array<Record<string, unknown>>)[0]?.avatar).toBe('NativeAvatarBot.png')
+    expect((getCharacter(0) as Record<string, unknown>).avatar).toBe('NativeAvatarBot.png')
+  })
+
+  it('refreshes one ST character mirror entry by legacy avatar filename', async () => {
+    updateStExtensionContext({
+      activeCharacter: null,
+      activeChatId: null,
+      characters: [{
+        id: 'import-bot',
+        name: 'ImportBot',
+        avatar: '/api/characters/ImportBot/avatar',
+        description: 'Old description',
+        model: 'default',
+        lastMessage: '',
+        pinned: false,
+        file_name: 'ImportBot',
+        world: null,
+      }],
+      messages: [],
+      chatLines: [],
+    })
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url === '/api/characters/ImportBot') {
+        return new Response(JSON.stringify({
+          name: 'ImportBot',
+          description: 'Fresh description',
+          tags: ['fresh'],
+          creator: 'Tester',
+          spec: 'chara_card_v2',
+          spec_version: '2.0',
+          avatar: '/api/characters/ImportBot/avatar',
+          file_name: 'ImportBot',
+          created_at: 1,
+          updated_at: 2,
+          world: 'FreshLore',
+          personality: 'Curious',
+          scenario: 'Lab',
+          first_mes: 'Fresh hello',
+          mes_example: '',
+          creator_notes: '',
+          system_prompt: '',
+          post_history_instructions: '',
+          alternate_greetings: ['Alt'],
+          character_version: '1.0',
+          extensions: { world: 'FreshLore', tavern_helper: { variables: { mood: 'bright' } } },
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response('', { status: 404 })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const character = await getOneCharacter('ImportBot.png')
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/characters/ImportBot', expect.any(Object))
+    expect(character).toMatchObject({
+      name: 'ImportBot',
+      avatar: 'ImportBot.png',
+      description: 'Fresh description',
+      first_mes: 'Fresh hello',
+      world: 'FreshLore',
+    })
+    expect((character?.data as Record<string, unknown>).extensions).toMatchObject({
+      tavern_helper: { variables: { mood: 'bright' } },
+      world: 'FreshLore',
+    })
+    expect(getDiagnostics()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'getOneCharacter', status: 'partial' }),
+    ]))
+  })
+
+  it('refreshes ST character list without discarding existing detail fields', async () => {
+    updateStExtensionContext({
+      activeCharacter: {
+        id: 'active-bot',
+        name: 'ActiveBot',
+        avatar: '/api/characters/ActiveBot/avatar',
+        description: 'Detailed description',
+        first_mes: 'Keep me',
+        model: 'default',
+        lastMessage: '',
+        pinned: false,
+        file_name: 'ActiveBot',
+        world: null,
+      },
+      activeChatId: 'chat-a',
+      characters: [{
+        id: 'active-bot',
+        name: 'ActiveBot',
+        avatar: '/api/characters/ActiveBot/avatar',
+        description: 'Detailed description',
+        first_mes: 'Keep me',
+        model: 'default',
+        lastMessage: '',
+        pinned: false,
+        file_name: 'ActiveBot',
+        world: null,
+      }],
+      messages: [],
+      chatLines: [],
+    })
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url === '/api/characters') {
+        return new Response(JSON.stringify([
+          {
+            name: 'ImportBot',
+            description: 'Newly imported',
+            tags: [],
+            creator: '',
+            spec: 'chara_card_v2',
+            spec_version: '2.0',
+            avatar: '/api/characters/ImportBot/avatar',
+            file_name: 'ImportBot',
+            created_at: 3,
+            updated_at: 4,
+            world: null,
+          },
+          {
+            name: 'ActiveBot',
+            description: 'Updated summary',
+            tags: ['tag'],
+            creator: '',
+            spec: 'chara_card_v2',
+            spec_version: '2.0',
+            avatar: '/api/characters/ActiveBot/avatar',
+            file_name: 'ActiveBot',
+            created_at: 1,
+            updated_at: 5,
+            world: 'ActiveLore',
+          },
+        ]), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response('', { status: 404 })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const list = await getCharacters()
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/characters', expect.any(Object))
+    expect(list).toHaveLength(2)
+    expect(list[0]).toMatchObject({ name: 'ImportBot', avatar: 'ImportBot.png', shallow: true })
+    expect(list[1]).toMatchObject({
+      name: 'ActiveBot',
+      avatar: 'ActiveBot.png',
+      first_mes: 'Keep me',
+      description: 'Updated summary',
+      chat: 'chat-a',
+      shallow: false,
+    })
+    expect(getContext().characterId).toBe(1)
+  })
+
+  it('unshallows shallow ST character entries through one-character refresh', async () => {
+    updateStExtensionContext({
+      activeCharacter: null,
+      activeChatId: null,
+      characters: [{
+        id: 'shallow-bot',
+        name: 'ShallowBot',
+        avatar: '/api/characters/ShallowBot/avatar',
+        description: '',
+        model: 'default',
+        lastMessage: '',
+        pinned: false,
+        file_name: 'ShallowBot',
+        world: null,
+        shallow: true,
+      } as never],
+      messages: [],
+      chatLines: [],
+    })
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url === '/api/characters/ShallowBot') {
+        return new Response(JSON.stringify({
+          name: 'ShallowBot',
+          description: 'Expanded',
+          tags: [],
+          creator: '',
+          spec: 'chara_card_v2',
+          spec_version: '2.0',
+          avatar: '/api/characters/ShallowBot/avatar',
+          file_name: 'ShallowBot',
+          created_at: 1,
+          updated_at: 2,
+          world: null,
+          personality: '',
+          scenario: '',
+          first_mes: 'Expanded hello',
+          mes_example: '',
+          creator_notes: '',
+          character_version: '',
+          extensions: {},
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response('', { status: 404 })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const character = await unshallowCharacter('0')
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/characters/ShallowBot', expect.any(Object))
+    expect(character).toMatchObject({ name: 'ShallowBot', first_mes: 'Expanded hello', shallow: false })
   })
 
   it('exposes ST-style chat messages without the JSONL metadata header', () => {
@@ -326,11 +565,35 @@ describe('SillyTavern extension host compatibility', () => {
     })
   })
 
+  it('defaults plugin-visible slash option runners to ST-style result objects', async () => {
+    SlashCommandParser.addCommand('plugin-pipe', (_args, unnamed) => unnamed)
+
+    const context = getContext()
+    const contextRunner = context.executeSlashCommandsWithOptions as (command: string) => Promise<unknown>
+    const windowRunner = window.executeSlashCommandsWithOptions as (command: string) => Promise<unknown>
+    const sillyTavernRunner = window.SillyTavern?.executeSlashCommandsWithOptions as ((command: string) => Promise<unknown>) | undefined
+
+    await expect(executeSlashCommandsWithOptions('/plugin-pipe direct')).resolves.toBe('direct')
+    await expect(contextRunner('/plugin-pipe context')).resolves.toMatchObject({ pipe: 'context', isError: false })
+    await expect(windowRunner('/plugin-pipe window')).resolves.toMatchObject({ pipe: 'window', isError: false })
+    await expect(sillyTavernRunner?.('/plugin-pipe host')).resolves.toMatchObject({ pipe: 'host', isError: false })
+  })
+
   it('accepts the legacy executeSlashCommands(command, true) result-object form', async () => {
     SlashCommandParser.addCommand('json', () => JSON.stringify({ ok: true }))
 
     await expect(executeSlashCommands('/json', true)).resolves.toMatchObject({
       pipe: '{"ok":true}',
+      isError: false,
+    })
+  })
+
+  it('passes pipe output between basic slash command pipeline segments', async () => {
+    SlashCommandParser.addCommand('pass', (_args, unnamed) => unnamed)
+    SlashCommandParser.addCommand('wrap', (_args, unnamed) => `<${unnamed}>`)
+
+    await expect(executeSlashCommandsWithOptions('/pass hello | /wrap', { returnResultObject: true })).resolves.toMatchObject({
+      pipe: '<hello>',
       isError: false,
     })
   })
@@ -612,7 +875,15 @@ describe('SillyTavern extension host compatibility', () => {
     const settings = extension_settings as Record<string, unknown>
     settings.regex = undefined
     settings.regex_presets = {}
-    settings.quickReplyV2 = {}
+    const setList = [{
+      set: {
+        name: 'Prompt Snippets',
+        qrList: [
+          { label: 'Greeting', message: 'Hello {{char}}' },
+        ],
+      },
+    }]
+    settings.quickReplyV2 = { config: { setList } }
 
     updateStExtensionContext({
       activeCharacter: null,
@@ -624,12 +895,137 @@ describe('SillyTavern extension host compatibility', () => {
 
     expect(Array.isArray(settings.regex)).toBe(true)
     expect(Array.isArray(settings.regex_presets)).toBe(true)
-    expect(settings.quickReplyV2).toMatchObject({ config: { setList: [] } })
+    expect(settings.quickReplyV2).toMatchObject({ config: { setList } })
+    expect(((settings.quickReplyV2 as Record<string, { setList: unknown[] }>).config).setList).toBe(setList)
 
     ;(settings.regex as Array<Record<string, unknown>>).push({ id: 'rx-1', scriptName: 'test' })
     settings.regex = (settings.regex as Array<Record<string, unknown>>).filter(entry => entry.id !== 'missing')
 
     expect(settings.regex).toEqual([{ id: 'rx-1', scriptName: 'test' }])
+  })
+
+  it('persists constrained character extension field writes for ST plugins', async () => {
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      if (url === '/api/characters/FieldBot' && init?.method === 'PATCH') {
+        return new Response(JSON.stringify({
+          name: 'FieldBot',
+          description: '',
+          tags: [],
+          creator: '',
+          spec: 'chara_card_v2',
+          spec_version: '2.0',
+          avatar: null,
+          file_name: 'FieldBot',
+          created_at: 1,
+          updated_at: 2,
+          world: 'FieldWorld',
+          personality: '',
+          scenario: '',
+          first_mes: '',
+          mes_example: '',
+          creator_notes: '',
+          character_version: '1.0',
+          extensions: {
+            LittleWhiteBox: { variablesCore: { bumpAliases: { hp: 'health' } } },
+            regex_scripts: [{ script_name: 'rx' }],
+            world: 'FieldWorld',
+          },
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response('{}', { status: 404, headers: { 'Content-Type': 'application/json' } })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    updateStExtensionContext({
+      activeCharacter: {
+        id: 'field-bot',
+        name: 'FieldBot',
+        avatar: null,
+        description: '',
+        model: 'default',
+        lastMessage: '',
+        pinned: false,
+        file_name: 'FieldBot',
+        world: null,
+      },
+      activeChatId: 'field-chat',
+      characters: [{
+        id: 'field-bot',
+        name: 'FieldBot',
+        avatar: null,
+        description: '',
+        model: 'default',
+        lastMessage: '',
+        pinned: false,
+        file_name: 'FieldBot',
+        world: null,
+        extensions: { keep: true },
+      }],
+      messages: [],
+      chatLines: [],
+    })
+
+    await expect(writeExtensionField(0, 'LittleWhiteBox.variablesCore.bumpAliases', { hp: 'health' })).resolves.toBe(true)
+    await expect(writeExtensionFieldBulk(0, { regex_scripts: [{ script_name: 'rx' }], world: 'FieldWorld' })).resolves.toBe(true)
+
+    const character = getCharacter(0) as Record<string, unknown>
+    const data = character.data as Record<string, unknown>
+    const extensions = data.extensions as Record<string, unknown>
+    const jsonData = JSON.parse(String(character.json_data)) as { data: { extensions: Record<string, unknown> } }
+
+    expect(extensions).toMatchObject({
+      LittleWhiteBox: { variablesCore: { bumpAliases: { hp: 'health' } } },
+      regex_scripts: [{ script_name: 'rx' }],
+      world: 'FieldWorld',
+    })
+    expect(jsonData.data.extensions).toMatchObject(extensions)
+    expect(fetchMock).toHaveBeenCalledWith('/api/characters/FieldBot', expect.objectContaining({
+      method: 'PATCH',
+      body: expect.stringContaining('"LittleWhiteBox"'),
+    }))
+    expect(getDiagnostics()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'writeExtensionField', status: 'partial' }),
+    ]))
+  })
+
+  it('blocks unsafe character extension field paths', async () => {
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    updateStExtensionContext({
+      activeCharacter: {
+        id: 'unsafe-field-bot',
+        name: 'UnsafeFieldBot',
+        avatar: null,
+        description: '',
+        model: 'default',
+        lastMessage: '',
+        pinned: false,
+        file_name: 'UnsafeFieldBot',
+        world: null,
+      },
+      activeChatId: 'unsafe-field-chat',
+      characters: [{
+        id: 'unsafe-field-bot',
+        name: 'UnsafeFieldBot',
+        avatar: null,
+        description: '',
+        model: 'default',
+        lastMessage: '',
+        pinned: false,
+        file_name: 'UnsafeFieldBot',
+        world: null,
+      }],
+      messages: [],
+      chatLines: [],
+    })
+
+    await expect(writeExtensionField(0, '__proto__.polluted', true)).resolves.toBe(false)
+
+    expect(({} as { polluted?: unknown }).polluted).toBeUndefined()
+    expect(fetchMock).not.toHaveBeenCalled()
+    expect(getDiagnostics()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'writeExtensionField', status: 'stub' }),
+    ]))
   })
 
   it('clears active chat variables on chats without metadata without breaking plugin-held references', () => {
@@ -1164,6 +1560,9 @@ describe('SillyTavern extension host compatibility', () => {
       world_info_character_strategy: 1,
     })
     expect(getContext().world_info_settings).toBe(window.CraftTalker?.stHost?.world_info_settings)
+    expect(getContext().event_types).toBe(window.CraftTalker?.stHost?.event_types)
+    expect(getContext().world_names).toBe(window.CraftTalker?.stHost?.world_names)
+    expect(getContext().selected_world_info).toBe(window.CraftTalker?.stHost?.selected_world_info)
     expect(world?.entries['7']?.content).toBe('A silver door.')
     expect(helperEntries).toEqual([expect.objectContaining({ uid: 7, comment: 'Portal' })])
     expect(getDiagnostics()).toEqual(expect.arrayContaining([

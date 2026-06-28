@@ -29,6 +29,30 @@ export default defineConfig(({ mode }) => {
         target: apiTarget,
         changeOrigin: true,
       },
+      '/version': {
+        target: apiTarget,
+        changeOrigin: true,
+      },
+      '/user/files': {
+        target: apiTarget,
+        changeOrigin: true,
+      },
+      '/User Avatars': {
+        target: apiTarget,
+        changeOrigin: true,
+      },
+      '/characters': {
+        target: apiTarget,
+        changeOrigin: true,
+      },
+      '/thumbnail': {
+        target: apiTarget,
+        changeOrigin: true,
+      },
+      '/cors': {
+        target: apiTarget,
+        changeOrigin: true,
+      },
     },
     watch: {
       ignored: ['**/server/**'],
@@ -51,7 +75,7 @@ export default defineConfig(({ mode }) => {
             },
             {
               name: 'vendor-router',
-              test: /node_modules[\\/](react-router|react-router-dom)[\\/]/,
+              test: /node_modules[\\/]react-router[\\/]/,
             },
             {
               name: 'vendor-query',

@@ -33,6 +33,17 @@ afterEach(() => {
 })
 
 describe('SillyTavern host chat-completions backend bridge', () => {
+  it('serves a fallback model list for ST plugin configuration UIs', async () => {
+    const res = await createTestApp().request('/api/backends/chat-completions/models')
+
+    expect(res.status).toBe(200)
+    await expect(res.json()).resolves.toMatchObject({
+      data: expect.arrayContaining([
+        expect.objectContaining({ id: 'gpt-4o-mini' }),
+      ]),
+    })
+  })
+
   it('lists models through the shared LLM provider model service', async () => {
     const fetchMock = vi.fn().mockResolvedValue(jsonResponse({
       data: [{ id: 'local-model' }],
@@ -58,6 +69,43 @@ describe('SillyTavern host chat-completions backend bridge', () => {
         Authorization: 'Bearer local-key',
       }),
     }))
+  })
+
+  it('serves fallback models for empty ST status probes without touching external providers', async () => {
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+
+    const res = await createTestApp().request('/api/backends/chat-completions/status', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    })
+
+    expect(res.status).toBe(200)
+    await expect(res.json()).resolves.toMatchObject({
+      data: expect.arrayContaining([
+        expect.objectContaining({ id: 'gpt-4o-mini' }),
+      ]),
+    })
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('rejects empty ST generation probes before any provider request is made', async () => {
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+
+    const res = await createTestApp().request('/api/backends/chat-completions/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    })
+
+    expect(res.status).toBe(400)
+    await expect(res.json()).resolves.toMatchObject({
+      error: expect.stringContaining('requires a reverse_proxy'),
+      code: 1001,
+    })
+    expect(fetchMock).not.toHaveBeenCalled()
   })
 
   it('generates an OpenAI-shaped non-streaming response without writing chats', async () => {

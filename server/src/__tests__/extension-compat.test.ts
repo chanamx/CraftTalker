@@ -43,6 +43,71 @@ describe('SillyTavern extension compatibility routes', () => {
     expect(await res.json()).toContainEqual({ type: 'local', name: 'third-party/TestExt' })
   })
 
+  it('returns read-only ST-shaped extension version information', async () => {
+    writeTestExtension('LittleWhiteBox', {
+      display_name: 'LittleWhiteBox',
+      version: '1.2.3',
+      js: 'index.js',
+      homePage: 'https://github.com/RT15548/LittleWhiteBox',
+    })
+    const app = createApp()
+
+    const res = await app.request('/api/extensions/version', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ extensionName: 'LittleWhiteBox', global: false }),
+    })
+
+    expect(res.status).toBe(200)
+    expect(await res.json()).toMatchObject({
+      currentBranchName: 'manifest',
+      currentCommitHash: 'manifest:1.2.3',
+      current_branch_name: 'manifest',
+      current_commit_hash: 'manifest:1.2.3',
+      isUpToDate: true,
+      is_up_to_date: true,
+      remoteUrl: 'https://github.com/RT15548/LittleWhiteBox',
+      remote_url: 'https://github.com/RT15548/LittleWhiteBox',
+      version: '1.2.3',
+      extensionPath: 'third-party/LittleWhiteBox',
+      extension_path: 'third-party/LittleWhiteBox',
+    })
+  })
+
+  it('supports GET extension version probes and rejects missing names', async () => {
+    writeTestExtension('JS-Slash-Runner', {
+      display_name: 'JS-Slash-Runner',
+      version: '0.9.0',
+      js: 'dist/index.js',
+      repository: { url: 'https://gitlab.com/novi028/JS-Slash-Runner' },
+    })
+    const app = createApp()
+
+    const ok = await app.request('/api/extensions/version?extensionName=JS-Slash-Runner')
+    const missing = await app.request('/api/extensions/version')
+
+    expect(ok.status).toBe(200)
+    expect(await ok.json()).toMatchObject({
+      remoteUrl: 'https://gitlab.com/novi028/JS-Slash-Runner',
+      shortCommitHash: 'manifest:0.9',
+    })
+    expect(missing.status).toBe(400)
+  })
+
+  it('keeps ST extension mutation endpoints fail-closed', async () => {
+    const app = createApp()
+
+    for (const endpoint of ['/api/extensions/install', '/api/extensions/update', '/api/extensions/delete']) {
+      const res = await app.request(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ extensionName: 'LittleWhiteBox' }),
+      })
+      expect(res.status).toBe(501)
+      expect(await res.json()).toMatchObject({ success: false, blocked: true })
+    }
+  })
+
   it('serves extension manifest and static resources from /scripts/extensions', async () => {
     writeTestExtension()
     const app = createApp()
@@ -115,12 +180,18 @@ describe('SillyTavern extension compatibility routes', () => {
 
     const openaiShim = await app.request('/scripts/openai.js')
     const scriptShim = await app.request('/script.js')
+    const tagsShim = await app.request('/scripts/tags.js')
+    const rootTagsShim = await app.request('/tags.js')
     const slashCommandShim = await app.request('/scripts/slash-commands/SlashCommandParser.js')
 
     expect(openaiShim.status).toBe(200)
     expect(await openaiShim.text()).toContain('/compat/openai.js')
     expect(scriptShim.status).toBe(200)
     expect(await scriptShim.text()).toContain('/scripts/compat/script.js')
+    expect(tagsShim.status).toBe(200)
+    expect(await tagsShim.text()).toContain('/compat/tags.js')
+    expect(rootTagsShim.status).toBe(200)
+    expect(await rootTagsShim.text()).toContain('/scripts/compat/tags.js')
     expect(slashCommandShim.status).toBe(200)
     expect(await slashCommandShim.text()).toContain('/compat/slash-commands/SlashCommandParser.js')
   })
@@ -148,13 +219,13 @@ describe('SillyTavern extension compatibility routes', () => {
     fs.writeFileSync(path.join(dir, 'dist', 'index.js'), "import './970.index.js';\n", 'utf8')
     fs.writeFileSync(path.join(dir, 'dist', '970.index.js'), 'export const chunk = true;\n', 'utf8')
     fs.writeFileSync(path.join(dir, 'dist', 'ejs.workers.js'), 'self.onmessage = () => {};\n', 'utf8')
-    fs.writeFileSync(path.join(dir, 'dist', 'font.ttf'), 'font-data', 'utf8')
+    fs.writeFileSync(path.join(dir, 'dist', '4c354c82c52ca6cc2543.ttf'), 'font-data', 'utf8')
     fs.writeFileSync(path.join(dir, 'locales', 'zh-cn.json'), '{"display_name":"Prompt Template"}', 'utf8')
     const app = createApp()
 
     const chunkRes = await app.request('/scripts/extensions/third-party/ST-Prompt-Template/dist/970.index.js')
     const workerRes = await app.request('/scripts/extensions/third-party/ST-Prompt-Template/dist/ejs.workers.js')
-    const fontRes = await app.request('/scripts/extensions/third-party/ST-Prompt-Template/dist/font.ttf')
+    const fontRes = await app.request('/scripts/extensions/third-party/ST-Prompt-Template/dist/codicon.ttf')
     const localeRes = await app.request('/scripts/extensions/third-party/ST-Prompt-Template/locales/zh-cn.json')
 
     expect(chunkRes.status).toBe(200)
@@ -164,6 +235,7 @@ describe('SillyTavern extension compatibility routes', () => {
     expect(workerRes.headers.get('Content-Type')).toContain('text/javascript')
     expect(fontRes.status).toBe(200)
     expect(fontRes.headers.get('Content-Type')).toBe('font/ttf')
+    expect(await fontRes.text()).toBe('font-data')
     expect(localeRes.status).toBe(200)
     expect(await localeRes.json()).toMatchObject({ display_name: 'Prompt Template' })
   })
@@ -183,10 +255,39 @@ describe('SillyTavern extension compatibility routes', () => {
 
     expect(saveRes.status).toBe(200)
     expect(readRes.status).toBe(200)
-    expect(await readRes.json()).toMatchObject({
+    const settings = await readRes.json()
+    expect(settings).toMatchObject({
       disabledExtensions: ['third-party/TestExt'],
       samplePlugin: { enabled: true, nested: { value: 42 } },
+      quickReplyV2: { config: { setList: [] } },
     })
+  })
+
+  it('keeps ST quick reply v2 settings visible for prompt-template plugins', async () => {
+    const app = createApp()
+    const quickReplyV2 = {
+      config: {
+        setList: [{
+          set: {
+            name: 'Prompt Snippets',
+            qrList: [
+              { label: 'Greeting', message: 'Hello {{char}}' },
+            ],
+          },
+        }],
+      },
+    }
+
+    const saveRes = await app.request('/api/extensions/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ quickReplyV2 }),
+    })
+    const readRes = await app.request('/api/extensions/settings')
+
+    expect(saveRes.status).toBe(200)
+    expect(readRes.status).toBe(200)
+    expect(await readRes.json()).toMatchObject({ quickReplyV2 })
   })
 
   it('reports extension compatibility state without executing plugins', async () => {
@@ -222,8 +323,13 @@ describe('SillyTavern extension compatibility routes', () => {
     expect(report.runtimeCapabilities).toEqual(expect.arrayContaining([
       expect.objectContaining({ id: 'resource-loading', status: 'supported' }),
       expect.objectContaining({ id: 'dom-anchors', status: 'partial' }),
+      expect.objectContaining({ id: 'user-file-storage', status: 'partial' }),
+      expect.objectContaining({ id: 'persona-avatar-api', status: 'partial' }),
+      expect.objectContaining({ id: 'chat-history-api', status: 'partial' }),
       expect.objectContaining({ id: 'worldbook-api', status: 'partial' }),
+      expect.objectContaining({ id: 'character-api', status: 'partial' }),
       expect.objectContaining({ id: 'generation-api', status: 'partial' }),
+      expect.objectContaining({ id: 'image-and-cors-proxy', status: 'blocked' }),
       expect.objectContaining({ id: 'unsafe-script-runtime', status: 'blocked' }),
     ]))
     expect(report.extensions).toContainEqual(expect.objectContaining({

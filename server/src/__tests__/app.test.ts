@@ -8,10 +8,59 @@ import { createChat, getChat } from '../services/chat.service.js'
 import { clearGenerationLocksForTest, tryAcquireGenerationLock } from '../lib/generation-locks.js'
 import { clearLlmKeySessionsForTest } from '../services/llm-session.service.js'
 import { writeChatFile } from '../lib/jsonl.js'
+import { readCharacterCard, writeCharacterCard } from '../lib/png-parser.js'
 
 type Json = Record<string, unknown>
 
 const testDataDir = path.join(os.tmpdir(), `luker-api-test-${Date.now()}`)
+
+type MultipartPart =
+  | { name: string; value: string }
+  | { name: string; filename: string; body: Buffer; contentType?: string }
+
+function multipartFormBody(parts: MultipartPart[]): { body: Buffer; contentType: string } {
+  const boundary = `----CraftTalkerTestBoundary${Date.now()}`
+  const chunks: Buffer[] = []
+  for (const part of parts) {
+    if ('filename' in part) {
+      chunks.push(Buffer.from(
+        `--${boundary}\r\n`
+        + `Content-Disposition: form-data; name="${part.name}"; filename="${part.filename}"\r\n`
+        + `Content-Type: ${part.contentType ?? 'application/octet-stream'}\r\n\r\n`,
+        'utf8',
+      ))
+      chunks.push(part.body)
+      chunks.push(Buffer.from('\r\n', 'utf8'))
+      continue
+    }
+
+    chunks.push(Buffer.from(
+      `--${boundary}\r\n`
+      + `Content-Disposition: form-data; name="${part.name}"\r\n\r\n`
+      + `${part.value}\r\n`,
+      'utf8',
+    ))
+  }
+  chunks.push(Buffer.from(`--${boundary}--\r\n`, 'utf8'))
+  return {
+    contentType: `multipart/form-data; boundary=${boundary}`,
+    body: Buffer.concat(chunks),
+  }
+}
+
+function multipartUploadBody(
+  fileBody: Buffer,
+  filename: string,
+  overwriteName: string,
+  contentType = 'image/png',
+): { body: Buffer; contentType: string } {
+  return multipartFormBody([
+    { name: 'avatar', filename, body: fileBody, contentType },
+    { name: 'overwrite_name', value: overwriteName },
+  ])
+}
+
+const multipartIt = typeof (globalThis as { document?: unknown }).document === 'undefined' ? it : it.skip
 
 beforeEach(() => {
   process.env.NODE_ENV = 'test'
@@ -43,12 +92,507 @@ describe('API Routes', () => {
     expect(body.timestamp).toBeTypeOf('number')
   })
 
+  it('GET /version returns an ST-compatible startup probe response', async () => {
+    const app = createApp()
+    const res = await app.request('/version')
+
+    expect(res.status).toBe(200)
+    expect(res.headers.get('Cache-Control')).toBe('no-cache')
+    await expect(res.json()).resolves.toMatchObject({
+      agent: 'CraftTalker',
+      pkgVersion: '1.12.13',
+      version: '1.12.13',
+      revision: 'crafttalker-compat',
+      isLatest: true,
+    })
+  })
+
+  it('serves ST-compatible fallback model list endpoints for plugin UIs', async () => {
+    const app = createApp()
+    const backendRes = await app.request('/api/backends/chat-completions/models')
+    const openAiRes = await app.request('/api/openai/models')
+
+    expect(backendRes.status).toBe(200)
+    expect(openAiRes.status).toBe(200)
+    for (const body of [await backendRes.json(), await openAiRes.json()] as Array<{ data: Array<Json> }>) {
+      expect(body.data).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: 'gpt-4o-mini' }),
+      ]))
+    }
+  })
+
+  it('serves ST-compatible tokenizer count endpoints with local estimates', async () => {
+    const app = createApp()
+    const claudeRes = await app.request('/api/tokenizers/claude/encode', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: 'Hello tokenizer' }),
+    })
+    const openAiRes = await app.request('/api/tokenizers/openai/count?model=gpt-4o-mini', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify([{ role: 'user', content: 'Hello tokenizer' }]),
+    })
+
+    expect(claudeRes.status).toBe(200)
+    expect(openAiRes.status).toBe(200)
+    expect((await claudeRes.json() as Json).count).toBeGreaterThan(0)
+    expect((await openAiRes.json() as Json).token_count).toBeGreaterThan(0)
+  })
+
+  it('keeps ST-compatible image and generic proxy endpoints explicitly fail-closed', async () => {
+    const app = createApp()
+
+    const sdRes = await app.request('/api/sd/ping', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: 'http://127.0.0.1:7860' }),
+    })
+    const comfyRes = await app.request('/api/sd/comfy/ping', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: 'http://127.0.0.1:8188' }),
+    })
+    const corsRes = await app.request('/cors/https://example.com/page.html')
+
+    for (const res of [sdRes, comfyRes, corsRes]) {
+      expect(res.status).toBe(501)
+      await expect(res.json()).resolves.toMatchObject({
+        success: false,
+        blocked: true,
+      })
+    }
+  })
+
+  it('serves ST-compatible user files uploaded by extensions from a constrained storage directory', async () => {
+    const app = createApp()
+    const content = JSON.stringify({ task: 'persisted' })
+
+    const uploadRes = await app.request('/api/files/upload', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: 'LittleWhiteBox_Tasks.json',
+        data: Buffer.from(content, 'utf8').toString('base64'),
+      }),
+    })
+
+    expect(uploadRes.status).toBe(200)
+    await expect(uploadRes.json()).resolves.toMatchObject({
+      success: true,
+      name: 'LittleWhiteBox_Tasks.json',
+      path: '/user/files/LittleWhiteBox_Tasks.json',
+      size: content.length,
+    })
+
+    const readRes = await app.request('/user/files/LittleWhiteBox_Tasks.json')
+    expect(readRes.status).toBe(200)
+    expect(readRes.headers.get('Content-Type')).toContain('application/json')
+    expect(await readRes.text()).toBe(content)
+    expect(fs.existsSync(path.join(testDataDir, 'user', 'files', 'LittleWhiteBox_Tasks.json'))).toBe(true)
+  })
+
+  it('rejects unsafe ST-compatible user file uploads', async () => {
+    const app = createApp()
+
+    const traversalRes = await app.request('/api/files/upload', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: '../secrets.json', data: 'e30=' }),
+    })
+    expect(traversalRes.status).toBe(400)
+
+    const invalidBase64Res = await app.request('/api/files/upload', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'LittleWhiteBox_Tasks.json', data: 'not base64!' }),
+    })
+    expect(invalidBase64Res.status).toBe(400)
+
+    const unsafeZipRes = await app.request('/api/files/upload', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'workspace.zip', data: 'UEsDBAo=' }),
+    })
+    expect(unsafeZipRes.status).toBe(400)
+  })
+
+  it('returns 404 for missing ST-compatible user files', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const app = createApp()
+    const res = await app.request('/user/files/LittleWhiteBox_Missing.json')
+
+    expect(res.status).toBe(404)
+    expect(consoleError).not.toHaveBeenCalled()
+    consoleError.mockRestore()
+  })
+
+  it('supports constrained LittleWhiteBox vector backup zip upload, readback, and delete', async () => {
+    const app = createApp()
+    const body = Buffer.from('zip-data')
+    const filename = 'LWB_VectorBackup_ab12cd.zip'
+
+    const uploadRes = await app.request('/api/files/upload', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: filename,
+        data: body.toString('base64'),
+      }),
+    })
+    expect(uploadRes.status).toBe(200)
+    expect(await uploadRes.json()).toMatchObject({
+      success: true,
+      name: filename,
+      path: `/user/files/${filename}`,
+      size: body.length,
+    })
+
+    const readRes = await app.request(`/user/files/${filename}`)
+    expect(readRes.status).toBe(200)
+    expect(readRes.headers.get('Content-Type')).toBe('application/zip')
+    expect(Buffer.from(await readRes.arrayBuffer())).toEqual(body)
+
+    const deleteRes = await app.request('/api/files/delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: `user/files/${filename}` }),
+    })
+    expect(deleteRes.status).toBe(200)
+    expect(await deleteRes.json()).toMatchObject({
+      success: true,
+      deleted: true,
+      path: `/user/files/${filename}`,
+    })
+    expect(fs.existsSync(path.join(testDataDir, 'user', 'files', filename))).toBe(false)
+  })
+
+  it('rejects unsafe ST-compatible user file deletes', async () => {
+    const app = createApp()
+
+    const traversalRes = await app.request('/api/files/delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: 'user/files/../secrets.json' }),
+    })
+    expect(traversalRes.status).toBe(400)
+
+    const missingRes = await app.request('/api/files/delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: 'user/files/LittleWhiteBox_Missing.json' }),
+    })
+    expect(missingRes.status).toBe(404)
+  })
+
+  multipartIt('supports constrained ST-compatible persona avatar upload, list, readback, and delete', async () => {
+    const app = createApp()
+    const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=', 'base64')
+    const multipart = multipartUploadBody(png, 'ignored.png', 'Persona_Test.png')
+
+    const uploadRes = await app.request('/api/avatars/upload', {
+      method: 'POST',
+      headers: { 'Content-Type': multipart.contentType },
+      body: multipart.body,
+    })
+    expect(uploadRes.status).toBe(200)
+    expect(await uploadRes.json()).toEqual({ path: 'Persona_Test.png' })
+    expect(fs.existsSync(path.join(testDataDir, 'user', 'avatars', 'Persona_Test.png'))).toBe(true)
+
+    const listRes = await app.request('/api/avatars/get', { method: 'POST' })
+    expect(listRes.status).toBe(200)
+    expect(await listRes.json()).toEqual(['Persona_Test.png'])
+
+    const getListRes = await app.request('/api/avatars/get')
+    expect(getListRes.status).toBe(200)
+    expect(await getListRes.json()).toEqual(['Persona_Test.png'])
+
+    const readRes = await app.request('/User%20Avatars/Persona_Test.png')
+    expect(readRes.status).toBe(200)
+    expect(readRes.headers.get('Content-Type')).toBe('image/png')
+    expect(Buffer.from(await readRes.arrayBuffer())).toEqual(png)
+
+    const deleteRes = await app.request('/api/avatars/delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ avatar: 'Persona_Test.png' }),
+    })
+    expect(deleteRes.status).toBe(200)
+    expect(await deleteRes.json()).toEqual({ result: 'ok' })
+    expect(fs.existsSync(path.join(testDataDir, 'user', 'avatars', 'Persona_Test.png'))).toBe(false)
+  })
+
+  multipartIt('rejects unsafe ST-compatible persona avatar writes and deletes', async () => {
+    const app = createApp()
+    const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=', 'base64')
+    const traversalMultipart = multipartUploadBody(png, 'avatar.png', '../avatar.png')
+
+    const traversalRes = await app.request('/api/avatars/upload', {
+      method: 'POST',
+      headers: { 'Content-Type': traversalMultipart.contentType },
+      body: traversalMultipart.body,
+    })
+    expect(traversalRes.status).toBe(400)
+
+    const invalidImageMultipart = multipartUploadBody(Buffer.from('not an image'), 'Persona_Test.png', 'Persona_Test.png', 'text/plain')
+    const invalidImageRes = await app.request('/api/avatars/upload', {
+      method: 'POST',
+      headers: { 'Content-Type': invalidImageMultipart.contentType },
+      body: invalidImageMultipart.body,
+    })
+    expect(invalidImageRes.status).toBe(400)
+
+    const missingDeleteRes = await app.request('/api/avatars/delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ avatar: 'Missing.png' }),
+    })
+    expect(missingDeleteRes.status).toBe(404)
+  })
+
   it('GET /api/characters returns character list', async () => {
     const app = createApp()
     const res = await app.request('/api/characters')
     expect(res.status).toBe(200)
     const body = await res.json() as unknown[]
     expect(Array.isArray(body)).toBe(true)
+  })
+
+  it('POST /api/characters/create accepts ST-compatible form data without avatar writes', async () => {
+    const app = createApp()
+    const form = new FormData()
+    form.set('ch_name', 'FormBot')
+    form.set('description', 'Created from ST form')
+    form.set('first_mes', 'Hello')
+    form.append('alternate_greetings', 'Alt 1')
+    form.append('alternate_greetings', 'Alt 2')
+    form.set('extensions', JSON.stringify({ tavern_helper: { enabled: true } }))
+    form.set('world', 'FormWorld')
+    form.set('talkativeness', '0.7')
+    form.set('fav', 'true')
+
+    const res = await app.request('/api/characters/create', {
+      method: 'POST',
+      body: form,
+    })
+
+    expect(res.status).toBe(201)
+    const body = await res.json() as Json
+    expect(body.name).toBe('FormBot')
+    expect(body.alternate_greetings).toEqual(['Alt 1', 'Alt 2'])
+    expect(body.extensions).toMatchObject({
+      tavern_helper: { enabled: true },
+      world: 'FormWorld',
+      talkativeness: 0.7,
+      fav: true,
+    })
+  })
+
+  multipartIt('POST /api/characters/create accepts a constrained ST-compatible avatar file', async () => {
+    const app = createApp()
+    const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=', 'base64')
+    const multipart = multipartFormBody([
+      { name: 'ch_name', value: 'FormAvatarBot' },
+      { name: 'description', value: 'Created with avatar' },
+      { name: 'first_mes', value: 'Hello with avatar' },
+      { name: 'avatar', filename: 'FormAvatarBot.png', body: png, contentType: 'image/png' },
+    ])
+
+    const res = await app.request('/api/characters/create', {
+      method: 'POST',
+      headers: { 'Content-Type': multipart.contentType },
+      body: multipart.body,
+    })
+
+    expect(res.status).toBe(201)
+    const body = await res.json() as Json
+    expect(body.name).toBe('FormAvatarBot')
+    expect(body.avatar).toBe('/api/characters/FormAvatarBot/avatar')
+    const avatarPath = path.join(testDataDir, 'characters', 'FormAvatarBot', 'avatar.png')
+    expect(fs.existsSync(avatarPath)).toBe(true)
+    expect(fs.readFileSync(avatarPath)).toEqual(png)
+
+    const avatarRes = await app.request('/api/characters/FormAvatarBot/avatar')
+    expect(avatarRes.status).toBe(200)
+    expect(avatarRes.headers.get('Content-Type')).toBe('image/png')
+    expect(Buffer.from(await avatarRes.arrayBuffer())).toEqual(png)
+  })
+
+  it('serves ST-compatible legacy character avatar and thumbnail URLs read-only', async () => {
+    const app = createApp()
+    const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=', 'base64')
+    const charDir = path.join(testDataDir, 'characters', 'LegacyAvatarBot')
+    fs.mkdirSync(charDir, { recursive: true })
+    fs.writeFileSync(
+      path.join(charDir, 'character.json'),
+      JSON.stringify({ name: 'LegacyAvatarBot', description: 'Legacy avatar' }),
+      'utf8',
+    )
+    fs.writeFileSync(path.join(charDir, 'avatar.png'), png)
+
+    const legacyRes = await app.request('/characters/LegacyAvatarBot.png')
+    const thumbnailRes = await app.request('/thumbnail?type=avatar&file=LegacyAvatarBot.png')
+    const traversalRes = await app.request('/characters/..%2fsecret.png')
+
+    expect(legacyRes.status).toBe(200)
+    expect(legacyRes.headers.get('Content-Type')).toBe('image/png')
+    expect(Buffer.from(await legacyRes.arrayBuffer())).toEqual(png)
+    expect(thumbnailRes.status).toBe(200)
+    expect(Buffer.from(await thumbnailRes.arrayBuffer())).toEqual(png)
+    expect(traversalRes.status).toBe(404)
+  })
+
+  multipartIt('POST /api/characters/create rejects invalid avatar files before creating the card', async () => {
+    const app = createApp()
+    const multipart = multipartFormBody([
+      { name: 'ch_name', value: 'InvalidAvatarBot' },
+      { name: 'avatar', filename: 'InvalidAvatarBot.png', body: Buffer.from('not an image'), contentType: 'text/plain' },
+    ])
+
+    const res = await app.request('/api/characters/create', {
+      method: 'POST',
+      headers: { 'Content-Type': multipart.contentType },
+      body: multipart.body,
+    })
+
+    expect(res.status).toBe(400)
+    expect(fs.existsSync(path.join(testDataDir, 'characters', 'InvalidAvatarBot', 'character.json'))).toBe(false)
+  })
+
+  it('POST /api/characters/edit accepts narrow ST-compatible form updates and preserves unknown card fields', async () => {
+    const app = createApp()
+    const charDir = path.join(testDataDir, 'characters', 'EditFormBot')
+    fs.mkdirSync(charDir, { recursive: true })
+    fs.writeFileSync(
+      path.join(charDir, 'character.json'),
+      JSON.stringify({
+        spec: 'chara_card_v3',
+        spec_version: '3.0',
+        top_level_runtime: { keep: true },
+        data: {
+          name: 'EditFormBot',
+          description: 'Original',
+          nickname: 'KeepNick',
+          first_mes: 'Original hello',
+          extensions: {
+            regex_scripts: [{ script_name: 'KeepRegex' }],
+            tavern_helper: { old: true },
+          },
+        },
+      }),
+      'utf8',
+    )
+
+    const form = new FormData()
+    form.set('ch_name', 'EditFormBot')
+    form.set('description', 'Edited from ST form')
+    form.set('extensions', JSON.stringify({
+      regex_scripts: [{ script_name: 'KeepRegex' }],
+      tavern_helper: { scripts: [{ name: 'A' }] },
+    }))
+    form.set('world', 'EditedWorld')
+
+    const res = await app.request('/api/characters/edit', {
+      method: 'POST',
+      body: form,
+    })
+
+    expect(res.status).toBe(200)
+    const stored = JSON.parse(fs.readFileSync(path.join(charDir, 'character.json'), 'utf8'))
+    expect(stored.top_level_runtime.keep).toBe(true)
+    expect(stored.data.nickname).toBe('KeepNick')
+    expect(stored.data.description).toBe('Edited from ST form')
+    expect(stored.data.first_mes).toBe('Original hello')
+    expect(stored.data.extensions).toMatchObject({
+      regex_scripts: [{ script_name: 'KeepRegex' }],
+      tavern_helper: { scripts: [{ name: 'A' }] },
+      world: 'EditedWorld',
+    })
+  })
+
+  it('PATCH /api/characters/:name persists ST plugin extension fields', async () => {
+    const app = createApp()
+    const charDir = path.join(testDataDir, 'characters', 'PatchExtBot')
+    fs.mkdirSync(charDir, { recursive: true })
+    fs.writeFileSync(
+      path.join(charDir, 'character.json'),
+      JSON.stringify({
+        spec: 'chara_card_v3',
+        spec_version: '3.0',
+        top_level_runtime: { keep: true },
+        data: {
+          name: 'PatchExtBot',
+          description: 'Original',
+          nickname: 'KeepNick',
+          extensions: {
+            old_plugin: { keep: true },
+          },
+        },
+      }),
+      'utf8',
+    )
+
+    const res = await app.request('/api/characters/PatchExtBot', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        extensions: {
+          old_plugin: { keep: true },
+          LittleWhiteBox: { variablesCore: { bumpAliases: { hp: 'health' } } },
+          regex_scripts: [{ script_name: 'RunnerRegex' }],
+        },
+      }),
+    })
+
+    expect(res.status).toBe(200)
+    const body = await res.json() as Json
+    const stored = JSON.parse(fs.readFileSync(path.join(charDir, 'character.json'), 'utf8'))
+    const extensions = body.extensions as Record<string, unknown>
+    expect(stored.top_level_runtime.keep).toBe(true)
+    expect(stored.data.nickname).toBe('KeepNick')
+    expect(extensions).toMatchObject({
+      LittleWhiteBox: { variablesCore: { bumpAliases: { hp: 'health' } } },
+      regex_scripts: [{ script_name: 'RunnerRegex' }],
+    })
+    expect(stored.data.extensions).toMatchObject(extensions)
+  })
+
+  multipartIt('POST /api/characters/edit accepts a constrained ST-compatible avatar replacement', async () => {
+    const app = createApp()
+    const charDir = path.join(testDataDir, 'characters', 'EditAvatarBot')
+    fs.mkdirSync(charDir, { recursive: true })
+    fs.writeFileSync(
+      path.join(charDir, 'character.json'),
+      JSON.stringify({
+        spec: 'chara_card_v2',
+        spec_version: '2.0',
+        data: {
+          name: 'EditAvatarBot',
+          description: 'Original',
+          first_mes: 'Original hello',
+          extensions: {},
+        },
+      }),
+      'utf8',
+    )
+    const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=', 'base64')
+    const multipart = multipartFormBody([
+      { name: 'ch_name', value: 'EditAvatarBot' },
+      { name: 'description', value: 'Edited with avatar' },
+      { name: 'avatar', filename: 'EditAvatarBot.png', body: png, contentType: 'image/png' },
+    ])
+
+    const res = await app.request('/api/characters/edit', {
+      method: 'POST',
+      headers: { 'Content-Type': multipart.contentType },
+      body: multipart.body,
+    })
+
+    expect(res.status).toBe(200)
+    const body = await res.json() as Json
+    expect(body.description).toBe('Edited with avatar')
+    expect(body.avatar).toBe('/api/characters/EditAvatarBot/avatar')
+    expect(fs.readFileSync(path.join(charDir, 'avatar.png'))).toEqual(png)
   })
 
   it('GET /api/worlds returns world book list', async () => {
@@ -274,6 +818,61 @@ describe('API Routes', () => {
     expect(res.status).toBe(400)
   })
 
+  multipartIt('POST /api/characters/import accepts ST-compatible multipart PNG card uploads', async () => {
+    const app = createApp()
+    const sourcePng = path.join(testDataDir, 'source.png')
+    const cardPng = path.join(testDataDir, 'RawImportBot.card.png')
+    fs.writeFileSync(
+      sourcePng,
+      Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=', 'base64'),
+    )
+    writeCharacterCard(sourcePng, JSON.stringify({
+      spec: 'chara_card_v2',
+      spec_version: '2.0',
+      data: {
+        name: 'RawImportBot',
+        description: 'Imported through ST multipart',
+        first_mes: 'Hello from raw import',
+      },
+    }), cardPng)
+    const multipart = multipartFormBody([
+      { name: 'avatar', filename: 'RawImportBot', body: fs.readFileSync(cardPng), contentType: 'image/png' },
+      { name: 'file_type', value: 'png' },
+      { name: 'preserved_name', value: 'RawImportBot' },
+    ])
+
+    const res = await app.request('/api/characters/import', {
+      method: 'POST',
+      headers: { 'Content-Type': multipart.contentType },
+      body: multipart.body,
+    })
+
+    expect(res.status).toBe(201)
+    const body = await res.json() as Json
+    expect(body.name).toBe('RawImportBot')
+    expect(body.description).toBe('Imported through ST multipart')
+    expect(fs.existsSync(path.join(testDataDir, 'characters', 'RawImportBot', 'character.json'))).toBe(true)
+    expect(fs.existsSync(path.join(testDataDir, 'characters', 'RawImportBot', 'character.png'))).toBe(true)
+  })
+
+  multipartIt('POST /api/characters/import rejects invalid ST-compatible multipart card uploads', async () => {
+    const app = createApp()
+    const multipart = multipartFormBody([
+      { name: 'avatar', filename: 'InvalidRawImportBot', body: Buffer.from('not a card'), contentType: 'image/png' },
+      { name: 'file_type', value: 'png' },
+      { name: 'preserved_name', value: 'InvalidRawImportBot' },
+    ])
+
+    const res = await app.request('/api/characters/import', {
+      method: 'POST',
+      headers: { 'Content-Type': multipart.contentType },
+      body: multipart.body,
+    })
+
+    expect(res.status).toBe(400)
+    expect(fs.existsSync(path.join(testDataDir, 'characters', 'InvalidRawImportBot', 'character.json'))).toBe(false)
+  })
+
   it('POST /api/characters/upload imports JSON character cards', async () => {
     const app = createApp()
     const card = {
@@ -298,6 +897,88 @@ describe('API Routes', () => {
     const body = await res.json() as Json
     expect(body.name).toBe('JsonBot')
     expect(fs.existsSync(path.join(testDataDir, 'characters', 'JsonBot', 'character.json'))).toBe(true)
+  })
+
+  it('POST /api/characters/export serves ST-compatible sanitized JSON and PNG character exports', async () => {
+    const app = createApp()
+    const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=', 'base64')
+    const charDir = path.join(testDataDir, 'characters', 'ExportBot')
+    fs.mkdirSync(charDir, { recursive: true })
+    fs.writeFileSync(path.join(charDir, 'avatar.png'), png)
+    fs.writeFileSync(
+      path.join(charDir, 'character.json'),
+      JSON.stringify({
+        spec: 'chara_card_v2',
+        spec_version: '2.0',
+        chat: 'private-chat-name',
+        fav: true,
+        data: {
+          name: 'ExportBot',
+          description: 'Export me',
+          first_mes: 'Hello',
+          extensions: {
+            fav: true,
+            tavern_helper: { keep: true },
+          },
+        },
+      }),
+      'utf8',
+    )
+
+    const jsonRes = await app.request('/api/characters/export', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ format: 'json', avatar_url: 'ExportBot.png' }),
+    })
+    const pngRes = await app.request('/api/characters/export', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ format: 'png', avatar_url: 'ExportBot.png' }),
+    })
+
+    expect(jsonRes.status).toBe(200)
+    expect(jsonRes.headers.get('Content-Disposition')).toContain('ExportBot.json')
+    const exportedJson = await jsonRes.json() as Json & { data: Json }
+    expect(exportedJson.chat).toBeUndefined()
+    expect(exportedJson.fav).toBe(false)
+    expect(exportedJson.data.name).toBe('ExportBot')
+    expect((exportedJson.data.extensions as Json).fav).toBe(false)
+    expect(exportedJson.data.extensions).toMatchObject({ tavern_helper: { keep: true } })
+
+    expect(pngRes.status).toBe(200)
+    expect(pngRes.headers.get('Content-Type')).toBe('image/png')
+    expect(pngRes.headers.get('Content-Disposition')).toContain('ExportBot.png')
+    const outPath = path.join(testDataDir, 'exported.png')
+    fs.writeFileSync(outPath, Buffer.from(await pngRes.arrayBuffer()))
+    const exportedPngJson = JSON.parse(readCharacterCard(outPath)) as Json & { data: Json }
+    expect(exportedPngJson.chat).toBeUndefined()
+    expect(exportedPngJson.fav).toBe(false)
+    expect(exportedPngJson.data.name).toBe('ExportBot')
+    expect((exportedPngJson.data.extensions as Json).fav).toBe(false)
+  })
+
+  it('POST /api/characters/export rejects invalid ST-compatible export requests', async () => {
+    const app = createApp()
+
+    const missingRes = await app.request('/api/characters/export', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ format: 'json' }),
+    })
+    const traversalRes = await app.request('/api/characters/export', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ format: 'json', avatar_url: '../secret.png' }),
+    })
+    const unsupportedRes = await app.request('/api/characters/export', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ format: 'yaml', avatar_url: 'ExportBot.png' }),
+    })
+
+    expect(missingRes.status).toBe(400)
+    expect(traversalRes.status).toBe(400)
+    expect(unsupportedRes.status).toBe(400)
   })
 
   it('GET /api/chats/:name returns empty for unknown character', async () => {
@@ -327,6 +1008,154 @@ describe('API Routes', () => {
     const body = await res.json() as Json
     expect(body).toHaveProperty('chatId')
     expect(body.chatId).toBeTypeOf('string')
+  })
+
+  it('POST /api/chats/get serves read-only ST-compatible raw chat lines', async () => {
+    const app = createApp()
+    const chatDir = path.join(testDataDir, 'chats', 'HistoryBot')
+    fs.mkdirSync(chatDir, { recursive: true })
+    await writeChatFile(path.join(chatDir, 'chat-a.jsonl'), [
+      {
+        chat_metadata: { chat_name: 'Display Name', variables: {} },
+        user_name: 'User',
+        character_name: 'HistoryBot',
+      },
+      {
+        name: 'User',
+        is_user: true,
+        is_system: false,
+        send_date: '2026-06-22T00:00:00.000Z',
+        mes: 'Hello history',
+        extra: {},
+      },
+    ])
+
+    const res = await app.request('/api/chats/get', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ch_name: 'HistoryBot', file_name: 'chat-a.jsonl' }),
+    })
+
+    expect(res.status).toBe(200)
+    const lines = await res.json() as Json[]
+    expect(lines).toHaveLength(2)
+    expect(lines[0]).toMatchObject({ character_name: 'HistoryBot' })
+    expect(lines[1]).toMatchObject({ mes: 'Hello history', is_user: true })
+  })
+
+  it('POST /api/chats/get rejects missing ST-compatible chat lookup fields', async () => {
+    const app = createApp()
+
+    const res = await app.request('/api/chats/get', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ch_name: 'HistoryBot' }),
+    })
+
+    expect(res.status).toBe(400)
+  })
+
+  it('keeps ST-compatible group chat reads explicitly fail-closed', async () => {
+    const app = createApp()
+
+    const res = await app.request('/api/chats/group/get', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: 'group-session.jsonl' }),
+    })
+
+    expect(res.status).toBe(501)
+    await expect(res.json()).resolves.toMatchObject({
+      success: false,
+      blocked: true,
+    })
+  })
+
+  multipartIt('POST /api/chats/import accepts constrained ST-compatible JSONL chat uploads', async () => {
+    const app = createApp()
+    const content = [
+      JSON.stringify({ chat_metadata: { chat_name: 'Imported Chat', custom: true }, user_name: 'Tester', character_name: 'ImportChatBot' }),
+      JSON.stringify({
+        name: 'Tester',
+        is_user: true,
+        is_system: false,
+        send_date: '2026-06-22T00:00:00.000Z',
+        mes: 'Imported hello',
+        extra: { files: [{ name: 'note.txt' }] },
+      }),
+    ].join('\n')
+    const multipart = multipartFormBody([
+      { name: 'avatar', filename: 'session.jsonl', body: Buffer.from(content, 'utf8'), contentType: 'application/json' },
+      { name: 'character_name', value: 'ImportChatBot' },
+      { name: 'user_name', value: 'Tester' },
+    ])
+
+    const res = await app.request('/api/chats/import', {
+      method: 'POST',
+      headers: { 'Content-Type': multipart.contentType },
+      body: multipart.body,
+    })
+
+    expect(res.status).toBe(201)
+    const body = await res.json() as Json
+    expect(body).toMatchObject({ chatId: 'session', file_name: 'session.jsonl', success: true })
+    const stored = await getChat('ImportChatBot', 'session')
+    expect(stored.lines[0]).toMatchObject({ chat_metadata: { chat_name: 'Imported Chat', custom: true } })
+    expect(stored.lines[1]).toMatchObject({ mes: 'Imported hello', extra: { files: [{ name: 'note.txt' }] } })
+  })
+
+  multipartIt('POST /api/chats/import adds metadata and avoids overwriting existing chats', async () => {
+    const app = createApp()
+    const chatDir = path.join(testDataDir, 'chats', 'ImportNoMetaBot')
+    fs.mkdirSync(chatDir, { recursive: true })
+    await writeChatFile(path.join(chatDir, 'session.jsonl'), [
+      { chat_metadata: { chat_name: 'Existing' }, user_name: 'Tester', character_name: 'ImportNoMetaBot' },
+    ])
+    const content = JSON.stringify({
+      name: 'Tester',
+      is_user: true,
+      is_system: false,
+      send_date: '2026-06-22T00:00:00.000Z',
+      mes: 'No metadata',
+      extra: {},
+    })
+    const multipart = multipartFormBody([
+      { name: 'avatar', filename: 'session.jsonl', body: Buffer.from(content, 'utf8'), contentType: 'application/json' },
+      { name: 'character_name', value: 'ImportNoMetaBot' },
+      { name: 'user_name', value: 'Tester' },
+    ])
+
+    const res = await app.request('/api/chats/import', {
+      method: 'POST',
+      headers: { 'Content-Type': multipart.contentType },
+      body: multipart.body,
+    })
+
+    expect(res.status).toBe(201)
+    const body = await res.json() as Json
+    expect(body.chatId).toBe('session-1')
+    const existing = await getChat('ImportNoMetaBot', 'session')
+    expect(existing.lines).toHaveLength(1)
+    const imported = await getChat('ImportNoMetaBot', 'session-1')
+    expect(imported.lines[0]).toMatchObject({ user_name: 'Tester', character_name: 'ImportNoMetaBot' })
+    expect(imported.lines[1]).toMatchObject({ mes: 'No metadata' })
+  })
+
+  multipartIt('POST /api/chats/import rejects invalid JSONL chat uploads', async () => {
+    const app = createApp()
+    const multipart = multipartFormBody([
+      { name: 'avatar', filename: 'bad.jsonl', body: Buffer.from('{not json}', 'utf8'), contentType: 'application/json' },
+      { name: 'character_name', value: 'BadImportBot' },
+    ])
+
+    const res = await app.request('/api/chats/import', {
+      method: 'POST',
+      headers: { 'Content-Type': multipart.contentType },
+      body: multipart.body,
+    })
+
+    expect(res.status).toBe(400)
+    expect(fs.existsSync(path.join(testDataDir, 'chats', 'BadImportBot', 'bad.jsonl'))).toBe(false)
   })
 
   it('PATCH /api/chats/:name/:chatId/metadata writes ST-compatible chat metadata', async () => {
