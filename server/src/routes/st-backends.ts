@@ -26,6 +26,7 @@ import {
 import { consumeNDJSON, consumeSSE } from '../engine/native-stream.js'
 import { fetchModelsFromAPI } from '../services/llm-models.service.js'
 import type { GenerationPreset } from '../services/preset.service.js'
+import { getStCompatModelListResponse } from '../services/st-compat-models.service.js'
 
 const stBackendsRoute = new Hono()
 
@@ -99,17 +100,33 @@ stBackendsRoute.post(
   zValidator('json', stChatCompletionsPayloadSchema),
   async (c) => {
     const payload = c.req.valid('json')
+    if (!hasExplicitProviderConnection(payload)) {
+      return c.json(getStCompatModelListResponse())
+    }
+
     const config = resolveLlmConfigApiKey(configFromStPayload(payload))
     const models = await fetchModelsFromAPI(config)
     return c.json({ data: models.map(id => ({ id })) })
   },
 )
 
+stBackendsRoute.get('/chat-completions/models', (c) => {
+  return c.json(getStCompatModelListResponse())
+})
+
 stBackendsRoute.post(
   '/chat-completions/generate',
   zValidator('json', stChatCompletionsPayloadSchema),
   async (c) => {
     const payload = c.req.valid('json')
+    assertSupportedStPayloadSource(payload)
+    if (!hasExplicitProviderConnection(payload)) {
+      throw createError(
+        ErrorCode.VALIDATION_ERROR,
+        'ST chat-completions generation requires a reverse_proxy, custom_url, proxy_password, or apiKeySessionId.',
+      )
+    }
+
     const config = resolveLlmConfigApiKey(configFromStPayload(payload))
     const preset = presetFromStPayload(payload)
     const messages = messagesFromStPayload(payload)
@@ -124,6 +141,19 @@ stBackendsRoute.post(
     return c.json(openAICompletionResponse(result))
   },
 )
+
+function hasExplicitProviderConnection(payload: StChatCompletionsPayload): boolean {
+  return Boolean(
+    stringValue(payload.reverse_proxy)
+      || stringValue(payload.custom_url)
+      || stringValue(payload.proxy_password)
+      || stringValue(payload.apiKeySessionId),
+  )
+}
+
+function assertSupportedStPayloadSource(payload: StChatCompletionsPayload): void {
+  assertSupportedStSource(normalizeStSource(payload.chat_completion_source))
+}
 
 function configFromStPayload(payload: StChatCompletionsPayload): LLMConfig {
   const source = normalizeStSource(payload.chat_completion_source)

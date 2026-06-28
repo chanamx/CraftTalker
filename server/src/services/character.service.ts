@@ -2,13 +2,22 @@ import fs from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { readCharacterCard, parseCharacterJson, serializeCharacterJson, toStoredCharacterJson, type CharacterCard } from '../lib/png-parser.js'
+import { readCharacterCard, parseCharacterJson, serializeCharacterJson, toStoredCharacterJson, writeCharacterCardToBuffer, type CharacterCard } from '../lib/png-parser.js'
 import { createError, ErrorCode } from '../lib/errors.js'
 import { normalizeWorld, saveWorldBook, type WorldBook } from './world.service.js'
 import { safePath } from '../lib/path-utils.js'
+import {
+  assertSupportedImage,
+  getStoredImageContentType,
+  readValidatedImageUpload,
+  writeAtomicFile,
+  type UploadedImageFile,
+} from '../lib/image-storage.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const DEFAULT_DATA_DIR = path.resolve(__dirname, '../../data')
+const MAX_CHARACTER_AVATAR_BYTES = 10 * 1024 * 1024
+const LEGACY_CHARACTER_AVATAR_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif'])
 
 function getDataDir() { return process.env.LUKER_DATA_DIR ?? DEFAULT_DATA_DIR }
 function getCharactersDir() { return path.join(getDataDir(), 'characters') }
@@ -34,6 +43,8 @@ export interface CharacterDetail extends CharacterCard {
   updated_at: number
 }
 
+export type UploadedCharacterAvatarFile = UploadedImageFile
+
 function getCharDir(name: string): string {
   return safePath(getCharactersDir(), name)
 }
@@ -48,6 +59,18 @@ function getPngPath(name: string): string {
 
 function getAvatarPath(name: string): string {
   return path.join(getCharDir(name), 'avatar.png')
+}
+
+function normalizeLegacyCharacterAvatarFileName(fileName: string): string | null {
+  const normalized = fileName.trim().replaceAll('\\', '/')
+  if (!normalized || normalized.includes('/') || normalized.includes('\0')) return null
+
+  const extension = path.extname(normalized).toLowerCase()
+  if (extension && !LEGACY_CHARACTER_AVATAR_EXTENSIONS.has(extension)) return null
+
+  const characterName = extension ? normalized.slice(0, -extension.length) : normalized
+  if (!characterName || characterName === '.' || characterName === '..' || characterName.includes('..')) return null
+  return characterName
 }
 
 async function readJsonFile(filePath: string): Promise<Record<string, unknown>> {
@@ -267,9 +290,37 @@ export async function cloneCharacter(name: string): Promise<CharacterDetail> {
 }
 
 export async function exportCharacter(name: string): Promise<Record<string, unknown>> {
-  const existing = await getCharacter(name)
-  const { avatar, file_name, created_at, updated_at, ...card } = existing
-  return toStoredCharacterJson(card as CharacterCard)
+  return getShareableCharacterCard(name)
+}
+
+export async function exportCharacterPng(name: string): Promise<{ body: Buffer; fileName: string }> {
+  const avatarPath = getCharacterAvatarPath(name)
+  if (!avatarPath) {
+    throw createError(ErrorCode.CHARACTER_NOT_FOUND, `Character avatar "${name}" was not found`, { characterName: name })
+  }
+
+  const imageBuffer = await fs.readFile(avatarPath)
+  const card = await getShareableCharacterCard(name)
+  return {
+    body: writeCharacterCardToBuffer(imageBuffer, JSON.stringify(card)),
+    fileName: `${name}.png`,
+  }
+}
+
+export async function prepareCharacterAvatarUpload(file: UploadedCharacterAvatarFile): Promise<Buffer> {
+  const { body } = await readValidatedImageUpload(file, {
+    label: 'Character avatar',
+    maxBytes: MAX_CHARACTER_AVATAR_BYTES,
+  })
+  return body
+}
+
+export async function saveCharacterAvatar(name: string, body: Buffer): Promise<void> {
+  assertSupportedImage(body, {
+    label: 'Character avatar',
+    maxBytes: MAX_CHARACTER_AVATAR_BYTES,
+  })
+  await writeAtomicFile(getAvatarPath(name), body)
 }
 
 export async function deleteCharacter(name: string): Promise<boolean> {
@@ -288,7 +339,37 @@ export function getCharacterAvatarPath(name: string): string | null {
   return existsSync(pngPath) ? pngPath : null
 }
 
+export function getLegacyCharacterAvatarPath(fileName: string): string | null {
+  const characterName = normalizeLegacyCharacterAvatarFileName(fileName)
+  return characterName ? getCharacterAvatarPath(characterName) : null
+}
+
+export function getCharacterAvatarContentType(body: Buffer): string {
+  return getStoredImageContentType(body, 'avatar.png')
+}
+
 export function getCharacterPngPath(name: string): string | null {
   const pngPath = getPngPath(name)
   return existsSync(pngPath) ? pngPath : null
+}
+
+async function getShareableCharacterCard(name: string): Promise<Record<string, unknown>> {
+  const existing = await getCharacter(name)
+  const { avatar, file_name, created_at, updated_at, ...card } = existing
+  const stored = toStoredCharacterJson(card as CharacterCard)
+  unsetPrivateCharacterFields(stored)
+  return stored
+}
+
+function unsetPrivateCharacterFields(card: Record<string, unknown>): void {
+  card.fav = false
+  delete card.chat
+  const data = card.data
+  if (data && typeof data === 'object' && !Array.isArray(data)) {
+    const dataRecord = data as Record<string, unknown>
+    const extensions = dataRecord.extensions
+    if (extensions && typeof extensions === 'object' && !Array.isArray(extensions)) {
+      ;(extensions as Record<string, unknown>).fav = false
+    }
+  }
 }

@@ -12,6 +12,12 @@ import { llmRoutes } from './routes/llm.routes.js'
 import { extensionsRoute } from './routes/extensions.js'
 import { stBackendsRoute } from './routes/st-backends.js'
 import { stWorldInfoRoute } from './routes/st-worldinfo.js'
+import { filesRoute, userFilesRoute } from './routes/files.js'
+import { avatarsRoute, userAvatarsRoute } from './routes/avatars.js'
+import { characterAssetsRoute } from './routes/character-assets.js'
+import { stOpenAiRoute } from './routes/st-openai.js'
+import { tokenizersRoute } from './routes/tokenizers.js'
+import { stSdRoute } from './routes/st-sd.js'
 import { appErrorHandler } from './middleware/errorHandler.js'
 import { applyCsrf } from './middleware/csrf.js'
 import { corsOrigin } from './config/origins.js'
@@ -71,6 +77,7 @@ function getCompatPath(normalized: string, fileName: string): string | null {
     'reasoning.js',
     'sse-stream.js',
     'st-context.js',
+    'tags.js',
     'templates.js',
     'tokenizers.js',
     'user.js',
@@ -96,6 +103,17 @@ export function createApp() {
     allowHeaders: ['Content-Type', 'Authorization'],
     credentials: true,
   }))
+
+  app.get('/version', (c) => {
+    c.header('Cache-Control', 'no-cache')
+    return c.json({
+      agent: 'CraftTalker',
+      pkgVersion: '1.12.13',
+      version: '1.12.13',
+      revision: 'crafttalker-compat',
+      isLatest: true,
+    })
+  })
 
   app.get('/scripts/extensions/*', async (c) => {
     const resourcePath = c.req.path.replace(/^\/scripts\/extensions\//, '')
@@ -128,7 +146,7 @@ export function createApp() {
     return c.body(resource.body)
   })
 
-  app.get('/:script{(?:script|lib|char-data|reasoning)\\.js}', async (c) => {
+  app.get('/:script{(?:script|lib|char-data|reasoning|tags)\\.js}', async (c) => {
     const resource = await readPublicRootScriptResource(c.req.param('script'))
     c.header('Content-Type', resource.contentType)
     c.header('Cache-Control', 'no-cache')
@@ -136,6 +154,14 @@ export function createApp() {
   })
 
   app.route('/api', stWorldInfoRoute)
+  app.route('/user/files', userFilesRoute)
+  app.route('/User Avatars', userAvatarsRoute)
+  app.route('/', characterAssetsRoute)
+  app.all('/cors/*', (c) => c.json({
+    success: false,
+    blocked: true,
+    error: 'SillyTavern generic CORS proxy is blocked in the CraftTalker compatibility runtime until an explicit trusted proxy boundary is implemented.',
+  }, 501))
 
   // CSRF protection applies to this routed API app in production.
   const protectedApp = new Hono()
@@ -150,6 +176,11 @@ export function createApp() {
   protectedApp.route('/api/llm', llmRoutes)
   protectedApp.route('/api/extensions', extensionsRoute)
   protectedApp.route('/api/backends', stBackendsRoute)
+  protectedApp.route('/api/openai', stOpenAiRoute)
+  protectedApp.route('/api/tokenizers', tokenizersRoute)
+  protectedApp.route('/api/sd', stSdRoute)
+  protectedApp.route('/api/files', filesRoute)
+  protectedApp.route('/api/avatars', avatarsRoute)
 
   app.route('/', protectedApp)
 

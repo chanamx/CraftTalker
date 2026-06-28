@@ -1,3 +1,4 @@
+import fs from 'node:fs/promises'
 import path from 'node:path'
 import { createError, ErrorCode } from './errors.js'
 
@@ -43,4 +44,15 @@ export function safePath(baseDir: string, ...segments: string[]): string {
   const sanitized = segments.map(s => sanitizePathSegment(s))
   const targetPath = path.join(baseDir, ...sanitized)
   return validatePathInBase(targetPath, baseDir)
+}
+
+export async function writeAtomicFile(filePath: string, body: Buffer): Promise<void> {
+  const directory = path.dirname(filePath)
+  await fs.mkdir(directory, { recursive: true })
+  const tempPath = validatePathInBase(
+    path.join(directory, `.${path.basename(filePath)}.${process.pid}.${Date.now()}.tmp`),
+    directory,
+  )
+  await fs.writeFile(tempPath, body)
+  await fs.rename(tempPath, filePath)
 }

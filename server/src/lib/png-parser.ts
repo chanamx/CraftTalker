@@ -85,6 +85,12 @@ export function readCharacterCard(pngPath: string): string {
 
 export function writeCharacterCard(imagePath: string, jsonData: string, outputPath: string): void {
   const imageBuffer = fs.readFileSync(imagePath)
+  const output = writeCharacterCardToBuffer(imageBuffer, jsonData)
+  fs.mkdirSync(path.dirname(outputPath), { recursive: true })
+  fs.writeFileSync(outputPath, output)
+}
+
+export function writeCharacterCardToBuffer(imageBuffer: Buffer, jsonData: string): Buffer {
   const chunks = readChunks(imageBuffer)
 
   const filtered = chunks.filter(c => {
@@ -123,8 +129,7 @@ export function writeCharacterCard(imagePath: string, jsonData: string, outputPa
     offset += buf.length
   }
 
-  fs.mkdirSync(path.dirname(outputPath), { recursive: true })
-  fs.writeFileSync(outputPath, output)
+  return output
 }
 
 export function parseCharacterJson(raw: string): CharacterCard {

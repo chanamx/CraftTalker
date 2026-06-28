@@ -189,6 +189,29 @@ export interface WorldListItem {
   bound_to: string[]
 }
 
+export interface StWorldInfoSettings {
+  world_names: string[]
+  selected_world_info: string[]
+  world_info: {
+    globalSelect: string[]
+    charLore: Array<Record<string, unknown>>
+    entries: Record<string, WorldBookEntry>
+  }
+  world_info_include_names: boolean
+  world_info_case_sensitive: boolean
+  world_info_match_whole_words: boolean
+  world_info_use_group_scoring: boolean
+  world_info_max_recursion_steps: number
+  world_info_depth: number
+  world_info_min_activations: number
+  world_info_min_activations_depth_max: number
+  world_info_budget: number
+  world_info_budget_cap: number
+  world_info_recursive: boolean
+  world_info_overflow_alert: boolean
+  world_info_character_strategy: number
+}
+
 export function getWorldNamesFromExtensions(extensions: Record<string, unknown> | undefined): string[] {
   if (!extensions) return []
   const names = new Set<string>()
@@ -268,6 +291,37 @@ export async function getWorld(name: string): Promise<WorldBook> {
     throw createError(ErrorCode.WORLD_NOT_FOUND, `世界书 "${name}" 不存在`, { worldName: name })
   }
   return normalizeWorld(await readJsonFile(filePath), name)
+}
+
+export async function getStWorldInfoSettings(): Promise<StWorldInfoSettings> {
+  const worlds = await listWorlds()
+  const worldNames = worlds.map(world => world.name)
+  const selectedWorldInfo = worlds
+    .filter(world => world.global_enabled)
+    .map(world => world.name)
+
+  return {
+    world_names: worldNames,
+    selected_world_info: selectedWorldInfo,
+    world_info: {
+      globalSelect: selectedWorldInfo,
+      charLore: [],
+      entries: {},
+    },
+    world_info_include_names: true,
+    world_info_case_sensitive: false,
+    world_info_match_whole_words: false,
+    world_info_use_group_scoring: false,
+    world_info_max_recursion_steps: 10,
+    world_info_depth: 4,
+    world_info_min_activations: 0,
+    world_info_min_activations_depth_max: 0,
+    world_info_budget: 25,
+    world_info_budget_cap: 0,
+    world_info_recursive: false,
+    world_info_overflow_alert: false,
+    world_info_character_strategy: 0,
+  }
 }
 
 export async function createWorld(name: string, description?: string): Promise<WorldBook> {

@@ -7,8 +7,81 @@ import { llmConfigSchema } from '../lib/llm-config.js'
 import { handleGenerate } from './chat-generation.js'
 import type { GenerationOperation } from '../lib/generation-locks.js'
 import { loadWorldEntriesForGeneration } from '../services/world-info-runtime.service.js'
+import { createError, ErrorCode } from '../lib/errors.js'
 
 const chatsRoute = new Hono()
+const MAX_IMPORTED_CHAT_BYTES = 20 * 1024 * 1024
+
+type UploadedFormFile = {
+  name?: string
+  size?: number
+  type?: string
+  arrayBuffer: () => Promise<ArrayBuffer>
+}
+
+function firstFormValue(body: Record<string, unknown>, key: string): unknown {
+  const value = body[key]
+  return Array.isArray(value) ? value[0] : value
+}
+
+function stringFormValue(body: Record<string, unknown>, key: string): string | undefined {
+  const value = firstFormValue(body, key)
+  return typeof value === 'string' ? value : undefined
+}
+
+function uploadedFileField(body: Record<string, unknown>, key: string): UploadedFormFile | undefined {
+  const value = firstFormValue(body, key)
+  return Boolean(value)
+    && typeof value === 'object'
+    && typeof (value as UploadedFormFile).arrayBuffer === 'function'
+    ? value as UploadedFormFile
+    : undefined
+}
+
+chatsRoute.post('/import', async (c) => {
+  const body = await c.req.parseBody({ all: true })
+  const file = uploadedFileField(body, 'avatar') ?? uploadedFileField(body, 'file')
+  if (!file) {
+    throw createError(ErrorCode.VALIDATION_ERROR, 'Chat import file is required')
+  }
+
+  const characterName = stringFormValue(body, 'character_name') ?? stringFormValue(body, 'ch_name')
+  if (!characterName) {
+    throw createError(ErrorCode.VALIDATION_ERROR, 'character_name is required')
+  }
+
+  const buffer = Buffer.from(await file.arrayBuffer())
+  if (buffer.length > MAX_IMPORTED_CHAT_BYTES) {
+    throw createError(ErrorCode.VALIDATION_ERROR, 'Imported chat file is too large', {
+      maxBytes: MAX_IMPORTED_CHAT_BYTES,
+      size: buffer.length,
+    })
+  }
+
+  const chat = await chatService.importChatJsonl(characterName, buffer.toString('utf8'), {
+    fileName: file.name,
+    userName: stringFormValue(body, 'user_name'),
+  })
+  return c.json({ ...chat, file_name: `${chat.chatId}.jsonl`, success: true }, 201)
+})
+
+const stChatGetSchema = z.object({
+  ch_name: z.string().min(1),
+  file_name: z.string().min(1),
+})
+
+chatsRoute.post('/group/get', (c) => c.json({
+  success: false,
+  blocked: true,
+  error: 'SillyTavern group chat reads are blocked in the CraftTalker compatibility runtime until group data is imported and modeled explicitly.',
+}, 501))
+
+chatsRoute.post('/get', zValidator('json', stChatGetSchema), async (c) => {
+  const { ch_name, file_name } = c.req.valid('json')
+  const chatId = file_name.replace(/\.jsonl$/i, '')
+  const chat = await chatService.getChat(ch_name, chatId)
+  return c.json(chat.lines)
+})
 
 chatsRoute.get('/:characterName', async (c) => {
   const characterName = decodeURIComponent(c.req.param('characterName'))

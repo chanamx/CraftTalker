@@ -23,6 +23,7 @@ import { safePath } from '../lib/path-utils.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const DEFAULT_DATA_DIR = path.resolve(__dirname, '../../data')
+const MAX_IMPORTED_CHAT_LINES = 20000
 
 function getDataDir() { return process.env.LUKER_DATA_DIR ?? DEFAULT_DATA_DIR }
 function getChatsDir() { return path.join(getDataDir(), 'chats') }
@@ -82,6 +83,82 @@ export async function createChat(characterName: string, userName?: string): Prom
   await writeChatFile(filePath, [metadata])
 
   return { chatId, characterName, lines: [metadata] }
+}
+
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value)
+}
+
+function parseImportedChatJsonl(content: string): ChatLine[] {
+  const rawLines = content.split(/\r?\n/).filter(line => line.trim())
+  if (rawLines.length === 0) {
+    throw createError(ErrorCode.VALIDATION_ERROR, 'Imported chat is empty')
+  }
+  if (rawLines.length > MAX_IMPORTED_CHAT_LINES) {
+    throw createError(ErrorCode.VALIDATION_ERROR, 'Imported chat has too many lines', {
+      maxLines: MAX_IMPORTED_CHAT_LINES,
+      lines: rawLines.length,
+    })
+  }
+
+  return rawLines.map((line, index) => {
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(line)
+    } catch {
+      throw createError(ErrorCode.VALIDATION_ERROR, 'Imported chat contains invalid JSONL', { line: index + 1 })
+    }
+    if (!isObjectRecord(parsed)) {
+      throw createError(ErrorCode.VALIDATION_ERROR, 'Imported chat line must be an object', { line: index + 1 })
+    }
+    return parsed as unknown as ChatLine
+  })
+}
+
+function normalizeImportChatId(fileName: string | undefined): string {
+  const rawName = String(fileName || `imported-${Date.now()}.jsonl`).trim()
+  if (!rawName || rawName === '.' || rawName === '..' || rawName.includes('..') || rawName !== path.basename(rawName)) {
+    throw createError(ErrorCode.VALIDATION_ERROR, 'Invalid imported chat file name')
+  }
+
+  const ext = path.extname(rawName).toLowerCase()
+  if (ext && ext !== '.jsonl') {
+    throw createError(ErrorCode.VALIDATION_ERROR, 'Imported chat must be a JSONL file')
+  }
+  return (ext ? rawName.slice(0, -ext.length) : rawName).trim() || `imported-${Date.now()}`
+}
+
+async function getAvailableChatId(characterName: string, preferredChatId: string): Promise<string> {
+  for (let index = 0; index < 1000; index += 1) {
+    const candidate = index === 0 ? preferredChatId : `${preferredChatId}-${index}`
+    if (!existsSync(getChatPath(characterName, candidate))) {
+      return candidate
+    }
+  }
+  throw createError(ErrorCode.VALIDATION_ERROR, 'Could not allocate a chat import file name')
+}
+
+export async function importChatJsonl(
+  characterName: string,
+  content: string,
+  options: { fileName?: string; userName?: string } = {},
+): Promise<ChatDetail> {
+  const lines = parseImportedChatJsonl(content)
+  const firstLine = lines[0]
+
+  if (!('chat_metadata' in firstLine)) {
+    lines.unshift(createChatMetadata(characterName, options.userName))
+  } else {
+    if (!firstLine.character_name) firstLine.character_name = characterName
+    if (!firstLine.user_name && options.userName) firstLine.user_name = options.userName
+  }
+
+  const preferredChatId = normalizeImportChatId(options.fileName)
+  const chatId = await getAvailableChatId(characterName, preferredChatId)
+  const filePath = getChatPath(characterName, chatId)
+  await writeChatFile(filePath, lines)
+
+  return { chatId, characterName, lines }
 }
 
 export async function addMessage(

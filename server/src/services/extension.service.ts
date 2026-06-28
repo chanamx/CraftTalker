@@ -1,5 +1,6 @@
 import fs from 'node:fs/promises'
 import { existsSync } from 'node:fs'
+import type { Dirent } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createError, ErrorCode } from '../lib/errors.js'
@@ -46,6 +47,24 @@ export interface ExtensionRuntimeCapability {
   id: string
   status: ExtensionRuntimeCapabilityStatus
   note: string
+}
+
+export interface ExtensionVersionInfo {
+  currentBranchName: string
+  currentCommitHash: string
+  isUpToDate: boolean
+  remoteUrl: string
+  remoteCommitHash: string
+  shortCommitHash: string
+  extensionPath: string
+  version: string
+  current_branch_name: string
+  current_commit_hash: string
+  is_up_to_date: boolean
+  remote_url: string
+  remote_commit_hash: string
+  short_commit_hash: string
+  extension_path: string
 }
 
 export interface ExtensionCompatibilityReportItem extends ExtensionDiscovery {
@@ -228,6 +247,43 @@ export async function readExtensionManifest(name: string): Promise<ExtensionMani
   return parsed as ExtensionManifest
 }
 
+export async function getExtensionVersionInfo(name: string, globalFlag?: boolean): Promise<ExtensionVersionInfo> {
+  const normalizedName = normalizeRequestedExtensionName(name)
+  const locations = await getExtensionLocations()
+  const location = locations.find(candidate =>
+    candidate.name === normalizedName
+    && (globalFlag === undefined || isGlobalExtensionLocation(candidate) === globalFlag),
+  ) ?? locations.find(candidate => candidate.name === normalizedName)
+
+  if (!location) {
+    throw createError(ErrorCode.NOT_FOUND, `Extension "${normalizedName}" was not found`)
+  }
+
+  const manifest = await readManifestFromLocation(location)
+  const remoteUrl = getManifestRemoteUrl(manifest)
+  const version = typeof manifest.version === 'string' ? manifest.version : ''
+  const currentCommitHash = version ? `manifest:${version}` : ''
+  const shortCommitHash = currentCommitHash ? currentCommitHash.slice(0, 12) : ''
+
+  return {
+    currentBranchName: 'manifest',
+    currentCommitHash,
+    isUpToDate: true,
+    remoteUrl,
+    remoteCommitHash: '',
+    shortCommitHash,
+    extensionPath: location.name,
+    version,
+    current_branch_name: 'manifest',
+    current_commit_hash: currentCommitHash,
+    is_up_to_date: true,
+    remote_url: remoteUrl,
+    remote_commit_hash: '',
+    short_commit_hash: shortCommitHash,
+    extension_path: location.name,
+  }
+}
+
 export async function readExtensionResource(requestPath: string): Promise<{
   filePath: string
   contentType: string
@@ -251,17 +307,24 @@ export async function readExtensionResource(requestPath: string): Promise<{
   const normalizedResourcePath = assertSafeRelativePath(resourcePath)
   const filePath = validatePathInBase(path.join(location.dir, normalizedResourcePath), location.dir)
   let body: Buffer
+  let resolvedFilePath = filePath
   try {
     body = await fs.readFile(filePath)
   } catch (error) {
     if (error instanceof Error && 'code' in error && error.code === 'ENOENT') {
-      throw createError(ErrorCode.NOT_FOUND, 'Extension resource was not found')
+      const aliasPath = await findExtensionAssetAlias(location, normalizedResourcePath)
+      if (!aliasPath) {
+        throw createError(ErrorCode.NOT_FOUND, 'Extension resource was not found')
+      }
+      resolvedFilePath = aliasPath
+      body = await fs.readFile(aliasPath)
+    } else {
+      throw error
     }
-    throw error
   }
   return {
-    filePath,
-    contentType: getContentType(filePath),
+    filePath: resolvedFilePath,
+    contentType: getContentType(resolvedFilePath),
     body,
   }
 }
@@ -414,6 +477,11 @@ export function getDefaultExtensionSettings(): Record<string, unknown> {
     translate: {},
     objective: {},
     quickReply: {},
+    quickReplyV2: {
+      config: {
+        setList: [],
+      },
+    },
     randomizer: {
       controls: [],
       fluctuation: 0.1,
@@ -497,9 +565,62 @@ async function resourceExists(location: ExtensionLocation, resourcePath: string)
   }
 }
 
+async function findExtensionAssetAlias(
+  location: ExtensionLocation,
+  normalizedResourcePath: string,
+): Promise<string | null> {
+  if (
+    location.name !== 'third-party/ST-Prompt-Template'
+    || path.posix.basename(normalizedResourcePath) !== 'codicon.ttf'
+  ) {
+    return null
+  }
+
+  const resourceDir = path.posix.dirname(normalizedResourcePath)
+  const absoluteDir = validatePathInBase(path.join(location.dir, resourceDir), location.dir)
+  let entries: Dirent[]
+  try {
+    entries = await fs.readdir(absoluteDir, { withFileTypes: true })
+  } catch {
+    return null
+  }
+
+  const hashedFonts = entries
+    .filter(entry => entry.isFile() && /^[a-f0-9]{12,}\.ttf$/i.test(entry.name))
+    .map(entry => entry.name)
+
+  if (hashedFonts.length !== 1) return null
+  return validatePathInBase(path.join(absoluteDir, hashedFonts[0]), location.dir)
+}
+
 function getDisabledExtensions(settings: Record<string, unknown>): Set<string> {
   const disabled = settings.disabledExtensions
   return new Set(Array.isArray(disabled) ? disabled.filter((value): value is string => typeof value === 'string') : [])
+}
+
+function normalizeRequestedExtensionName(name: string): string {
+  const raw = String(name ?? '').trim()
+  if (!raw) {
+    throw createError(ErrorCode.VALIDATION_ERROR, 'Extension name is required')
+  }
+  const safeName = assertSafeRelativePath(raw)
+  return safeName.includes('/') ? safeName : `third-party/${safeName}`
+}
+
+function isGlobalExtensionLocation(location: ExtensionLocation): boolean {
+  return location.type === 'global' || location.type === 'system'
+}
+
+function getManifestRemoteUrl(manifest: ExtensionManifest): string {
+  for (const key of ['homePage', 'homepage', 'repo', 'repository', 'url'] as const) {
+    const value = manifest[key]
+    if (typeof value === 'string' && value.trim()) return value.trim()
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+      const nested = (value as Record<string, unknown>).url
+      if (typeof nested === 'string' && nested.trim()) return nested.trim()
+    }
+  }
+  return ''
 }
 
 function getManifestPathValue(value: unknown): string | null {
@@ -555,19 +676,44 @@ function getExtensionRuntimeCapabilities(): ExtensionRuntimeCapability[] {
       note: 'Active chat metadata can write through CraftTalker chat persistence; message-variable and broader ST field writes still need typed bridges.',
     },
     {
+      id: 'user-file-storage',
+      status: 'partial',
+      note: 'Provides constrained ST-compatible /user/files reads plus /api/files/upload and /api/files/delete under the CraftTalker user-file storage directory for extension-owned JSON/text data and LittleWhiteBox vector backup zips.',
+    },
+    {
+      id: 'persona-avatar-api',
+      status: 'partial',
+      note: 'Provides constrained ST-compatible /api/avatars/get, /api/avatars/upload, /api/avatars/delete, and /User Avatars reads for persona images under the CraftTalker user-avatar storage directory; image crop/resize and thumbnail generation remain unimplemented.',
+    },
+    {
+      id: 'chat-history-api',
+      status: 'partial',
+      note: 'Provides ST-compatible chat history summaries through public getPastCharacterChats, raw JSONL line reads through /api/chats/get, and constrained JSONL uploads through /api/chats/import with strict parsing, no arbitrary paths, and no overwrite of existing chat files; broad chat writeback remains blocked.',
+    },
+    {
       id: 'worldbook-api',
       status: 'partial',
       note: 'Worldbook names, global selections, and entries are available through read-only CraftTalker world-service bridges; plugin write operations remain blocked or stubbed.',
     },
     {
+      id: 'character-api',
+      status: 'partial',
+      note: 'Provides native character reads, ST host getCharacters/getOneCharacter/unshallowCharacter mirror refreshes by index/name/file_name/avatar, constrained character data.extensions writeback for plugin fields, legacy read-only /characters/*.png and /thumbnail avatar assets, sanitized ST-compatible /api/characters/export JSON/PNG exports, and narrow ST-compatible /api/characters/create and /api/characters/edit form-data bridges for text fields, alternate greetings, tags, extensions, world binding, talkativeness, favorite flags, and constrained avatar files; /api/characters/import accepts sandboxed filePath imports and ST multipart PNG/JSON card uploads without arbitrary filesystem access.',
+    },
+    {
       id: 'generation-api',
       status: 'partial',
-      note: 'ST host chat-completions status/generate endpoints proxy direct provider calls through CraftTalker provider rules across common OpenAI-compatible, Claude, Gemini, and custom sources; TavernHelper generate/generateRaw can run governed background requests with explicit custom_api/oai_settings, streaming token events, and AbortController cancellation without writing chats, runs, or plugin state.',
+      note: 'ST host chat-completions status/generate endpoints proxy direct provider calls through CraftTalker provider rules across common OpenAI-compatible, Claude, Gemini, and custom sources; fallback model-list GET endpoints and tokenizer count estimates support plugin configuration UIs without exposing keys; TavernHelper generate/generateRaw can run governed background requests with explicit custom_api/oai_settings, streaming token events, and AbortController cancellation without writing chats, runs, or plugin state.',
+    },
+    {
+      id: 'image-and-cors-proxy',
+      status: 'blocked',
+      note: 'ST /api/sd, /api/sd/comfy, and generic /cors proxy endpoints return explicit blocked diagnostics; CraftTalker does not forward arbitrary image-backend or external page requests until a trusted proxy boundary exists.',
     },
     {
       id: 'extension-management',
       status: 'blocked',
-      note: 'Install, update, delete, move, branch switching, and version checks remain disabled server-side.',
+      note: 'Install, update, delete, move, and branch switching remain disabled server-side. Version checks are read-only manifest snapshots for plugin UI compatibility and never perform git or network mutation.',
     },
     {
       id: 'unsafe-script-runtime',
