@@ -1,9 +1,10 @@
-import { Hono } from 'hono'
+import { Hono, type Context } from 'hono'
 import { createError, ErrorCode } from '../lib/errors.js'
-import { getWorld, getStWorldInfoSettings } from '../services/world.service.js'
+import { getWorld, getStWorldInfoSettings, replaceExistingWorldInfo } from '../services/world.service.js'
 import { getWorldInfoPromptForContext } from '../services/world-info-runtime.service.js'
 
 const stWorldInfoRoute = new Hono()
+const stWorldInfoWriteRoute = new Hono()
 
 stWorldInfoRoute.post('/settings/get', async (c) => {
   const settings = await getStWorldInfoSettings()
@@ -34,6 +35,33 @@ stWorldInfoRoute.post('/worldinfo/check', async (c) => {
   })
   return c.json(result)
 })
+
+stWorldInfoWriteRoute.post('/worldinfo/edit', async (c) => saveWorldInfo(c))
+stWorldInfoWriteRoute.post('/worldinfo/save', async (c) => saveWorldInfo(c))
+
+async function saveWorldInfo(c: Context) {
+  const payload = await c.req.json().catch(() => ({})) as Record<string, unknown>
+  const name = stringValue(payload.name)
+  if (!name) {
+    throw createError(ErrorCode.VALIDATION_ERROR, 'World info name is required')
+  }
+
+  const data = worldInfoDataFromPayload(payload)
+  if (!data || !isWorldInfoEntries(data.entries)) {
+    throw createError(ErrorCode.VALIDATION_ERROR, 'World info data with entries is required')
+  }
+
+  const dataName = stringValue(data.name)
+  if (dataName && dataName !== name) {
+    throw createError(ErrorCode.VALIDATION_ERROR, 'World info payload name must match the requested name', {
+      name,
+      dataName,
+    })
+  }
+
+  const world = await replaceExistingWorldInfo(name, data)
+  return c.json(world)
+}
 
 function normalizeWorldInfoPromptChat(value: unknown): Array<string | { name: string | undefined; content: string }> {
   const values = Array.isArray(value) ? value : typeof value === 'string' ? [value] : []
@@ -75,4 +103,16 @@ function recordValue(value: unknown): Record<string, unknown> | undefined {
     : undefined
 }
 
-export { stWorldInfoRoute }
+function worldInfoDataFromPayload(payload: Record<string, unknown>): Record<string, unknown> | undefined {
+  return recordValue(payload.data)
+    ?? recordValue(payload.world)
+    ?? recordValue(payload.worldInfo)
+    ?? recordValue(payload.world_info)
+    ?? (Object.hasOwn(payload, 'entries') ? payload : undefined)
+}
+
+function isWorldInfoEntries(value: unknown): boolean {
+  return Array.isArray(value) || recordValue(value) !== undefined
+}
+
+export { stWorldInfoRoute, stWorldInfoWriteRoute }

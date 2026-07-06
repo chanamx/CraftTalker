@@ -194,7 +194,7 @@ export interface StWorldInfoSettings {
   selected_world_info: string[]
   world_info: {
     globalSelect: string[]
-    charLore: Array<Record<string, unknown>>
+    charLore: StWorldInfoCharLoreEntry[]
     entries: Record<string, WorldBookEntry>
   }
   world_info_include_names: boolean
@@ -212,6 +212,11 @@ export interface StWorldInfoSettings {
   world_info_character_strategy: number
 }
 
+export interface StWorldInfoCharLoreEntry {
+  name: string
+  extraBooks: string[]
+}
+
 export function getWorldNamesFromExtensions(extensions: Record<string, unknown> | undefined): string[] {
   if (!extensions) return []
   const names = new Set<string>()
@@ -224,6 +229,48 @@ export function getWorldNamesFromExtensions(extensions: Record<string, unknown> 
     }
   }
   return [...names]
+}
+
+function getAdditionalWorldNamesFromExtensions(extensions: Record<string, unknown> | undefined): string[] {
+  if (!extensions) return []
+  const primary = typeof extensions.world === 'string' ? extensions.world.trim() : ''
+  const extra = extensions.worlds
+  if (!Array.isArray(extra)) return []
+
+  const names = new Set<string>()
+  for (const item of extra) {
+    if (typeof item !== 'string') continue
+    const name = item.trim()
+    if (!name || name === primary) continue
+    names.add(name)
+  }
+  return [...names]
+}
+
+async function getWorldInfoCharLore(worldNames: string[]): Promise<StWorldInfoCharLoreEntry[]> {
+  const charsDir = path.join(getDataDir(), 'characters')
+  if (!existsSync(charsDir)) return []
+
+  const knownWorldNames = new Set(worldNames)
+  const charLore: StWorldInfoCharLoreEntry[] = []
+  const charDirs = await fs.readdir(charsDir, { withFileTypes: true })
+  for (const d of charDirs.filter(d => d.isDirectory())) {
+    const jsonPath = path.join(charsDir, d.name, 'character.json')
+    if (!existsSync(jsonPath)) continue
+
+    try {
+      const card = parseCharacterJson(JSON.stringify(await readJsonFile(jsonPath)))
+      const extraBooks = getAdditionalWorldNamesFromExtensions(card.extensions as Record<string, unknown> | undefined)
+        .filter(name => knownWorldNames.has(name))
+      if (extraBooks.length > 0) {
+        charLore.push({ name: d.name, extraBooks })
+      }
+    } catch {
+      // Ignore malformed character cards when building the ST-compatible settings mirror.
+    }
+  }
+
+  return charLore.sort((left, right) => left.name.localeCompare(right.name))
 }
 
 export function isWorldGloballyEnabled(world: Pick<WorldBook, 'global_enabled'>, boundTo: string[]): boolean {
@@ -299,13 +346,14 @@ export async function getStWorldInfoSettings(): Promise<StWorldInfoSettings> {
   const selectedWorldInfo = worlds
     .filter(world => world.global_enabled)
     .map(world => world.name)
+  const charLore = await getWorldInfoCharLore(worldNames)
 
   return {
     world_names: worldNames,
     selected_world_info: selectedWorldInfo,
     world_info: {
       globalSelect: selectedWorldInfo,
-      charLore: [],
+      charLore,
       entries: {},
     },
     world_info_include_names: true,
@@ -325,6 +373,11 @@ export async function getStWorldInfoSettings(): Promise<StWorldInfoSettings> {
 }
 
 export async function createWorld(name: string, description?: string): Promise<WorldBook> {
+  const filePath = getWorldPath(name)
+  if (existsSync(filePath)) {
+    throw createError(ErrorCode.VALIDATION_ERROR, `World "${name}" already exists`, { worldName: name })
+  }
+
   const world: WorldBook = {
     name,
     description: description ?? '',
@@ -340,7 +393,6 @@ export async function createWorld(name: string, description?: string): Promise<W
     extensions: {},
   }
 
-  const filePath = getWorldPath(name)
   await fs.mkdir(path.dirname(filePath), { recursive: true })
   const normalized = normalizeWorld(world)
   await fs.writeFile(filePath, JSON.stringify(normalized, null, 2), 'utf8')
@@ -360,6 +412,12 @@ export async function updateWorld(name: string, updates: Partial<WorldBook>): Pr
   const filePath = getWorldPath(name)
   await fs.writeFile(filePath, JSON.stringify(merged, null, 2), 'utf8')
   return merged
+}
+
+export async function replaceExistingWorldInfo(name: string, data: Record<string, unknown>): Promise<WorldBook> {
+  const existing = await getWorld(name)
+  const normalized = normalizeWorld({ ...existing, ...data, name }, name)
+  return saveWorldBook(normalized)
 }
 
 export async function deleteWorld(name: string): Promise<boolean> {

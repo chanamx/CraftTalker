@@ -5,6 +5,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createError, ErrorCode } from '../lib/errors.js'
 import { validatePathInBase } from '../lib/path-utils.js'
+import { getStCorsProxyPolicy, getStImageBackendPolicy } from '../lib/st-proxy-policy.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const DEFAULT_DATA_DIR = path.resolve(__dirname, '../../data')
@@ -649,6 +650,20 @@ function hasManifestDependency(manifestNameSet: Set<string>, dependency: string)
 }
 
 function getExtensionRuntimeCapabilities(): ExtensionRuntimeCapability[] {
+  const corsPolicy = getStCorsProxyPolicy()
+  const imagePolicy = getStImageBackendPolicy()
+  const corsProxyEnabled = corsPolicy.enabled && corsPolicy.allowedHosts.length > 0
+  const imagePingEnabled = imagePolicy.pingEnabled && imagePolicy.allowedOrigins.length > 0
+  const proxyNotes = [
+    corsProxyEnabled
+      ? `Generic /cors proxy is enabled only for trusted hosts: ${corsPolicy.allowedHosts.join(', ')}.`
+      : 'Generic /cors proxy returns explicit blocked diagnostics.',
+    imagePingEnabled
+      ? `ST /api/sd/ping and /api/sd/comfy/ping are enabled only for trusted image backend origins: ${imagePolicy.allowedOrigins.join(', ')}.`
+      : 'ST /api/sd and /api/sd/comfy image-backend proxy endpoints return explicit blocked diagnostics.',
+    'Image generation, model listing, and arbitrary SD/Comfy proxy paths remain blocked.',
+  ]
+
   return [
     {
       id: 'resource-loading',
@@ -693,7 +708,7 @@ function getExtensionRuntimeCapabilities(): ExtensionRuntimeCapability[] {
     {
       id: 'worldbook-api',
       status: 'partial',
-      note: 'Worldbook names, global selections, and entries are available through read-only CraftTalker world-service bridges; plugin write operations remain blocked or stubbed.',
+      note: 'Worldbook names, global selections, and entries are available through CraftTalker world-service bridges; plugins can create empty worldbooks and save existing worldbooks through constrained ST-compatible bridges, while whole-worldbook delete and command-style selection writes remain blocked.',
     },
     {
       id: 'character-api',
@@ -707,8 +722,8 @@ function getExtensionRuntimeCapabilities(): ExtensionRuntimeCapability[] {
     },
     {
       id: 'image-and-cors-proxy',
-      status: 'blocked',
-      note: 'ST /api/sd, /api/sd/comfy, and generic /cors proxy endpoints return explicit blocked diagnostics; CraftTalker does not forward arbitrary image-backend or external page requests until a trusted proxy boundary exists.',
+      status: corsProxyEnabled || imagePingEnabled ? 'partial' : 'blocked',
+      note: proxyNotes.join(' '),
     },
     {
       id: 'extension-management',

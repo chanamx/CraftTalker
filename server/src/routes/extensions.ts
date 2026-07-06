@@ -9,6 +9,7 @@ import {
   saveExtensionSettings,
 } from '../services/extension.service.js'
 import { createError, ErrorCode } from '../lib/errors.js'
+import { createBlockedCompatCapability } from '../lib/st-compat-capabilities.js'
 
 const extensionsRoute = new Hono()
 
@@ -57,11 +58,15 @@ extensionsRoute.post('/version', zValidator('json', extensionVersionSchema), asy
 })
 
 function notImplemented(name: string) {
+  const payload = createBlockedCompatCapability({
+    capabilityId: 'extension-management',
+    feature: `SillyTavern extension ${name}`,
+    reason: 'extension mutation is not enabled',
+    trustRequirement: 'Extension install/update/delete needs trusted source validation, explicit user consent, filesystem sandboxing, and an operation journal.',
+  })
   return {
-    success: false,
-    message: `SillyTavern extension ${name} is blocked in the CraftTalker compatibility runtime.`,
-    error: `SillyTavern extension ${name} is blocked in the CraftTalker compatibility runtime.`,
-    blocked: true,
+    ...payload,
+    message: payload.error,
   }
 }
 

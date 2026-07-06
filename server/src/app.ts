@@ -11,13 +11,14 @@ import { llmSessionsRoute } from './routes/llm-sessions.js'
 import { llmRoutes } from './routes/llm.routes.js'
 import { extensionsRoute } from './routes/extensions.js'
 import { stBackendsRoute } from './routes/st-backends.js'
-import { stWorldInfoRoute } from './routes/st-worldinfo.js'
+import { stWorldInfoRoute, stWorldInfoWriteRoute } from './routes/st-worldinfo.js'
 import { filesRoute, userFilesRoute } from './routes/files.js'
 import { avatarsRoute, userAvatarsRoute } from './routes/avatars.js'
 import { characterAssetsRoute } from './routes/character-assets.js'
 import { stOpenAiRoute } from './routes/st-openai.js'
 import { tokenizersRoute } from './routes/tokenizers.js'
 import { stSdRoute } from './routes/st-sd.js'
+import { stCorsRoute } from './routes/st-cors.js'
 import { appErrorHandler } from './middleware/errorHandler.js'
 import { applyCsrf } from './middleware/csrf.js'
 import { corsOrigin } from './config/origins.js'
@@ -157,15 +158,12 @@ export function createApp() {
   app.route('/user/files', userFilesRoute)
   app.route('/User Avatars', userAvatarsRoute)
   app.route('/', characterAssetsRoute)
-  app.all('/cors/*', (c) => c.json({
-    success: false,
-    blocked: true,
-    error: 'SillyTavern generic CORS proxy is blocked in the CraftTalker compatibility runtime until an explicit trusted proxy boundary is implemented.',
-  }, 501))
+  app.route('/cors', stCorsRoute)
 
   // CSRF protection applies to this routed API app in production.
   const protectedApp = new Hono()
   applyCsrf(protectedApp)
+  protectedApp.route('/api', stWorldInfoWriteRoute)
   protectedApp.route('/api/characters', charactersRoute)
   protectedApp.route('/api/chats', chatsRoute)
   protectedApp.route('/api/worlds', worldsRoute)
