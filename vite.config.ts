@@ -106,7 +106,7 @@ export default defineConfig(({ mode }) => {
     exclude: [
       '**/node_modules/**',
       '**/dist/**',
-      '**/server/data/extensions/**',
+      '**/server/**',
     ],
     css: false,
   },
