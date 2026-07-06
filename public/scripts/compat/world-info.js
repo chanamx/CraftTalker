@@ -59,8 +59,11 @@ export function loadWorldInfo(name) {
   return host.loadWorldInfo(name)
 }
 
-export function saveWorldInfo() {
-  return Promise.resolve(blockWorldInfoWrite('saveWorldInfo', false))
+export function saveWorldInfo(name, data, immediately = false) {
+  if (typeof host.saveWorldInfo !== 'function') {
+    return Promise.resolve(blockWorldInfoWrite('saveWorldInfo', false))
+  }
+  return host.saveWorldInfo(name, data, immediately)
 }
 
 export function updateWorldInfoList() {
@@ -224,16 +227,40 @@ export function parseRegexFromString(value) {
   }
 }
 
-export function createNewWorldInfo() {
-  return Promise.resolve(blockWorldInfoWrite('createNewWorldInfo', null))
+export function createNewWorldInfo(name, options = {}) {
+  if (typeof host.createNewWorldInfo !== 'function') {
+    return Promise.resolve(blockWorldInfoWrite('createNewWorldInfo', false))
+  }
+  return host.createNewWorldInfo(name, options)
 }
 
-export function createWorldInfoEntry() {
-  return blockWorldInfoWrite('createWorldInfoEntry', null)
+export function createWorldInfoEntry(_name, data) {
+  const entries = getWorldInfoEntries(data)
+  if (!entries) return blockWorldInfoWrite('createWorldInfoEntry', undefined)
+  const uid = getFreeWorldEntryUid(data)
+  if (!Number.isInteger(uid)) return blockWorldInfoWrite('createWorldInfoEntry', undefined)
+  const entry = { ...structuredClone(newWorldInfoEntryTemplate), uid }
+  entries[uid] = entry
+  host.recordCompatDiagnostic?.(
+    'createWorldInfoEntry',
+    'partial',
+    'Created an in-memory worldbook entry in the provided ST data object; persistence requires saveWorldInfo.',
+  )
+  return entry
 }
 
-export function deleteWorldInfoEntry() {
-  return Promise.resolve(blockWorldInfoWrite('deleteWorldInfoEntry', false))
+export async function deleteWorldInfoEntry(data, uid) {
+  const entries = getWorldInfoEntries(data)
+  const key = String(uid ?? '')
+  if (!entries) return blockWorldInfoWrite('deleteWorldInfoEntry', false)
+  if (!Object.hasOwn(entries, key)) return false
+  delete entries[key]
+  host.recordCompatDiagnostic?.(
+    'deleteWorldInfoEntry',
+    'partial',
+    'Deleted an in-memory worldbook entry from the provided ST data object; persistence requires saveWorldInfo.',
+  )
+  return true
 }
 
 export function deleteWorldInfo() {
@@ -251,9 +278,19 @@ export function setWIOriginalDataValue(entry, key, value) {
   return entry
 }
 
-export function onWorldInfoChange(args) {
+export function onWorldInfoChange(args, text = '') {
   if (typeof args !== 'function') {
-    return blockWorldInfoWrite('onWorldInfoChange', '')
+    if (typeof host.setWorldInfoSelection !== 'function') {
+      return Promise.resolve(blockWorldInfoWrite('onWorldInfoChange', ''))
+    }
+    if (!args || typeof args !== 'object' || Array.isArray(args)) {
+      return Promise.resolve(blockWorldInfoWrite('onWorldInfoChange', ''))
+    }
+
+    const state = normalizeWorldInfoSelectionState(args.state, text)
+    if (!state) return Promise.resolve(blockWorldInfoWrite('onWorldInfoChange', ''))
+
+    return host.setWorldInfoSelection(normalizeWorldInfoSelectionNames(text), state).then(() => '')
   }
   return () => {}
 }
@@ -262,9 +299,44 @@ function blockWorldInfoWrite(id, fallback) {
   host.recordCompatDiagnostic?.(
     id,
     'blocked',
-    'Public world-info.js write helpers are blocked; CraftTalker exposes read-only worldbook compatibility until a permissioned write bridge is implemented.',
+    'This public world-info.js helper is blocked unless CraftTalker exposes a matching permissioned compatibility bridge.',
   )
   return fallback
+}
+
+function normalizeWorldInfoSelectionState(value, text) {
+  if (value === undefined || value === null || value === '') {
+    return String(text ?? '').trim() ? 'on' : 'off'
+  }
+  if (value === true) return 'on'
+  if (value === false) return 'off'
+  const state = String(value).trim().toLowerCase()
+  if (state === 'on' || state === 'true' || state === '1') return 'on'
+  if (state === 'off' || state === 'false' || state === '0') return 'off'
+  if (state === 'toggle') return 'toggle'
+  return null
+}
+
+function normalizeWorldInfoSelectionNames(text) {
+  const value = String(text ?? '').trim()
+  if (!value) return []
+  if (host.world_names?.includes(value)) return [value]
+  return value.split(',').map(part => part.trim()).filter(Boolean)
+}
+
+export function getFreeWorldEntryUid(data) {
+  const entries = getWorldInfoEntries(data)
+  if (!entries) return null
+  for (let uid = 0; uid < 1_000_000; uid += 1) {
+    if (!Object.hasOwn(entries, String(uid)) && !Object.hasOwn(entries, uid)) return uid
+  }
+  return null
+}
+
+function getWorldInfoEntries(data) {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return null
+  if (!data.entries || typeof data.entries !== 'object' || Array.isArray(data.entries)) return null
+  return data.entries
 }
 
 export function setWorldInfoButtonClass() {}
@@ -281,6 +353,7 @@ export default {
   getWorldInfoPrompt,
   checkWorldInfo,
   getWorldInfoSettings,
+  onWorldInfoChange,
   charUpdatePrimaryWorld,
   reloadEditor,
   convertCharacterBook,

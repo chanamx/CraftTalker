@@ -128,6 +128,7 @@ function refreshContextExports() {
   name2 = String(context.name2 ?? '')
   online_status = String(context.onlineStatus ?? 'no_connection')
   max_context = Number(context.maxContext ?? 0)
+  syncSendPressExport()
 }
 
 refreshContextExports()
@@ -140,7 +141,40 @@ for (const eventName of new Set([
 ].filter(Boolean))) {
   host.eventSource.on(eventName, refreshContextExports)
 }
+installGenerationStateHooks()
 installContextRefreshHooks()
+
+function readHostSendPressState() {
+  const context = typeof host?.getContext === 'function' ? host.getContext() : {}
+  if (typeof host?.isGenerating === 'function') return Boolean(host.isGenerating())
+  const contextIsGenerating = context?.isGenerating
+  if (typeof contextIsGenerating === 'function') return Boolean(contextIsGenerating())
+  if (typeof context?.is_send_press === 'boolean') return context.is_send_press
+  if (typeof host?.is_send_press === 'boolean') return host.is_send_press
+  return is_send_press
+}
+
+function syncSendPressExport(value) {
+  is_send_press = typeof value === 'boolean' ? value : readHostSendPressState()
+}
+
+function installGenerationStateHooks() {
+  const startedEvents = [
+    host.event_types?.GENERATION_STARTED,
+    host.event_types?.JS_GENERATION_STARTED,
+  ].filter(Boolean)
+  const finishedEvents = [
+    host.event_types?.GENERATION_ENDED,
+    host.event_types?.JS_GENERATION_ENDED,
+    host.event_types?.GENERATION_STOPPED,
+  ].filter(Boolean)
+  for (const eventName of new Set(startedEvents)) {
+    host.eventSource?.on?.(eventName, () => syncSendPressExport(true))
+  }
+  for (const eventName of new Set(finishedEvents)) {
+    host.eventSource?.on?.(eventName, () => syncSendPressExport(false))
+  }
+}
 
 function installContextRefreshHooks() {
   const documentEvents = ['pointerdown', 'click', 'focusin']
@@ -251,10 +285,15 @@ export function stopGeneration() {
   host.eventSource.emit(host.event_types.GENERATION_STOPPED)
 }
 export function activateSendButtons(...args) {
+  is_send_press = false
   return callHostOrContextFunction('activateSendButtons', ...args)
 }
 export function deactivateSendButtons(...args) {
+  is_send_press = true
   return callHostOrContextFunction('deactivateSendButtons', ...args)
+}
+export function isGenerating() {
+  return Boolean(is_send_press || readHostSendPressState())
 }
 export function updateChatMetadata(...args) {
   return callHostOrContextFunction('updateChatMetadata', ...args)
