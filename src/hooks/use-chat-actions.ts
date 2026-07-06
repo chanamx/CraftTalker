@@ -56,6 +56,7 @@ export function useChatActions(messages: ChatMessage[]) {
         const err = await response.json().catch(() => ({ error: '请求失败' }))
         toast.error(err.error ?? '请求失败')
         endStream(key)
+        emitStExtensionEvent(stEventTypes.GENERATION_ENDED)
         return
       }
 

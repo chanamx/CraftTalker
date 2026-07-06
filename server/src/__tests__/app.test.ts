@@ -75,10 +75,15 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  vi.restoreAllMocks()
   vi.unstubAllGlobals()
   clearGenerationLocksForTest()
   clearLlmKeySessionsForTest()
   delete process.env.LUKER_DATA_DIR
+  delete process.env.CRAFTTALKER_ST_CORS_PROXY_ENABLED
+  delete process.env.CRAFTTALKER_ST_CORS_PROXY_ALLOWLIST
+  delete process.env.CRAFTTALKER_ST_IMAGE_BACKEND_PING_ENABLED
+  delete process.env.CRAFTTALKER_ST_IMAGE_BACKEND_ALLOWLIST
   fs.rmSync(testDataDir, { recursive: true, force: true })
 })
 
@@ -162,6 +167,133 @@ describe('API Routes', () => {
         blocked: true,
       })
     }
+  })
+
+  it('proxies ST-compatible /cors GET requests only for trusted hosts', async () => {
+    process.env.CRAFTTALKER_ST_CORS_PROXY_ENABLED = 'true'
+    process.env.CRAFTTALKER_ST_CORS_PROXY_ALLOWLIST = '93.184.216.34'
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('<main>ok</main>', {
+      status: 200,
+      headers: {
+        'Content-Length': '15',
+        'Content-Type': 'text/html; charset=utf-8',
+      },
+    }))
+    const app = createApp()
+
+    const res = await app.request('/cors/https://93.184.216.34/widget.html?mode=embed')
+
+    expect(res.status).toBe(200)
+    expect(res.headers.get('Content-Type')).toBe('text/html; charset=utf-8')
+    expect(res.headers.get('X-Content-Type-Options')).toBe('nosniff')
+    expect(await res.text()).toBe('<main>ok</main>')
+    expect(String(fetchSpy.mock.calls[0]?.[0])).toBe('https://93.184.216.34/widget.html?mode=embed')
+  })
+
+  it('pings trusted ST-compatible SD and Comfy image backends without opening full proxy paths', async () => {
+    process.env.CRAFTTALKER_ST_IMAGE_BACKEND_PING_ENABLED = 'true'
+    process.env.CRAFTTALKER_ST_IMAGE_BACKEND_ALLOWLIST = 'http://127.0.0.1:7860 http://127.0.0.1:8188'
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('[]', { status: 200 }))
+    const app = createApp()
+
+    const sdRes = await app.request('/api/sd/ping', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: 'http://127.0.0.1:7860/ui/settings', auth: 'user:pass' }),
+    })
+    const comfyRes = await app.request('/api/sd/comfy/ping', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: 'http://127.0.0.1:8188' }),
+    })
+    const blockedModelsRes = await app.request('/api/sd/models', { method: 'POST' })
+
+    expect(sdRes.status).toBe(200)
+    expect(comfyRes.status).toBe(200)
+    await expect(sdRes.json()).resolves.toMatchObject({ success: true, ok: true })
+    await expect(comfyRes.json()).resolves.toMatchObject({ success: true, ok: true })
+    expect(String(fetchSpy.mock.calls[0]?.[0])).toBe('http://127.0.0.1:7860/sdapi/v1/sd-models')
+    expect(fetchSpy.mock.calls[0]?.[1]?.headers).toMatchObject({
+      Authorization: `Basic ${Buffer.from('user:pass', 'utf8').toString('base64')}`,
+    })
+    expect(String(fetchSpy.mock.calls[1]?.[0])).toBe('http://127.0.0.1:8188/system_stats')
+    expect(blockedModelsRes.status).toBe(501)
+  })
+
+  it('rejects ST-compatible image backend ping outside the trusted origin allowlist', async () => {
+    process.env.CRAFTTALKER_ST_IMAGE_BACKEND_PING_ENABLED = 'true'
+    process.env.CRAFTTALKER_ST_IMAGE_BACKEND_ALLOWLIST = 'http://127.0.0.1:7860'
+    const fetchSpy = vi.spyOn(globalThis, 'fetch')
+    const app = createApp()
+
+    const res = await app.request('/api/sd/ping', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: 'http://127.0.0.1:9999' }),
+    })
+
+    expect(res.status).toBe(403)
+    await expect(res.json()).resolves.toMatchObject({
+      success: false,
+      blocked: true,
+      capabilityId: 'image-backend-proxy',
+      reason: 'target origin is not in the trusted allowlist',
+    })
+    expect(fetchSpy).not.toHaveBeenCalled()
+  })
+
+  it('rejects /cors requests outside the trusted host allowlist', async () => {
+    process.env.CRAFTTALKER_ST_CORS_PROXY_ENABLED = 'true'
+    process.env.CRAFTTALKER_ST_CORS_PROXY_ALLOWLIST = 'example.com'
+    const fetchSpy = vi.spyOn(globalThis, 'fetch')
+    const app = createApp()
+
+    const res = await app.request('/cors/https://evil.example/widget.html')
+
+    expect(res.status).toBe(403)
+    await expect(res.json()).resolves.toMatchObject({
+      success: false,
+      blocked: true,
+      capabilityId: 'network-proxy',
+      reason: 'target host is not in the trusted allowlist',
+    })
+    expect(fetchSpy).not.toHaveBeenCalled()
+  })
+
+  it('rejects /cors targets that use private addresses', async () => {
+    process.env.CRAFTTALKER_ST_CORS_PROXY_ENABLED = 'true'
+    process.env.CRAFTTALKER_ST_CORS_PROXY_ALLOWLIST = '127.0.0.1'
+    const fetchSpy = vi.spyOn(globalThis, 'fetch')
+    const app = createApp()
+
+    const res = await app.request('/cors/https://127.0.0.1/admin')
+
+    expect(res.status).toBe(403)
+    await expect(res.json()).resolves.toMatchObject({
+      success: false,
+      blocked: true,
+      capabilityId: 'network-proxy',
+      reason: 'private or reserved IP addresses are not allowed',
+    })
+    expect(fetchSpy).not.toHaveBeenCalled()
+  })
+
+  it('rejects non-read-only /cors methods before proxying', async () => {
+    process.env.CRAFTTALKER_ST_CORS_PROXY_ENABLED = 'true'
+    process.env.CRAFTTALKER_ST_CORS_PROXY_ALLOWLIST = 'example.com'
+    const fetchSpy = vi.spyOn(globalThis, 'fetch')
+    const app = createApp()
+
+    const res = await app.request('/cors/https://example.com/widget.html', { method: 'POST' })
+
+    expect(res.status).toBe(405)
+    await expect(res.json()).resolves.toMatchObject({
+      success: false,
+      blocked: true,
+      capabilityId: 'network-proxy',
+      reason: 'only GET and HEAD requests are supported',
+    })
+    expect(fetchSpy).not.toHaveBeenCalled()
   })
 
   it('serves ST-compatible user files uploaded by extensions from a constrained storage directory', async () => {
@@ -1315,6 +1447,29 @@ describe('API Routes', () => {
     expect(fs.existsSync(path.join(testDataDir, 'worlds', 'TestWorld.json'))).toBe(true)
   })
 
+  it('POST /api/worlds rejects duplicate world names instead of overwriting existing data', async () => {
+    const app = createApp()
+    fs.writeFileSync(
+      path.join(testDataDir, 'worlds', 'TestWorld.json'),
+      JSON.stringify({
+        name: 'TestWorld',
+        description: 'keep me',
+        entries: { 1: { uid: 1, content: 'existing lore' } },
+      }),
+      'utf8',
+    )
+
+    const res = await app.request('/api/worlds', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'TestWorld', description: 'overwrite attempt' }),
+    })
+
+    expect(res.status).toBe(400)
+    const saved = JSON.parse(fs.readFileSync(path.join(testDataDir, 'worlds', 'TestWorld.json'), 'utf8')) as Json
+    expect(saved.description).toBe('keep me')
+  })
+
   it('reads nameless ST world files using the filename and preserves uid zero entries', async () => {
     const app = createApp()
     fs.writeFileSync(
@@ -1576,6 +1731,19 @@ describe('API Routes', () => {
       }),
       'utf8',
     )
+    const charDir = path.join(testDataDir, 'characters', 'LoreBot')
+    fs.mkdirSync(charDir, { recursive: true })
+    fs.writeFileSync(
+      path.join(charDir, 'character.json'),
+      JSON.stringify({
+        spec: 'chara_card_v2',
+        spec_version: '2.0',
+        name: 'LoreBot',
+        description: 'Uses an additional character lorebook',
+        extensions: { world: 'GlobalLore', worlds: ['GlobalLore', 'LocalLore'] },
+      }),
+      'utf8',
+    )
 
     const worldsRes = await app.request('/api/worlds/settings')
     const stRes = await app.request('/api/settings/get', { method: 'POST' })
@@ -1585,7 +1753,11 @@ describe('API Routes', () => {
     for (const body of [await worldsRes.json(), await stRes.json()] as Array<Json>) {
       expect(body.world_names).toEqual(expect.arrayContaining(['GlobalLore', 'LocalLore']))
       expect(body.selected_world_info).toEqual(['GlobalLore'])
-      expect(body.world_info).toMatchObject({ globalSelect: ['GlobalLore'], charLore: [], entries: {} })
+      expect(body.world_info).toMatchObject({
+        globalSelect: ['GlobalLore'],
+        charLore: [{ name: 'LoreBot', extraBooks: ['LocalLore'] }],
+        entries: {},
+      })
       expect(body.world_info_max_recursion_steps).toBe(10)
       expect(body.world_info_depth).toBe(4)
       expect(body.world_info_min_activations).toBe(0)
@@ -1635,6 +1807,91 @@ describe('API Routes', () => {
     })
   })
 
+  it('persists existing worldbooks through the constrained ST-compatible worldinfo edit endpoint', async () => {
+    const app = createApp()
+    const filePath = path.join(testDataDir, 'worlds', 'GlobalLore.json')
+    fs.writeFileSync(
+      filePath,
+      JSON.stringify({
+        name: 'GlobalLore',
+        description: 'old',
+        enabled: true,
+        global_enabled: true,
+        preserved_top_level: 'keep-me',
+        entries: {},
+      }),
+      'utf8',
+    )
+
+    const res = await app.request('/api/worldinfo/edit', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: 'GlobalLore',
+        data: {
+          description: 'new',
+          plugin_state: { source: 'LittleWhiteBox' },
+          entries: {
+            3: {
+              uid: 3,
+              keys: ['gate'],
+              content: 'The saved gate hums.',
+              extensions: { display_index: 9, custom_extension: 'keep-me-too' },
+            },
+          },
+        },
+      }),
+    })
+
+    expect(res.status).toBe(200)
+    const body = await res.json() as Json & { entries: Record<string, Json> }
+    expect(body).toMatchObject({
+      name: 'GlobalLore',
+      description: 'new',
+      preserved_top_level: 'keep-me',
+      plugin_state: { source: 'LittleWhiteBox' },
+    })
+    expect(body.entries['3']).toMatchObject({
+      uid: 3,
+      key: ['gate'],
+      content: 'The saved gate hums.',
+      display_index: 9,
+      extensions: { custom_extension: 'keep-me-too' },
+    })
+
+    const saved = JSON.parse(fs.readFileSync(filePath, 'utf8')) as Json & { entries: Record<string, Json> }
+    expect(saved.entries['3']?.content).toBe('The saved gate hums.')
+    expect(saved.preserved_top_level).toBe('keep-me')
+  })
+
+  it('rejects unsafe ST-compatible worldinfo edits', async () => {
+    const app = createApp()
+    fs.writeFileSync(
+      path.join(testDataDir, 'worlds', 'GlobalLore.json'),
+      JSON.stringify({
+        name: 'GlobalLore',
+        enabled: true,
+        global_enabled: true,
+        entries: {},
+      }),
+      'utf8',
+    )
+
+    const missingEntries = await app.request('/api/worldinfo/edit', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'GlobalLore', data: { description: 'no entries' } }),
+    })
+    const mismatchedName = await app.request('/api/worldinfo/edit', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'GlobalLore', data: { name: 'OtherLore', entries: {} } }),
+    })
+
+    expect(missingEntries.status).toBe(400)
+    expect(mismatchedName.status).toBe(400)
+  })
+
   it('serves ST-compatible read-only worldinfo prompt checks', async () => {
     const app = createApp()
     fs.writeFileSync(
@@ -1681,6 +1938,175 @@ describe('API Routes', () => {
     expect(body.worldInfoBefore).toContain('The dragon remembers the old gate.')
     expect(body.worldInfoAfter).toBe('')
     expect(body.allActivatedEntries[0]).toMatchObject({ world: 'GlobalLore', uid: 1 })
+  })
+
+  it('serves ST-compatible worldinfo checks for character-bound non-global worldbooks', async () => {
+    const app = createApp()
+    const charDir = path.join(testDataDir, 'characters', 'BoundScanBot')
+    fs.mkdirSync(charDir, { recursive: true })
+    fs.writeFileSync(
+      path.join(charDir, 'character.json'),
+      JSON.stringify({
+        spec: 'chara_card_v2',
+        spec_version: '2.0',
+        name: 'BoundScanBot',
+        description: 'Scans only its bound lorebook.',
+        extensions: { world: 'LocalLore' },
+      }),
+      'utf8',
+    )
+    fs.writeFileSync(
+      path.join(testDataDir, 'worlds', 'LocalLore.json'),
+      JSON.stringify({
+        name: 'LocalLore',
+        enabled: true,
+        global_enabled: false,
+        scan_depth: 4,
+        entries: {
+          2: {
+            uid: 2,
+            key: ['lantern'],
+            content: 'The bound lantern glows only for BoundScanBot.',
+            enabled: true,
+            position: 0,
+            insertion_order: 20,
+          },
+        },
+      }),
+      'utf8',
+    )
+
+    const res = await app.request('/api/worldinfo/check', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        characterName: 'BoundScanBot',
+        chat: [{ name: 'You', mes: 'The lantern is lit.' }],
+        maxContext: 4096,
+        isDryRun: true,
+      }),
+    })
+
+    expect(res.status).toBe(200)
+    const body = await res.json() as Json & {
+      matchedEntries: Array<Json & { content: string }>
+      allActivatedEntries: Array<Json & { world: string; uid: number; sourceType: string }>
+    }
+    expect(body.matchedEntries).toHaveLength(1)
+    expect(body.matchedEntries[0]?.content).toBe('The bound lantern glows only for BoundScanBot.')
+    expect(body.allActivatedEntries[0]).toMatchObject({
+      world: 'LocalLore',
+      uid: 2,
+      sourceType: 'character',
+    })
+  })
+
+  it('persists non-dry-run worldinfo timed metadata and clears consumed vector activations', async () => {
+    const app = createApp()
+    const charDir = path.join(testDataDir, 'characters', 'TimedBot')
+    fs.mkdirSync(charDir, { recursive: true })
+    fs.writeFileSync(
+      path.join(charDir, 'character.json'),
+      JSON.stringify({
+        spec: 'chara_card_v2',
+        spec_version: '2.0',
+        name: 'TimedBot',
+        description: 'Uses timed and vector lore.',
+        extensions: { world: 'TimedLore' },
+      }),
+      'utf8',
+    )
+    fs.writeFileSync(
+      path.join(testDataDir, 'worlds', 'TimedLore.json'),
+      JSON.stringify({
+        name: 'TimedLore',
+        enabled: true,
+        global_enabled: false,
+        entries: {
+          3: {
+            uid: 3,
+            key: ['dragon'],
+            content: 'The sticky dragon stays in context.',
+            enabled: true,
+            position: 0,
+            insertion_order: 10,
+            sticky: 2,
+          },
+          4: {
+            uid: 4,
+            key: ['missing-vector-key'],
+            content: 'The vector-only memory was recalled.',
+            enabled: true,
+            position: 0,
+            insertion_order: 20,
+            vectorized: true,
+          },
+        },
+      }),
+      'utf8',
+    )
+
+    const createChatRes = await app.request('/api/chats/TimedBot', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ userName: 'Tester' }),
+    })
+    expect(createChatRes.status).toBe(201)
+    const createdChat = await createChatRes.json() as Json & { chatId: string }
+
+    const metadataRes = await app.request(`/api/chats/TimedBot/${createdChat.chatId}/metadata`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_metadata: {
+          worldInfoBuffer: {
+            externalActivations: [
+              { world: 'TimedLore', uid: 4, source: 'route-test-vector', score: 0.73 },
+            ],
+          },
+        },
+      }),
+    })
+    expect(metadataRes.status).toBe(200)
+
+    const res = await app.request('/api/worldinfo/check', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        characterName: 'TimedBot',
+        chatId: createdChat.chatId,
+        chat: [{ name: 'You', content: 'A dragon is nearby.' }],
+        maxContext: 4096,
+        isDryRun: false,
+      }),
+    })
+
+    expect(res.status).toBe(200)
+    const body = await res.json() as Json & {
+      matchedEntries: Array<Json & { content: string }>
+      vectorizedActivated: Array<Json & { world: string; uid: number; source: string; score: number }>
+      timedEffectsChanged: boolean
+    }
+    expect(body.matchedEntries.map(entry => entry.content)).toEqual(expect.arrayContaining([
+      'The sticky dragon stays in context.',
+      'The vector-only memory was recalled.',
+    ]))
+    expect(body.vectorizedActivated[0]).toMatchObject({
+      world: 'TimedLore',
+      uid: 4,
+      source: 'route-test-vector',
+      score: 0.73,
+    })
+    expect(body.timedEffectsChanged).toBe(true)
+
+    const storedChatRes = await app.request(`/api/chats/TimedBot/${createdChat.chatId}`)
+    expect(storedChatRes.status).toBe(200)
+    const storedChat = await storedChatRes.json() as Json & { lines: Json[] }
+    const metadata = storedChat.lines[0]?.chat_metadata as Json
+    const timedWorldInfo = metadata.timedWorldInfo as Json
+    const sticky = timedWorldInfo.sticky as Record<string, Json>
+    expect(sticky['TimedLore.3']).toMatchObject({ start: 1, end: 3 })
+    expect(metadata.worldInfoBuffer).toEqual({})
   })
 
   it('rejects ST-compatible worldinfo get requests without a name', async () => {

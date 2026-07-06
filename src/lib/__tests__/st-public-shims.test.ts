@@ -19,7 +19,10 @@ interface TestGlobal {
       getCharacters?: () => Promise<Array<Record<string, unknown>>>
       getOneCharacter?: (id: unknown) => Promise<Record<string, unknown> | null>
       unshallowCharacter?: (id: unknown) => Promise<Record<string, unknown> | null>
+      createNewWorldInfo?: (name: string, options?: Record<string, unknown>) => Promise<boolean>
+      setWorldInfoSelection?: (names: string | string[], state: 'on' | 'off' | 'toggle') => Promise<boolean>
       loadWorldInfo?: (name: string) => Promise<unknown>
+      saveWorldInfo?: (name: string, data: unknown, immediately?: boolean) => Promise<boolean>
       updateWorldInfoList?: () => Promise<void>
       recordCompatDiagnostic?: (id: string, status: string, note: string) => void
       messageFormatting?: (...args: unknown[]) => string
@@ -464,31 +467,63 @@ describe('ST public compatibility shims', () => {
 
   it('forwards legacy public UI helpers to the active ST context when available', async () => {
     const reloadCurrentChat = vi.fn()
-    const activateSendButtons = vi.fn()
-    const deactivateSendButtons = vi.fn()
+    let sendPressed = false
+    const activateSendButtons = vi.fn(() => {
+      sendPressed = false
+    })
+    const deactivateSendButtons = vi.fn(() => {
+      sendPressed = true
+    })
     const scrollChatToBottom = vi.fn()
     const setGenerationProgress = vi.fn()
+    const eventHandlers = new Map<string, Array<() => void>>()
+    const eventSource = {
+      on: vi.fn((eventName: unknown, callback: unknown) => {
+        if (typeof eventName !== 'string' || typeof callback !== 'function') return
+        const handlers = eventHandlers.get(eventName) ?? []
+        handlers.push(callback as () => void)
+        eventHandlers.set(eventName, handlers)
+      }),
+    }
     testGlobal().CraftTalker = {
       stHost: {
         getRequestHeaders: () => ({ 'Content-Type': 'application/json' }),
         getContext: () => ({
           this_chid: 0,
+          get is_send_press() {
+            return sendPressed
+          },
+          isGenerating: () => sendPressed,
           reloadCurrentChat,
           activateSendButtons,
           deactivateSendButtons,
           scrollChatToBottom,
           setGenerationProgress,
         }),
-        event_types: { CHAT_CHANGED: 'chat_changed', APP_READY: 'app_ready' },
-        eventSource: { on: vi.fn() },
+        event_types: {
+          CHAT_CHANGED: 'chat_changed',
+          APP_READY: 'app_ready',
+          GENERATION_STARTED: 'generation_started',
+          JS_GENERATION_STARTED: 'js_generation_started',
+          GENERATION_ENDED: 'generation_ended',
+          JS_GENERATION_ENDED: 'js_generation_ended',
+          GENERATION_STOPPED: 'generation_stopped',
+        },
+        eventSource,
       },
     }
 
     const scriptShim = await importScriptShim()
 
+    expect(scriptShim.is_send_press).toBe(false)
+    expect(scriptShim.isGenerating()).toBe(false)
     scriptShim.reloadCurrentChat()
-    scriptShim.activateSendButtons()
     scriptShim.deactivateSendButtons()
+    expect(scriptShim.is_send_press).toBe(true)
+    expect(scriptShim.isGenerating()).toBe(true)
+    scriptShim.activateSendButtons()
+    expect(scriptShim.is_send_press).toBe(false)
+    expect(scriptShim.isGenerating()).toBe(false)
     scriptShim.scrollChatToBottom({ waitForFrame: true })
     scriptShim.setGenerationProgress(50)
 
@@ -497,6 +532,12 @@ describe('ST public compatibility shims', () => {
     expect(deactivateSendButtons).toHaveBeenCalledOnce()
     expect(scrollChatToBottom).toHaveBeenCalledWith({ waitForFrame: true })
     expect(setGenerationProgress).toHaveBeenCalledWith(50)
+    eventHandlers.get('generation_started')?.forEach(callback => callback())
+    expect(scriptShim.is_send_press).toBe(true)
+    expect(scriptShim.isGenerating()).toBe(true)
+    eventHandlers.get('generation_ended')?.forEach(callback => callback())
+    expect(scriptShim.is_send_press).toBe(false)
+    expect(scriptShim.isGenerating()).toBe(false)
   })
 
   it('exposes lightweight runtime-only named exports required by common third-party plugins', async () => {
@@ -1205,6 +1246,79 @@ describe('ST public compatibility shims', () => {
     expect(worldInfoShim.wi_anchor_position).toEqual({ before: 0, after: 1 })
   })
 
+  it('routes public world info saves through the permissioned host bridge', async () => {
+    const saveWorldInfo = vi.fn().mockResolvedValue(true)
+    testGlobal().CraftTalker = {
+      stHost: {
+        getRequestHeaders: () => ({ 'Content-Type': 'application/json' }),
+        world_names: ['GlobalLore'],
+        selected_world_info: ['GlobalLore'],
+        world_info: { globalSelect: ['GlobalLore'], charLore: [], entries: {} },
+        world_info_settings: {},
+        loadWorldInfo: async () => null,
+        saveWorldInfo,
+        updateWorldInfoList: async () => {},
+      },
+    }
+
+    const worldInfoShim = await importWorldInfoShim()
+    const data = { entries: { 1: { uid: 1, content: 'saved' } } }
+
+    await expect(worldInfoShim.saveWorldInfo('GlobalLore', data, true)).resolves.toBe(true)
+    expect(saveWorldInfo).toHaveBeenCalledWith('GlobalLore', data, true)
+  })
+
+  it('supports safe in-memory world info entry helpers used before saveWorldInfo', async () => {
+    const diagnostics: Array<{ id: string; status: string; note: string }> = []
+    testGlobal().CraftTalker = {
+      stHost: {
+        getRequestHeaders: () => ({ 'Content-Type': 'application/json' }),
+        world_names: ['GlobalLore'],
+        selected_world_info: ['GlobalLore'],
+        world_info: { globalSelect: ['GlobalLore'], charLore: [], entries: {} },
+        world_info_settings: {},
+        loadWorldInfo: async () => null,
+        updateWorldInfoList: async () => {},
+        recordCompatDiagnostic: (id, status, note) => diagnostics.push({ id, status, note }),
+      },
+    }
+
+    const worldInfoShim = await importWorldInfoShim()
+    const data: { entries: Record<number, unknown> } = { entries: { 0: { uid: 0, content: 'old' } } }
+    const entry = worldInfoShim.createWorldInfoEntry('GlobalLore', data)
+
+    expect(entry).toMatchObject({ uid: 1, key: [], content: '', enabled: true })
+    expect(data.entries[1]).toBe(entry)
+    await expect(worldInfoShim.deleteWorldInfoEntry(data, 0, { silent: true })).resolves.toBe(true)
+    expect(data.entries[0]).toBeUndefined()
+    expect(worldInfoShim.getFreeWorldEntryUid(data)).toBe(0)
+    expect(diagnostics.map(item => [item.id, item.status])).toEqual([
+      ['createWorldInfoEntry', 'partial'],
+      ['deleteWorldInfoEntry', 'partial'],
+    ])
+  })
+
+  it('routes public world info creation through the permissioned host bridge', async () => {
+    const createNewWorldInfo = vi.fn().mockResolvedValue(true)
+    testGlobal().CraftTalker = {
+      stHost: {
+        getRequestHeaders: () => ({ 'Content-Type': 'application/json' }),
+        world_names: [],
+        selected_world_info: [],
+        world_info: { globalSelect: [], charLore: [], entries: {} },
+        world_info_settings: {},
+        createNewWorldInfo,
+        loadWorldInfo: async () => null,
+        updateWorldInfoList: async () => {},
+      },
+    }
+
+    const worldInfoShim = await importWorldInfoShim()
+
+    await expect(worldInfoShim.createNewWorldInfo('NewLore', { interactive: false })).resolves.toBe(true)
+    expect(createNewWorldInfo).toHaveBeenCalledWith('NewLore', { interactive: false })
+  })
+
   it('blocks public world info write helpers without mutating local mirrors', async () => {
     const diagnostics: Array<{ id: string; status: string; note: string }> = []
     const entries: Record<string, unknown> = {}
@@ -1223,8 +1337,8 @@ describe('ST public compatibility shims', () => {
 
     const worldInfoShim = await importWorldInfoShim()
 
-    expect(await worldInfoShim.createNewWorldInfo('NewLore')).toBeNull()
-    expect(worldInfoShim.createWorldInfoEntry('GlobalLore', { uid: 7, content: 'ghost' })).toBeNull()
+    expect(await worldInfoShim.createNewWorldInfo('NewLore')).toBe(false)
+    expect(worldInfoShim.createWorldInfoEntry('GlobalLore', { uid: 7, content: 'ghost' })).toBeUndefined()
     await expect(worldInfoShim.saveWorldInfo('GlobalLore')).resolves.toBe(false)
     await expect(worldInfoShim.deleteWorldInfoEntry('GlobalLore', 7)).resolves.toBe(false)
     await expect(worldInfoShim.deleteWorldInfo('GlobalLore')).resolves.toBe(false)
@@ -1242,12 +1356,43 @@ describe('ST public compatibility shims', () => {
     ])
   })
 
-  it('blocks command-style world info selection changes without mutating active worlds', async () => {
+  it('routes command-style world info selection changes through the host bridge', async () => {
     const diagnostics: Array<{ id: string; status: string; note: string }> = []
+    const setWorldInfoSelection = vi.fn().mockResolvedValue(true)
     testGlobal().CraftTalker = {
       stHost: {
         getRequestHeaders: () => ({ 'Content-Type': 'application/json' }),
         world_names: ['GlobalLore', 'CharacterLore'],
+        selected_world_info: ['GlobalLore'],
+        world_info: { globalSelect: ['GlobalLore'], charLore: [], entries: {} },
+        world_info_settings: {},
+        loadWorldInfo: async () => null,
+        updateWorldInfoList: async () => {},
+        setWorldInfoSelection,
+        recordCompatDiagnostic: (id, status, note) => diagnostics.push({ id, status, note }),
+      },
+    }
+
+    const worldInfoShim = await importWorldInfoShim()
+
+    await expect(worldInfoShim.onWorldInfoChange({ state: 'off', silent: true }, 'GlobalLore')).resolves.toBe('')
+    await expect(worldInfoShim.onWorldInfoChange({ state: 'toggle' }, 'GlobalLore, CharacterLore')).resolves.toBe('')
+    await expect(worldInfoShim.onWorldInfoChange({ silent: true }, '')).resolves.toBe('')
+    await expect(worldInfoShim.onWorldInfoChange('__notSlashCommand__')).resolves.toBe('')
+    expect(setWorldInfoSelection).toHaveBeenNthCalledWith(1, ['GlobalLore'], 'off')
+    expect(setWorldInfoSelection).toHaveBeenNthCalledWith(2, ['GlobalLore', 'CharacterLore'], 'toggle')
+    expect(setWorldInfoSelection).toHaveBeenNthCalledWith(3, [], 'off')
+    expect(diagnostics.map(item => [item.id, item.status])).toEqual([
+      ['onWorldInfoChange', 'blocked'],
+    ])
+  })
+
+  it('keeps world info selection writes blocked when no host bridge is available', async () => {
+    const diagnostics: Array<{ id: string; status: string; note: string }> = []
+    testGlobal().CraftTalker = {
+      stHost: {
+        getRequestHeaders: () => ({ 'Content-Type': 'application/json' }),
+        world_names: ['GlobalLore'],
         selected_world_info: ['GlobalLore'],
         world_info: { globalSelect: ['GlobalLore'], charLore: [], entries: {} },
         world_info_settings: {},
@@ -1259,11 +1404,9 @@ describe('ST public compatibility shims', () => {
 
     const worldInfoShim = await importWorldInfoShim()
 
-    expect(worldInfoShim.onWorldInfoChange({ state: 'off', silent: true }, 'GlobalLore')).toBe('')
-    expect(worldInfoShim.onWorldInfoChange('__notSlashCommand__')).toBe('')
+    await expect(worldInfoShim.onWorldInfoChange({ state: 'off' }, 'GlobalLore')).resolves.toBe('')
     expect(worldInfoShim.selected_world_info).toEqual(['GlobalLore'])
     expect(diagnostics.map(item => [item.id, item.status])).toEqual([
-      ['onWorldInfoChange', 'blocked'],
       ['onWorldInfoChange', 'blocked'],
     ])
   })

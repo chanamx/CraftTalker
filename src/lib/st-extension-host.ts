@@ -113,6 +113,37 @@ interface ExtensionPrompt {
   role?: unknown
 }
 
+type WorldInfoCharLoreEntry = {
+  name: string
+  extraBooks: string[]
+}
+
+type WorldInfoCharLoreNormalization = {
+  entries: WorldInfoCharLoreEntry[]
+  invalidEntries: string[]
+  missingCharacters: string[]
+  missingWorldbooks: string[]
+}
+type CompatMediaType = 'image' | 'video' | 'audio'
+type CompatMediaAttachment = {
+  type: CompatMediaType
+  url: string
+  title: string
+}
+type CompatFileAttachment = {
+  name: string
+  size: string
+  url: string
+}
+type CompatMessageMedia = {
+  media: CompatMediaAttachment[]
+  files: CompatFileAttachment[]
+  mediaDisplay: 'list' | 'gallery'
+  mediaIndex: number
+  hideMessageText: boolean
+  skipped: number
+}
+
 interface StHostApi {
   CLIENT_VERSION: string
   ARGUMENT_TYPE: typeof ARGUMENT_TYPE
@@ -126,6 +157,8 @@ interface StHostApi {
   characters: Array<Record<string, unknown>>
   event_types: typeof event_types
   eventSource: StEventEmitter
+  is_send_press: boolean
+  isGenerating: typeof isGenerating
   extension_settings: ExtensionSettings
   extensionNames: string[]
   extensionTypes: Record<string, string>
@@ -146,7 +179,10 @@ interface StHostApi {
   getContext: typeof getContext
   getExtensionManifest: typeof getExtensionManifest
   getRequestHeaders: typeof getRequestHeaders
+  createNewWorldInfo: typeof createNewWorldInfo
+  setWorldInfoSelection: typeof setWorldInfoSelection
   loadWorldInfo: typeof loadWorldInfo
+  saveWorldInfo: typeof saveWorldInfo
   updateWorldInfoList: typeof updateWorldInfoList
   initialize: typeof initializeStExtensionHost
   ModuleWorkerWrapper: typeof SimpleMutex
@@ -169,6 +205,9 @@ interface StHostApi {
   unshallowCharacter: typeof unshallowCharacter
   writeExtensionField: typeof writeExtensionField
   writeExtensionFieldBulk: typeof writeExtensionFieldBulk
+  reloadCurrentChat: typeof reloadCurrentChat
+  activateSendButtons: typeof activateSendButtons
+  deactivateSendButtons: typeof deactivateSendButtons
   updateMessageBlock: typeof updateMessageBlock
   printMessages: typeof printMessages
   clearChat: typeof clearChat
@@ -231,6 +270,10 @@ declare global {
     executeSlashCommandsWithOptions?: typeof executeSlashCommandsWithOptions
     messageFormatting?: typeof messageFormatting
     reloadMarkdownProcessor?: typeof reloadMarkdownProcessor
+    reloadCurrentChat?: typeof reloadCurrentChat
+    activateSendButtons?: typeof activateSendButtons
+    deactivateSendButtons?: typeof deactivateSendButtons
+    isGenerating?: typeof isGenerating
     updateMessageBlock?: typeof updateMessageBlock
     printMessages?: typeof printMessages
     clearChat?: typeof clearChat
@@ -500,6 +543,8 @@ const world_names: string[] = []
 const selected_world_info: string[] = []
 const world_info: Record<string, unknown> = { globalSelect: selected_world_info, charLore: [], entries: {} }
 const world_info_settings: StWorldInfoRuntimeSettings = createDefaultWorldInfoSettings()
+let persistedSelectedWorldInfoSnapshot: string[] = []
+let persistedWorldInfoCharLoreSnapshot: WorldInfoCharLoreEntry[] = []
 const character_variables: VariableScope = {}
 const preset_variables: VariableScope = {}
 const script_variables: VariableScope = {}
@@ -510,6 +555,8 @@ let saveMetadataTimer: number | null = null
 let saveChatTimer: number | null = null
 let initializePromise: Promise<void> | null = null
 let currentCharacterIndex = -1
+let compatIsSendPress = false
+let compatGenerationStateHooksInstalled = false
 let contextState: StHostContextState = {
   activeCharacter: null,
   activeChatId: null,
@@ -642,6 +689,7 @@ export function registerSlashCommand(
 }
 
 export async function executeSlashCommands(text = '', optionsOrReturnResultObject: unknown = {}): Promise<unknown> {
+  ensureBuiltInSlashCommands()
   const options = typeof optionsOrReturnResultObject === 'boolean'
     ? { returnResultObject: optionsOrReturnResultObject }
     : isPlainRecord(optionsOrReturnResultObject)
@@ -651,6 +699,7 @@ export async function executeSlashCommands(text = '', optionsOrReturnResultObjec
 }
 
 export async function executeSlashCommandsWithOptions(input: unknown = '', options: Record<string, unknown> = {}): Promise<unknown> {
+  ensureBuiltInSlashCommands()
   const text = getSlashCommandText(input, options)
   const trimmed = replaceVariableMacros(text).trim()
   try {
@@ -675,6 +724,101 @@ export async function executeSlashCommandsWithOptions(input: unknown = '', optio
 
 function executeSlashCommandsWithResultObject(input: unknown = '', options: Record<string, unknown> = {}): Promise<unknown> {
   return executeSlashCommandsWithOptions(input, { ...options, returnResultObject: true })
+}
+
+function ensureBuiltInSlashCommands(): void {
+  const builtIns: Array<[string, SlashCommandCallback]> = [
+    ['pass', (_args, unnamed) => unnamed],
+    ['echo', (_args, unnamed) => {
+      if (unnamed) {
+        const severity = String(_args.severity ?? 'info')
+        const toast = severity === 'error' ? toastr.error : severity === 'warning' ? toastr.warning : toastr.info
+        toast.call(toastr, unnamed)
+      }
+      return unnamed
+    }],
+    ['messages', (args, unnamed) => formatSlashMessages(String(unnamed ?? ''), args)],
+    ['hide', (_args, unnamed) => setSlashMessageSystemState(String(unnamed ?? ''), true)],
+    ['unhide', (_args, unnamed) => setSlashMessageSystemState(String(unnamed ?? ''), false)],
+  ]
+
+  for (const [name, callback] of builtIns) {
+    if (!SlashCommandParser.commands[name]) {
+      SlashCommandParser.addCommandObjectUnsafe(SlashCommand.fromProps({
+        name,
+        callback,
+        helpString: 'CraftTalker built-in ST compatibility command.',
+      }))
+    }
+  }
+}
+
+function formatSlashMessages(rangeText: string, args: Record<string, unknown>): string {
+  const { start, end } = parseSlashMessageRange(rangeText)
+  const includeNames = parseSlashBoolean(args.names, true)
+  return chat
+    .map((message, index) => ({ message, index }))
+    .filter(({ index }) => index >= start && index <= end)
+    .filter(({ message }) => !message.is_system)
+    .map(({ message }) => {
+      const text = String(message.mes ?? '')
+      if (!includeNames) return text
+      const name = String(message.name ?? (message.is_user ? getCompatUserName() : getCompatCharacterName()))
+      return `${name}: ${text}`
+    })
+    .join('\n')
+}
+
+function setSlashMessageSystemState(rangeText: string, isSystem: boolean): string {
+  const { start, end } = parseSlashMessageRange(rangeText)
+  let changed = 0
+  for (let index = start; index <= end; index += 1) {
+    const message = chat[index]
+    if (!message || Boolean(message.is_system) === isSystem) continue
+    message.is_system = isSystem
+    const sourceIndex = Number(message._lineIndex)
+    const line = Number.isInteger(sourceIndex) ? contextState.chatLines[sourceIndex] : undefined
+    if (line && 'mes' in line) line.is_system = isSystem
+    renderCompatMessageBlock(index, message)
+    changed += 1
+  }
+  recordCompatDiagnostic(
+    isSystem ? 'hideSlashCommand' : 'unhideSlashCommand',
+    'partial',
+    'Updated message visibility only in the ST compatibility chat mirror; native chat storage was not mutated.',
+  )
+  return String(changed)
+}
+
+function parseSlashMessageRange(value: string): { start: number, end: number } {
+  const fallbackEnd = Math.max(0, chat.length - 1)
+  const match = /(-?\d+)(?:\s*-\s*(-?\d+))?/.exec(value)
+  if (!match) return { start: 0, end: fallbackEnd }
+  const start = clampMessageIndex(Number(match[1]), 0)
+  const end = clampMessageIndex(Number(match[2] ?? match[1]), fallbackEnd)
+  return start <= end ? { start, end } : { start: end, end: start }
+}
+
+function clampMessageIndex(value: number, fallback: number): number {
+  if (!Number.isInteger(value)) return fallback
+  return Math.min(Math.max(value, 0), Math.max(0, chat.length - 1))
+}
+
+function parseSlashBoolean(value: unknown, fallback: boolean): boolean {
+  if (typeof value !== 'string') return fallback
+  if (/^(false|off|no|0)$/i.test(value)) return false
+  if (/^(true|on|yes|1)$/i.test(value)) return true
+  return fallback
+}
+
+function getCompatUserName(): string {
+  const header = contextState.chatLines.find(line => line.user_name)
+  return String(header?.user_name ?? 'You')
+}
+
+function getCompatCharacterName(): string {
+  const header = contextState.chatLines.find(line => line.character_name)
+  return String(header?.character_name ?? contextState.activeCharacter?.name ?? '')
 }
 
 export function getGlobalVariable(name: unknown): unknown {
@@ -748,6 +892,9 @@ export async function STscript(command: unknown): Promise<unknown> {
 export function replaceVariableMacros(value: unknown, context: MacroLikeContext = {}): string {
   let output = String(value ?? '')
   output = output
+    .replace(/\{\{user\}\}/gi, getCompatUserName())
+    .replace(/\{\{char\}\}/gi, getCompatCharacterName())
+    .replace(/\{\{lastMessageId\}\}/gi, String(Math.max(-1, chat.length - 1)))
     .replace(/\{\{getvar::([^}]+)\}\}/gi, (_, path: string) => stringifyMacroValue(getVariableValue({ type: 'chat' }, path)))
     .replace(/\{\{getglobalvar::([^}]+)\}\}/gi, (_, path: string) => stringifyMacroValue(getVariableValue({ type: 'global' }, path)))
     .replace(/\{\{xbgetvar::([^}]+)\}\}/gi, (_, path: string) => stringifyMacroValue(getVariableValue({ type: 'chat' }, path)))
@@ -901,12 +1048,16 @@ export function getContext(): Record<string, unknown> {
     name2: contextState.activeCharacter?.name ?? '',
     characterId: currentCharacterIndex,
     this_chid: currentCharacterIndex,
+    get is_send_press() {
+      return compatIsSendPress
+    },
+    isGenerating,
     groupId: null,
     chatId: contextState.activeChatId,
     chat_metadata,
     getCurrentChatId: () => contextState.activeChatId,
     getRequestHeaders,
-    reloadCurrentChat: async () => recordCompatDiagnostic('reloadCurrentChat', 'stub', 'Current chat reload is not wired to the native chat loader yet.'),
+    reloadCurrentChat,
     renameChat: async () => recordCompatDiagnostic('renameChat', 'stub', 'Chat rename through the ST compatibility context is not implemented yet.'),
     saveSettingsDebounced,
     onlineStatus: 'no_connection',
@@ -933,13 +1084,16 @@ export function getContext(): Record<string, unknown> {
     world_info_settings,
     world_names,
     selected_world_info,
+    createNewWorldInfo,
+    setWorldInfoSelection,
+    saveWorldInfo,
     setExtensionPrompt,
     getExtensionPromptByName,
     saveChat: saveChatConditional,
     saveMetadata,
     sendSystemMessage: () => recordCompatDiagnostic('sendSystemMessage', 'stub', 'System message injection must go through native chat service semantics.'),
-    activateSendButtons: () => recordCompatDiagnostic('activateSendButtons', 'stub', 'Native React send controls are not exposed through ST DOM helpers.'),
-    deactivateSendButtons: () => recordCompatDiagnostic('deactivateSendButtons', 'stub', 'Native React send controls are not exposed through ST DOM helpers.'),
+    activateSendButtons,
+    deactivateSendButtons,
     saveReply: async () => recordCompatDiagnostic('saveReply', 'stub', 'Direct saveReply is not wired to CraftTalker chat persistence yet.'),
     updateMessageBlock,
     printMessages,
@@ -1018,6 +1172,337 @@ export function getRequestHeaders(): Record<string, string> {
   return { 'Content-Type': 'application/json' }
 }
 
+export async function createNewWorldInfo(name: string): Promise<boolean> {
+  const worldName = String(name ?? '').trim()
+  if (!worldName) {
+    recordCompatDiagnostic('createNewWorldInfo', 'blocked', 'Worldbook creation requires a non-empty name.')
+    return false
+  }
+  if (world_names.includes(worldName)) {
+    recordCompatDiagnostic('createNewWorldInfo', 'blocked', `Worldbook "${worldName}" already exists and was not overwritten.`)
+    return false
+  }
+
+  try {
+    const world = await api.worlds.create(worldName)
+    cacheWorldInfo(world)
+    syncCompatWorldSelects()
+    await eventSource.emit(event_types.WORLDINFO_UPDATED, worldName, world)
+    recordCompatDiagnostic('createNewWorldInfo', 'partial', 'Created an empty CraftTalker worldbook through the permissioned ST compatibility bridge.')
+    return true
+  } catch (error) {
+    recordCompatDiagnostic('createNewWorldInfo', 'stub', `Worldbook "${worldName}" could not be created through CraftTalker world services.`)
+    console.warn('[ST Compat] Failed to create world info', worldName, error)
+    return false
+  }
+}
+
+type WorldInfoSelectionState = 'on' | 'off' | 'toggle'
+
+export async function setWorldInfoSelection(
+  names: string | string[],
+  state: WorldInfoSelectionState = 'on',
+): Promise<boolean> {
+  const targetNames = normalizeWorldInfoSelectionTargets(names)
+  if (targetNames.length === 0) {
+    if (state === 'on') {
+      recordCompatDiagnostic('setWorldInfoSelection', 'blocked', 'Worldbook selection requires a known worldbook name when enabling.')
+      return false
+    }
+    targetNames.push(...selected_world_info)
+  }
+
+  const missing = targetNames.filter(name => !world_names.includes(name))
+  if (missing.length > 0) {
+    recordCompatDiagnostic('setWorldInfoSelection', 'blocked', `Worldbook selection ignored unknown worldbook(s): ${missing.join(', ')}.`)
+    return false
+  }
+
+  const selected = new Set(selected_world_info)
+  const updates = targetNames
+    .map((name) => {
+      const nextSelected = state === 'toggle' ? !selected.has(name) : state === 'on'
+      return { name, global_enabled: nextSelected }
+    })
+    .filter(update => selected.has(update.name) !== update.global_enabled)
+
+  try {
+    await applyWorldInfoSelectionUpdates(updates)
+    recordCompatDiagnostic('setWorldInfoSelection', 'partial', 'Global worldbook selection was persisted through CraftTalker world services.')
+    return true
+  } catch (error) {
+    recordCompatDiagnostic('setWorldInfoSelection', 'stub', 'Worldbook selection could not be persisted through CraftTalker world services.')
+    console.warn('[ST Compat] Failed to update world info selection', targetNames, error)
+    return false
+  }
+}
+
+async function persistSelectedWorldInfoMirrorIfChanged(): Promise<void> {
+  const source = Array.isArray(world_info.globalSelect) && world_info.globalSelect !== selected_world_info
+    ? world_info.globalSelect
+    : selected_world_info
+  const desired = normalizeWorldInfoSelectionTargets(source)
+  if (!sameStringArray(selected_world_info, desired)) {
+    selected_world_info.splice(0, selected_world_info.length, ...desired)
+    world_info.globalSelect = selected_world_info
+    syncCompatWorldSelects()
+  }
+  if (sameStringArray(desired, persistedSelectedWorldInfoSnapshot)) return
+
+  const missing = desired.filter(name => !world_names.includes(name))
+  if (missing.length > 0) {
+    selected_world_info.splice(0, selected_world_info.length, ...persistedSelectedWorldInfoSnapshot)
+    world_info.globalSelect = selected_world_info
+    syncCompatWorldSelects()
+    recordCompatDiagnostic('saveSettingsWorldInfoSelection', 'blocked', `Ignored unknown worldbook(s) in selected_world_info: ${missing.join(', ')}.`)
+    return
+  }
+
+  const selected = new Set(persistedSelectedWorldInfoSnapshot)
+  const desiredSet = new Set(desired)
+  const updates = [
+    ...desired.filter(name => !selected.has(name)).map(name => ({ name, global_enabled: true })),
+    ...persistedSelectedWorldInfoSnapshot.filter(name => !desiredSet.has(name)).map(name => ({ name, global_enabled: false })),
+  ]
+  if (updates.length === 0) {
+    syncSelectedWorldInfoSnapshot()
+    return
+  }
+
+  try {
+    await applyWorldInfoSelectionUpdates(updates)
+    recordCompatDiagnostic('saveSettingsWorldInfoSelection', 'partial', 'Persisted direct selected_world_info changes through CraftTalker world services.')
+  } catch (error) {
+    selected_world_info.splice(0, selected_world_info.length, ...persistedSelectedWorldInfoSnapshot)
+    world_info.globalSelect = selected_world_info
+    syncCompatWorldSelects()
+    recordCompatDiagnostic('saveSettingsWorldInfoSelection', 'stub', 'Direct selected_world_info changes could not be persisted through CraftTalker world services.')
+    console.warn('[ST Compat] Failed to persist selected_world_info mirror', desired, error)
+  }
+}
+
+async function persistWorldInfoCharLoreMirrorIfChanged(source: unknown = world_info.charLore): Promise<void> {
+  const desiredResult = normalizeWorldInfoCharLoreEntries(source, { allowPersistedCharacters: true })
+  if (
+    desiredResult.invalidEntries.length > 0
+    || desiredResult.missingCharacters.length > 0
+    || desiredResult.missingWorldbooks.length > 0
+  ) {
+    restoreWorldInfoCharLoreSnapshot()
+    const details = [
+      desiredResult.invalidEntries.length > 0 ? `invalid entries: ${desiredResult.invalidEntries.join(', ')}` : '',
+      desiredResult.missingCharacters.length > 0 ? `unknown character(s): ${desiredResult.missingCharacters.join(', ')}` : '',
+      desiredResult.missingWorldbooks.length > 0 ? `unknown worldbook(s): ${desiredResult.missingWorldbooks.join(', ')}` : '',
+    ].filter(Boolean).join('; ')
+    recordCompatDiagnostic('saveSettingsWorldInfoCharLore', 'blocked', `Ignored unsafe world_info.charLore changes (${details}).`)
+    return
+  }
+
+  const desired = desiredResult.entries
+  if (sameWorldInfoCharLoreEntries(desired, persistedWorldInfoCharLoreSnapshot)) return
+
+  try {
+    await persistCharacterWorldInfoBindings(desired)
+    await updateWorldInfoList()
+    recordCompatDiagnostic('saveSettingsWorldInfoCharLore', 'partial', 'Persisted direct world_info.charLore changes through constrained character worldbook bindings.')
+  } catch (error) {
+    restoreWorldInfoCharLoreSnapshot()
+    recordCompatDiagnostic('saveSettingsWorldInfoCharLore', 'stub', 'Direct world_info.charLore changes could not be persisted through CraftTalker character storage.')
+    console.warn('[ST Compat] Failed to persist world_info.charLore mirror', desired, error)
+  }
+}
+
+async function persistCharacterWorldInfoBindings(desired: WorldInfoCharLoreEntry[]): Promise<void> {
+  const currentByCharacter = new Map(persistedWorldInfoCharLoreSnapshot.map(entry => [entry.name, entry.extraBooks]))
+  const desiredByCharacter = new Map(desired.map(entry => [entry.name, entry.extraBooks]))
+  const characterNames = Array.from(new Set([...currentByCharacter.keys(), ...desiredByCharacter.keys()])).sort()
+
+  for (const characterName of characterNames) {
+    const current = currentByCharacter.get(characterName) ?? []
+    const next = desiredByCharacter.get(characterName) ?? []
+    if (sameStringArray(current, next)) continue
+    await persistCharacterAdditionalWorldbooks(characterName, next, current)
+  }
+}
+
+async function persistCharacterAdditionalWorldbooks(
+  characterName: string,
+  additionalWorldbooks: string[],
+  previousAdditionalWorldbooks: string[],
+): Promise<void> {
+  const detail = await api.characters.get(characterName)
+  const extensions = cloneCompatRecord(asRecord(detail.extensions))
+  const primary = typeof extensions.world === 'string' ? extensions.world.trim() : ''
+  const nextAdditional = additionalWorldbooks.filter(name => name !== primary)
+  const nextWorlds = primary
+    ? [primary, ...nextAdditional]
+    : nextAdditional
+
+  if (primary) {
+    extensions.world = primary
+  } else {
+    delete extensions.world
+  }
+
+  if (nextWorlds.length > (primary ? 1 : 0) || (!primary && nextWorlds.length > 0)) {
+    extensions.worlds = nextWorlds
+  } else {
+    delete extensions.worlds
+  }
+
+  const previous = new Set(previousAdditionalWorldbooks)
+  for (const worldName of nextAdditional.filter(name => !previous.has(name))) {
+    const world = await api.worlds.update(worldName, { enabled: true })
+    cacheWorldInfo(world)
+  }
+
+  const saved = await api.characters.update(characterName, { extensions })
+  const characterIndex = resolveCharacterIndex(characterName)
+  if (characterIndex >= 0) {
+    mergeSavedCharacter(characterIndex, saved as unknown as Character & Record<string, unknown>)
+  }
+}
+
+async function applyWorldInfoSelectionUpdates(updates: Array<{ name: string, global_enabled: boolean }>): Promise<void> {
+  for (const update of updates) {
+    const world = await api.worlds.update(update.name, { global_enabled: update.global_enabled })
+    cacheWorldInfo(world)
+  }
+  await updateWorldInfoList()
+  await eventSource.emit(event_types.WORLDINFO_SETTINGS_UPDATED, {
+    selected_world_info: structuredClone(selected_world_info),
+    world_names: structuredClone(world_names),
+  })
+}
+
+function normalizeWorldInfoSelectionTargets(names: string | string[]): string[] {
+  const values = Array.isArray(names) ? names : [names]
+  const normalized = values
+    .flatMap((name) => {
+      const value = String(name ?? '').trim()
+      if (!value) return []
+      if (world_names.includes(value)) return [value]
+      return value.split(',').map(part => part.trim()).filter(Boolean)
+    })
+  return Array.from(new Set(normalized))
+}
+
+function syncSelectedWorldInfoSnapshot(): void {
+  persistedSelectedWorldInfoSnapshot = normalizeWorldInfoSelectionTargets(selected_world_info)
+}
+
+function syncWorldInfoCharLoreSnapshot(source: unknown = world_info.charLore): void {
+  persistedWorldInfoCharLoreSnapshot = normalizeWorldInfoCharLoreEntries(source, { trustCharacterNames: true }).entries
+  world_info.charLore = structuredClone(persistedWorldInfoCharLoreSnapshot)
+}
+
+function restoreWorldInfoCharLoreSnapshot(): void {
+  world_info.charLore = structuredClone(persistedWorldInfoCharLoreSnapshot)
+}
+
+function normalizeWorldInfoCharLoreEntries(
+  source: unknown,
+  options: { allowPersistedCharacters?: boolean, trustCharacterNames?: boolean } = {},
+): WorldInfoCharLoreNormalization {
+  const invalidEntries: string[] = []
+  const missingCharacters: string[] = []
+  const missingWorldbooks: string[] = []
+  const entriesByCharacter = new Map<string, string[]>()
+
+  if (source !== undefined && source !== null && !Array.isArray(source)) {
+    return {
+      entries: [],
+      invalidEntries: ['charLore'],
+      missingCharacters,
+      missingWorldbooks,
+    }
+  }
+
+  for (const [index, entry] of (Array.isArray(source) ? source : []).entries()) {
+    if (!isPlainRecord(entry)) {
+      invalidEntries.push(String(index))
+      continue
+    }
+
+    const characterName = options.trustCharacterNames
+      ? normalizeWorldInfoCharLoreCharacterName(entry.name)
+      : resolveWorldInfoCharLoreCharacterName(entry.name, Boolean(options.allowPersistedCharacters))
+    if (!characterName) {
+      missingCharacters.push(String(entry.name ?? index))
+      continue
+    }
+
+    const rawExtraBooks = entry.extraBooks
+    if (rawExtraBooks !== undefined && rawExtraBooks !== null && !Array.isArray(rawExtraBooks)) {
+      invalidEntries.push(`${characterName}.extraBooks`)
+      continue
+    }
+
+    const extraBooks = normalizeWorldInfoSelectionTargets(Array.isArray(rawExtraBooks) ? rawExtraBooks.map(item => String(item ?? '')) : [])
+    const knownExtraBooks = extraBooks.filter((name) => {
+      if (world_names.includes(name)) return true
+      missingWorldbooks.push(name)
+      return false
+    })
+    if (knownExtraBooks.length === 0) continue
+
+    const existing = entriesByCharacter.get(characterName) ?? []
+    entriesByCharacter.set(characterName, Array.from(new Set([...existing, ...knownExtraBooks])))
+  }
+
+  return {
+    entries: Array.from(entriesByCharacter.entries())
+      .map(([name, extraBooks]) => ({ name, extraBooks }))
+      .sort((left, right) => left.name.localeCompare(right.name)),
+    invalidEntries: Array.from(new Set(invalidEntries)),
+    missingCharacters: Array.from(new Set(missingCharacters)),
+    missingWorldbooks: Array.from(new Set(missingWorldbooks)),
+  }
+}
+
+function resolveWorldInfoCharLoreCharacterName(value: unknown, allowPersistedCharacter: boolean): string {
+  const directIndex = resolveCharacterIndex(value)
+  if (directIndex >= 0 && characters[directIndex]) {
+    return getPersistableCharacterName(characters[directIndex])
+  }
+
+  const candidate = normalizeWorldInfoCharLoreCharacterName(value)
+  if (!candidate) return ''
+
+  const character = contextState.characters.find(entry =>
+    entry.file_name === candidate
+    || entry.name === candidate
+    || resolveCharacterFileName(entry.avatar) === candidate
+  )
+  if (character?.file_name) return character.file_name
+
+  if (allowPersistedCharacter && persistedWorldInfoCharLoreSnapshot.some(entry => entry.name === candidate)) {
+    return candidate
+  }
+
+  return ''
+}
+
+function normalizeWorldInfoCharLoreCharacterName(value: unknown): string {
+  const raw = String(value ?? '').trim()
+  if (!raw) return ''
+
+  const urlFileName = resolveCharacterFileNameFromUrl(raw)
+  if (urlFileName) return urlFileName
+
+  if (isLegacyAvatarFileName(raw)) return stripLegacyAvatarExtension(raw)
+  return raw.includes('/') || raw.includes('\\') ? '' : raw
+}
+
+function sameWorldInfoCharLoreEntries(left: WorldInfoCharLoreEntry[], right: WorldInfoCharLoreEntry[]): boolean {
+  return left.length === right.length
+    && left.every((entry, index) => entry.name === right[index]?.name && sameStringArray(entry.extraBooks, right[index]?.extraBooks ?? []))
+}
+
+function sameStringArray(left: string[], right: string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index])
+}
+
 export async function updateWorldInfoList(): Promise<void> {
   const settings = await api.worlds.getSettings()
   world_names.splice(0, world_names.length, ...settings.world_names)
@@ -1028,6 +1513,8 @@ export async function updateWorldInfoList(): Promise<void> {
     globalSelect: selected_world_info,
   })
   syncCompatWorldSelects()
+  syncSelectedWorldInfoSnapshot()
+  syncWorldInfoCharLoreSnapshot(settings.world_info.charLore)
   recordCompatDiagnostic('updateWorldInfoList', 'partial', 'Worldbook names and global selections were loaded from CraftTalker world services.')
 }
 
@@ -1044,6 +1531,33 @@ export async function loadWorldInfo(name: string): Promise<WorldBook | null> {
     recordCompatDiagnostic('loadWorldInfo', 'stub', `Worldbook "${worldName}" could not be read through CraftTalker world services.`)
     console.warn('[ST Compat] Failed to load world info', worldName, error)
     return null
+  }
+}
+
+export async function saveWorldInfo(name: string, data: unknown, _immediately = false): Promise<boolean> {
+  const worldName = String(name ?? '').trim()
+  if (!worldName || !data || typeof data !== 'object' || Array.isArray(data)) {
+    recordCompatDiagnostic('saveWorldInfo', 'blocked', 'Worldbook saves require an existing worldbook name and an object payload.')
+    return false
+  }
+
+  try {
+    const response = await fetch('/api/worldinfo/edit', {
+      method: 'POST',
+      headers: getRequestHeaders(),
+      body: JSON.stringify({ name: worldName, data }),
+    })
+    if (!response.ok) throw new Error(`World info save failed with ${response.status}`)
+    const world = await response.json() as WorldBook
+    cacheWorldInfo(world)
+    syncCompatWorldSelects()
+    await eventSource.emit(event_types.WORLDINFO_UPDATED, worldName, world)
+    recordCompatDiagnostic('saveWorldInfo', 'partial', 'Existing worldbook data was persisted through the permissioned CraftTalker world-info bridge.')
+    return true
+  } catch (error) {
+    recordCompatDiagnostic('saveWorldInfo', 'stub', `Worldbook "${worldName}" could not be saved through CraftTalker world services.`)
+    console.warn('[ST Compat] Failed to save world info', worldName, error)
+    return false
   }
 }
 
@@ -1199,6 +1713,41 @@ export async function printMessages(): Promise<void> {
   recordCompatDiagnostic('printMessages', 'partial', 'Rebuilt the hidden ST compatibility chat mirror from the in-memory chat array.')
 }
 
+export async function reloadCurrentChat(): Promise<void> {
+  await reloadChatMutex.runExclusive(async () => {
+    clearCompatChatDom()
+    await printMessages()
+    await eventSource.emit(event_types.CHAT_LOADED, {
+      detail: {
+        id: currentCharacterIndex,
+        character: characters[currentCharacterIndex],
+      },
+    })
+    await eventSource.emit(event_types.CHAT_CHANGED, contextState.activeChatId)
+    recordCompatDiagnostic('reloadCurrentChat', 'partial', 'Reloaded the ST compatibility chat DOM mirror from the current in-memory chat array without native chat switching or broad message persistence.')
+  })
+}
+
+export function isGenerating(): boolean {
+  return compatIsSendPress
+}
+
+export function activateSendButtons(): void {
+  setCompatGenerationState(
+    false,
+    'activateSendButtons',
+    'Cleared the ST-compatible generation state and re-enabled hidden compatibility send controls without touching CraftTalker native chat flow.',
+  )
+}
+
+export function deactivateSendButtons(): void {
+  setCompatGenerationState(
+    true,
+    'deactivateSendButtons',
+    'Marked the ST-compatible generation state and disabled hidden compatibility send controls without granting plugins native send control.',
+  )
+}
+
 export async function clearChat(options: Record<string, unknown> = {}): Promise<void> {
   if (options.clearData === true) {
     chat.splice(0, chat.length)
@@ -1243,8 +1792,276 @@ export function addOneMessage(message: unknown, options: Record<string, unknown>
   return message
 }
 
-export function appendMediaToMessage(): void {
-  recordCompatDiagnostic('appendMediaToMessage', 'stub', 'Media attachment rendering is not wired to the ST compatibility chat mirror yet.')
+export function appendMediaToMessage(message?: unknown, messageElement?: unknown): void {
+  const root = getElementFromMaybeJQuery(messageElement)
+  if (!root) {
+    recordCompatDiagnostic('appendMediaToMessage', 'stub', 'Ignored media rendering because the ST message element could not be resolved.')
+    return
+  }
+
+  const mediaState = normalizeCompatMessageMedia(message)
+  const { fileWrapper, mediaWrapper } = ensureCompatMessageMediaWrappers(root)
+  root.setAttribute('data-media-display', mediaState.media.length > 0 ? mediaState.mediaDisplay : '')
+  root.querySelector<HTMLElement>('.mes_text')?.classList.toggle('inline_media', mediaState.hideMessageText)
+
+  fileWrapper.textContent = ''
+  for (const [index, file] of mediaState.files.entries()) {
+    fileWrapper.appendChild(createCompatFileAttachmentElement(file, index))
+  }
+
+  mediaWrapper.textContent = ''
+  const mediaToRender = mediaState.mediaDisplay === 'gallery' && mediaState.media.length > 0
+    ? mediaState.media.slice(mediaState.mediaIndex, mediaState.mediaIndex + 1)
+    : mediaState.media
+  for (const [index, attachment] of mediaToRender.entries()) {
+    const sourceIndex = mediaState.mediaDisplay === 'gallery' ? mediaState.mediaIndex : index
+    mediaWrapper.appendChild(createCompatMediaAttachmentElement(attachment, sourceIndex, mediaState.media.length))
+  }
+
+  const renderedCount = mediaState.media.length + mediaState.files.length
+  const status: CompatDiagnosticStatus = renderedCount > 0 ? 'partial' : mediaState.skipped > 0 ? 'blocked' : 'partial'
+  const skippedNote = mediaState.skipped > 0 ? ` Skipped ${mediaState.skipped} unsafe or incomplete attachment(s).` : ''
+  recordCompatDiagnostic(
+    'appendMediaToMessage',
+    status,
+    `Rendered ST-compatible message media/files into the compatibility DOM mirror without native chat persistence.${skippedNote}`,
+  )
+}
+
+function normalizeCompatMessageMedia(message: unknown): CompatMessageMedia {
+  const extra = asRecord(asRecord(message).extra)
+  const media: CompatMediaAttachment[] = []
+  const files: CompatFileAttachment[] = []
+  let skipped = 0
+
+  for (const item of toCompatArray(extra.media)) {
+    const attachment = normalizeCompatMediaAttachment(item)
+    if (attachment) media.push(attachment)
+    else skipped += 1
+  }
+  for (const item of toCompatArray(extra.image)) {
+    const attachment = normalizeCompatMediaAttachment(item, 'image')
+    if (attachment) media.push(attachment)
+    else skipped += 1
+  }
+  for (const item of toCompatArray(extra.video)) {
+    const attachment = normalizeCompatMediaAttachment(item, 'video')
+    if (attachment) media.push(attachment)
+    else skipped += 1
+  }
+  for (const item of toCompatArray(extra.audio)) {
+    const attachment = normalizeCompatMediaAttachment(item, 'audio')
+    if (attachment) media.push(attachment)
+    else skipped += 1
+  }
+  for (const item of toCompatArray(extra.files)) {
+    const file = normalizeCompatFileAttachment(item)
+    if (file) files.push(file)
+    else skipped += 1
+  }
+  for (const item of toCompatArray(extra.file)) {
+    const file = normalizeCompatFileAttachment(item)
+    if (file) files.push(file)
+    else skipped += 1
+  }
+
+  const mediaDisplay = extra.media_display === 'gallery' ? 'gallery' : 'list'
+  const rawIndex = Number(extra.media_index)
+  const mediaIndex = Number.isInteger(rawIndex) && rawIndex >= 0 && rawIndex < media.length ? rawIndex : 0
+  return {
+    media,
+    files,
+    mediaDisplay,
+    mediaIndex,
+    hideMessageText: media.length > 0 && extra.inline_image === false,
+    skipped,
+  }
+}
+
+function normalizeCompatMediaAttachment(item: unknown, forcedType?: CompatMediaType): CompatMediaAttachment | null {
+  const record = asRecord(item)
+  const rawUrl = typeof item === 'string'
+    ? item
+    : stringField(record, 'url') || stringField(record, 'src') || stringField(record, 'path')
+  const type = normalizeCompatMediaType(forcedType ?? record.type, rawUrl)
+  const url = safeCompatAttachmentUrl(rawUrl, { mediaType: type })
+  if (!url) return null
+  return {
+    type,
+    url,
+    title: typeof item === 'string' ? '' : stringField(record, 'title') || stringField(record, 'name'),
+  }
+}
+
+function normalizeCompatFileAttachment(item: unknown): CompatFileAttachment | null {
+  const record = asRecord(item)
+  const rawUrl = typeof item === 'string'
+    ? item
+    : stringField(record, 'url') || stringField(record, 'href') || stringField(record, 'path')
+  const url = safeCompatAttachmentUrl(rawUrl, { allowData: false })
+  const rawName = typeof item === 'string'
+    ? ''
+    : stringField(record, 'name') || stringField(record, 'fileName') || stringField(record, 'filename')
+  const name = rawName || fileNameFromUrl(rawUrl) || 'attachment'
+  if (!name && !url) return null
+  return {
+    name,
+    size: formatCompatFileSize(record.size),
+    url,
+  }
+}
+
+function normalizeCompatMediaType(value: unknown, url: string): CompatMediaType {
+  const type = String(value ?? '').toLowerCase()
+  if (type.includes('video')) return 'video'
+  if (type.includes('audio')) return 'audio'
+  if (type.includes('image')) return 'image'
+  if (/\.(mp4|webm|mov|m4v)(?:[?#].*)?$/i.test(url)) return 'video'
+  if (/\.(mp3|wav|ogg|m4a|flac)(?:[?#].*)?$/i.test(url)) return 'audio'
+  return 'image'
+}
+
+function toCompatArray(value: unknown): unknown[] {
+  if (Array.isArray(value)) return value
+  return value === undefined || value === null || value === '' ? [] : [value]
+}
+
+function safeCompatAttachmentUrl(value: unknown, options: { mediaType?: CompatMediaType, allowData?: boolean } = {}): string {
+  const raw = String(value ?? '').trim()
+  if (!raw) return ''
+
+  if (raw.startsWith('/')) return raw
+  if (/^(?:\.\/|\.\.\/|[A-Za-z0-9_-]+\/)/.test(raw)) return raw
+
+  if (raw.startsWith('data:')) {
+    if (options.allowData === false) return ''
+    const mediaType = options.mediaType ?? 'image'
+    return raw.toLowerCase().startsWith(`data:${mediaType}/`) ? raw : ''
+  }
+
+  try {
+    const parsed = new URL(raw, window.location.origin)
+    if (parsed.protocol === 'http:' || parsed.protocol === 'https:' || parsed.protocol === 'blob:') {
+      return raw
+    }
+  } catch {
+    return ''
+  }
+  return ''
+}
+
+function fileNameFromUrl(value: unknown): string {
+  const raw = String(value ?? '').trim()
+  if (!raw) return ''
+  try {
+    const parsed = new URL(raw, window.location.origin)
+    const lastSegment = parsed.pathname.split('/').filter(Boolean).pop() ?? ''
+    return decodeURIComponent(lastSegment)
+  } catch {
+    return raw.split(/[\\/]/).filter(Boolean).pop() ?? ''
+  }
+}
+
+function formatCompatFileSize(value: unknown): string {
+  const size = Number(value)
+  if (!Number.isFinite(size) || size < 0) return ''
+  if (size < 1024) return `${Math.round(size)} B`
+  const units = ['KB', 'MB', 'GB']
+  let current = size / 1024
+  for (const unit of units) {
+    if (current < 1024 || unit === units[units.length - 1]) {
+      return `${current.toFixed(current >= 10 ? 0 : 1)} ${unit}`
+    }
+    current /= 1024
+  }
+  return `${Math.round(size)} B`
+}
+
+function ensureCompatMessageMediaWrappers(root: Element): { fileWrapper: HTMLElement, mediaWrapper: HTMLElement } {
+  const block = root.classList.contains('mes_block')
+    ? root as HTMLElement
+    : root.querySelector<HTMLElement>('.mes_block') ?? root as HTMLElement
+  const fileWrapper = ensureCompatMessageWrapper(block, 'mes_file_wrapper')
+  const mediaWrapper = ensureCompatMessageWrapper(block, 'mes_media_wrapper')
+  const text = block.querySelector<HTMLElement>('.mes_text')
+  if (text) {
+    text.after(fileWrapper, mediaWrapper)
+  } else {
+    block.append(fileWrapper, mediaWrapper)
+  }
+  return { fileWrapper, mediaWrapper }
+}
+
+function ensureCompatMessageWrapper(block: HTMLElement, className: string): HTMLElement {
+  const existing = block.querySelector<HTMLElement>(`.${className}`)
+  if (existing) return existing
+  const wrapper = document.createElement('div')
+  wrapper.className = className
+  wrapper.dataset.stCompatMediaWrapper = 'true'
+  return wrapper
+}
+
+function createCompatMediaAttachmentElement(attachment: CompatMediaAttachment, index: number, total: number): HTMLElement {
+  const container = document.createElement('div')
+  container.className = `mes_${attachment.type}_container mes_media_container`
+  container.dataset.index = String(index)
+
+  if (attachment.type === 'video') {
+    const video = document.createElement('video')
+    video.className = 'mes_video'
+    video.controls = true
+    video.src = attachment.url
+    if (attachment.title) video.title = attachment.title
+    container.appendChild(video)
+  } else if (attachment.type === 'audio') {
+    const audio = document.createElement('audio')
+    audio.className = 'mes_audio'
+    audio.controls = true
+    audio.src = attachment.url
+    if (attachment.title) audio.title = attachment.title
+    container.appendChild(audio)
+  } else {
+    const image = document.createElement('img')
+    image.className = 'mes_img'
+    image.src = attachment.url
+    image.alt = attachment.title
+    if (attachment.title) image.title = attachment.title
+    container.appendChild(image)
+  }
+
+  if (total > 1) {
+    const counter = document.createElement('span')
+    counter.className = 'mes_img_swipe_counter'
+    counter.textContent = `${index + 1}/${total}`
+    container.appendChild(counter)
+  }
+  return container
+}
+
+function createCompatFileAttachmentElement(file: CompatFileAttachment, index: number): HTMLElement {
+  const container = document.createElement('div')
+  container.className = 'mes_file_container'
+  container.dataset.index = String(index)
+
+  const label = file.url ? document.createElement('a') : document.createElement('span')
+  label.className = 'mes_file_name'
+  label.textContent = file.name
+  label.title = file.name
+  if (label instanceof HTMLAnchorElement) {
+    label.href = file.url
+    label.target = '_blank'
+    label.rel = 'noopener noreferrer'
+  }
+  container.appendChild(label)
+
+  if (file.size) {
+    const size = document.createElement('span')
+    size.className = 'mes_file_size'
+    size.textContent = file.size
+    size.title = file.size
+    container.appendChild(size)
+  }
+  return container
 }
 
 export function addCopyToCodeBlocks(container?: unknown): void {
@@ -1267,6 +2084,9 @@ export function addCopyToCodeBlocks(container?: unknown): void {
 
 export async function saveSettings(): Promise<ExtensionSettings> {
   normalizeExtensionSettingsShape()
+  const charLoreMirror = cloneCompatValue(world_info.charLore)
+  await persistSelectedWorldInfoMirrorIfChanged()
+  await persistWorldInfoCharLoreMirrorIfChanged(charLoreMirror)
   const saved = await api.extensions.saveSettings(extension_settings)
   mergeInto(extension_settings, saved)
   normalizeExtensionSettingsShape()
@@ -1415,6 +2235,9 @@ class SimpleMutex {
     }
   }
 }
+
+const reloadChatMutex = new SimpleMutex()
+installCompatGenerationStateHooks()
 
 async function initializeStExtensionHostOnce(): Promise<void> {
   publishGlobals()
@@ -3321,6 +4144,10 @@ const stHost: StHostApi = {
   characters,
   event_types,
   eventSource,
+  get is_send_press() {
+    return compatIsSendPress
+  },
+  isGenerating,
   extension_settings,
   extensionNames,
   extensionTypes,
@@ -3341,7 +4168,10 @@ const stHost: StHostApi = {
   getContext,
   getExtensionManifest,
   getRequestHeaders,
+  createNewWorldInfo,
+  setWorldInfoSelection,
   loadWorldInfo,
+  saveWorldInfo,
   updateWorldInfoList,
   initialize: initializeStExtensionHost,
   ModuleWorkerWrapper: SimpleMutex,
@@ -3364,6 +4194,9 @@ const stHost: StHostApi = {
   unshallowCharacter,
   writeExtensionField,
   writeExtensionFieldBulk,
+  reloadCurrentChat,
+  activateSendButtons,
+  deactivateSendButtons,
   updateMessageBlock,
   printMessages,
   clearChat,
@@ -3434,6 +4267,10 @@ function publishGlobals(): void {
   window.executeSlashCommandsWithOptions = executeSlashCommandsWithResultObject
   window.messageFormatting = messageFormatting
   window.reloadMarkdownProcessor = reloadMarkdownProcessor
+  window.reloadCurrentChat = reloadCurrentChat
+  window.activateSendButtons = activateSendButtons
+  window.deactivateSendButtons = deactivateSendButtons
+  window.isGenerating = isGenerating
   window.updateMessageBlock = updateMessageBlock
   window.printMessages = printMessages
   window.clearChat = clearChat
@@ -3458,6 +4295,50 @@ function syncCompatDomState(): void {
     chat,
     selectedWorldInfo: selected_world_info,
     worldNames: world_names,
+  })
+}
+
+function installCompatGenerationStateHooks(): void {
+  if (compatGenerationStateHooksInstalled) return
+  compatGenerationStateHooksInstalled = true
+  eventSource.makeFirst(event_types.GENERATION_STARTED, () => setCompatGenerationState(true))
+  eventSource.makeFirst(event_types.JS_GENERATION_STARTED, () => setCompatGenerationState(true))
+  eventSource.makeFirst(event_types.GENERATION_ENDED, () => setCompatGenerationState(false))
+  eventSource.makeFirst(event_types.JS_GENERATION_ENDED, () => setCompatGenerationState(false))
+  eventSource.makeFirst(event_types.GENERATION_STOPPED, () => setCompatGenerationState(false))
+}
+
+function setCompatGenerationState(
+  isPressed: boolean,
+  diagnosticId?: 'activateSendButtons' | 'deactivateSendButtons',
+  diagnosticNote?: string,
+): void {
+  compatIsSendPress = isPressed
+  syncCompatSendControlState()
+  if (diagnosticId && diagnosticNote) {
+    recordCompatDiagnostic(diagnosticId, 'partial', diagnosticNote)
+  }
+}
+
+function syncCompatSendControlState(): void {
+  ensureStCompatDomAnchors()
+  if (compatIsSendPress) {
+    document.body.dataset.generating = 'true'
+  } else {
+    delete document.body.dataset.generating
+  }
+
+  const controls = new Set<HTMLElement>()
+  document
+    .querySelectorAll<HTMLElement>('#crafttalker-st-compat-root #send_but, #crafttalker-st-compat-root #send_textarea, #send_but, #send_textarea')
+    .forEach(element => controls.add(element))
+  controls.forEach((element) => {
+    if ('disabled' in element) {
+      const control = element as HTMLButtonElement | HTMLTextAreaElement
+      control.disabled = compatIsSendPress
+    }
+    element.toggleAttribute('disabled', compatIsSendPress)
+    element.setAttribute('aria-disabled', String(compatIsSendPress))
   })
 }
 

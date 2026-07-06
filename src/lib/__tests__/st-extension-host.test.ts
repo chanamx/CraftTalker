@@ -23,17 +23,25 @@ import {
   saveMetadata,
   saveMetadataDebounced,
   saveSettings,
+  saveWorldInfo,
   setGlobalVariable,
   setLocalVariable,
   SlashCommandParser,
   extensionNames,
   extensionTypes,
   initializeStExtensionHost,
+  createNewWorldInfo,
+  setWorldInfoSelection,
   updateWorldInfoList,
   saveChatConditional,
   updateStExtensionContext,
   updateMessageBlock,
+  reloadCurrentChat,
+  activateSendButtons,
+  deactivateSendButtons,
+  isGenerating,
   addOneMessage,
+  appendMediaToMessage,
   writeExtensionField,
   writeExtensionFieldBulk,
   unshallowCharacter,
@@ -44,6 +52,7 @@ afterEach(() => {
   vi.useRealTimers()
   vi.unstubAllGlobals()
   SlashCommandParser.commands = {}
+  activateSendButtons()
   updateStExtensionContext({
     activeCharacter: null,
     activeChatId: null,
@@ -108,6 +117,59 @@ describe('SillyTavern extension host compatibility', () => {
     expect(context.chatId).toBe('chat-a')
     expect(context.characterId).toBe(0)
     expect(context.chat).toEqual([expect.objectContaining({ name: 'You', is_user: true, mes: 'hello' })])
+  })
+
+  it('mirrors ST send-button generation state without granting native send control', async () => {
+    resetDiagnostics()
+
+    deactivateSendButtons()
+
+    const sendButton = document.querySelector<HTMLButtonElement>('#crafttalker-st-compat-root #send_but')
+    const sendTextarea = document.querySelector<HTMLTextAreaElement>('#crafttalker-st-compat-root #send_textarea')
+    expect(isGenerating()).toBe(true)
+    expect(getContext().is_send_press).toBe(true)
+    expect(document.body.dataset.generating).toBe('true')
+    expect(sendButton?.disabled).toBe(true)
+    expect(sendButton?.getAttribute('aria-disabled')).toBe('true')
+    expect(sendTextarea?.disabled).toBe(true)
+    expect(window.CraftTalker?.stHost?.is_send_press).toBe(true)
+    expect(window.CraftTalker?.stHost?.isGenerating()).toBe(true)
+    expect(window.SillyTavern?.isGenerating()).toBe(true)
+    expect(window.deactivateSendButtons).toBe(deactivateSendButtons)
+
+    activateSendButtons()
+
+    expect(isGenerating()).toBe(false)
+    expect(getContext().is_send_press).toBe(false)
+    expect(document.body.dataset.generating).toBeUndefined()
+    expect(sendButton?.disabled).toBe(false)
+    expect(sendButton?.hasAttribute('disabled')).toBe(false)
+    expect(sendButton?.getAttribute('aria-disabled')).toBe('false')
+    expect(sendTextarea?.disabled).toBe(false)
+    expect(window.CraftTalker?.stHost?.is_send_press).toBe(false)
+    expect(window.CraftTalker?.stHost?.isGenerating()).toBe(false)
+    expect(window.SillyTavern?.isGenerating()).toBe(false)
+    expect(window.activateSendButtons).toBe(activateSendButtons)
+    expect(getDiagnostics()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'deactivateSendButtons', status: 'partial' }),
+      expect.objectContaining({ id: 'activateSendButtons', status: 'partial' }),
+    ]))
+
+    resetDiagnostics()
+    await eventSource.emit(event_types.GENERATION_STARTED)
+
+    expect(isGenerating()).toBe(true)
+    expect(getContext().is_send_press).toBe(true)
+    expect(document.body.dataset.generating).toBe('true')
+    expect(sendButton?.disabled).toBe(true)
+
+    await eventSource.emit(event_types.GENERATION_ENDED)
+
+    expect(isGenerating()).toBe(false)
+    expect(getContext().is_send_press).toBe(false)
+    expect(document.body.dataset.generating).toBeUndefined()
+    expect(sendButton?.disabled).toBe(false)
+    expect(getDiagnostics()).toEqual([])
   })
 
   it('mirrors active character details in ST v1/v2-compatible character shape', () => {
@@ -598,6 +660,71 @@ describe('SillyTavern extension host compatibility', () => {
     })
   })
 
+  it('provides safe built-in ST slash commands for common plugin reads', async () => {
+    updateStExtensionContext({
+      activeCharacter: {
+        id: 'char-a',
+        name: 'Aster',
+        description: '',
+        avatar: null,
+        tags: [],
+        file_name: 'Aster',
+        model: '',
+        lastMessage: '',
+        pinned: false,
+        world: null,
+      },
+      activeChatId: 'chat-slash',
+      characters: [],
+      messages: [],
+      chatLines: [
+        { chat_metadata: {}, user_name: 'Mira', character_name: 'Aster' },
+        { name: 'Mira', is_user: true, is_system: false, mes: 'Hello' },
+        { name: 'Aster', is_user: false, is_system: false, mes: 'Hi' },
+      ],
+    })
+
+    await expect(executeSlashCommandsWithOptions('/pass {{user}} {{char}} {{lastMessageId}}')).resolves.toBe('Mira Aster 1')
+    await expect(executeSlashCommandsWithOptions('/messages names=on 0-1')).resolves.toBe('Mira: Hello\nAster: Hi')
+    await expect(executeSlashCommandsWithOptions('/messages names=off 1')).resolves.toBe('Hi')
+  })
+
+  it('limits built-in hide and unhide slash commands to the compatibility chat mirror', async () => {
+    updateStExtensionContext({
+      activeCharacter: {
+        id: 'char-a',
+        name: 'Aster',
+        description: '',
+        avatar: null,
+        tags: [],
+        file_name: 'Aster',
+        model: '',
+        lastMessage: '',
+        pinned: false,
+        world: null,
+      },
+      activeChatId: 'chat-hide',
+      characters: [],
+      messages: [],
+      chatLines: [
+        { chat_metadata: {}, user_name: 'Mira', character_name: 'Aster' },
+        { name: 'Mira', is_user: true, is_system: false, mes: 'Hello' },
+        { name: 'Aster', is_user: false, is_system: false, mes: 'Hi' },
+      ],
+    })
+
+    await expect(executeSlashCommands('/hide 0', true)).resolves.toMatchObject({ pipe: '1', isError: false })
+    expect((getContext().chat as Array<Record<string, unknown>>)[0]?.is_system).toBe(true)
+
+    await expect(executeSlashCommands('/messages names=on 0-1')).resolves.toBe('Aster: Hi')
+    await expect(executeSlashCommands('/unhide 0', true)).resolves.toMatchObject({ pipe: '1', isError: false })
+    expect((getContext().chat as Array<Record<string, unknown>>)[0]?.is_system).toBe(false)
+    expect(getDiagnostics()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'hideSlashCommand', status: 'partial' }),
+      expect.objectContaining({ id: 'unhideSlashCommand', status: 'partial' }),
+    ]))
+  })
+
   it('provides a controlled xiaobaix streaming generation shim', async () => {
     const shim = window.xiaobaixStreamingGeneration
 
@@ -757,6 +884,134 @@ describe('SillyTavern extension host compatibility', () => {
     expect(rendered).toHaveBeenCalledWith(0)
     expect(getDiagnostics()).toEqual(expect.arrayContaining([
       expect.objectContaining({ id: 'updateMessageBlock', status: 'partial' }),
+    ]))
+  })
+
+  it('reloads the current ST compatibility chat mirror without native message persistence', async () => {
+    document.body.innerHTML = ''
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    updateStExtensionContext({
+      activeCharacter: {
+        id: 'char-reload',
+        name: 'ReloadBot',
+        avatar: null,
+        description: '',
+        model: 'default',
+        lastMessage: '',
+        pinned: false,
+        file_name: 'ReloadBot',
+        world: null,
+      },
+      activeChatId: 'chat-reload',
+      characters: [{
+        id: 'char-reload',
+        name: 'ReloadBot',
+        avatar: null,
+        description: '',
+        model: 'default',
+        lastMessage: '',
+        pinned: false,
+        file_name: 'ReloadBot',
+        world: null,
+      }],
+      messages: [],
+      chatLines: [
+        { chat_metadata: { variables: {}, extensions: {} }, user_name: 'User', character_name: 'ReloadBot' },
+        { name: 'User', is_user: true, is_system: false, mes: 'Original', send_date: '2026-06-18T00:00:00.000Z', extra: {} },
+      ],
+    })
+    resetDiagnostics()
+    const chatChanged = vi.fn()
+    const chatLoaded = vi.fn()
+    eventSource.on(event_types.CHAT_CHANGED, chatChanged)
+    eventSource.on(event_types.CHAT_LOADED, chatLoaded)
+
+    const context = getContext()
+    const chat = context.chat as Array<Record<string, unknown>>
+    chat[0].mes = '**Plugin edit**'
+    document.getElementById('crafttalker-st-compat-root')?.querySelector('#chat')?.replaceChildren()
+
+    await reloadCurrentChat()
+
+    const compatChat = document.getElementById('crafttalker-st-compat-root')?.querySelector('#chat')
+    expect(compatChat?.querySelectorAll('.mes')).toHaveLength(1)
+    expect(compatChat?.querySelector('.mes[mesid="0"] .mes_text')?.innerHTML).toContain('<strong>Plugin edit</strong>')
+    expect(chatLoaded).toHaveBeenCalledWith(expect.objectContaining({
+      detail: expect.objectContaining({ id: 0 }),
+    }))
+    expect(chatChanged).toHaveBeenCalledWith('chat-reload')
+    expect(fetchMock).not.toHaveBeenCalled()
+    expect(getContext().reloadCurrentChat).toBe(reloadCurrentChat)
+    expect(window.CraftTalker?.stHost?.reloadCurrentChat).toBe(reloadCurrentChat)
+    expect(window.reloadCurrentChat).toBe(reloadCurrentChat)
+    expect(getDiagnostics()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'printMessages', status: 'partial' }),
+      expect.objectContaining({ id: 'reloadCurrentChat', status: 'partial' }),
+    ]))
+  })
+
+  it('renders ST-compatible message media into the compatibility DOM without native persistence', () => {
+    document.body.innerHTML = ''
+    updateStExtensionContext({
+      activeCharacter: {
+        id: 'char-media',
+        name: 'MediaBot',
+        avatar: null,
+        description: '',
+        model: 'default',
+        lastMessage: '',
+        pinned: false,
+        file_name: 'MediaBot',
+        world: null,
+      },
+      activeChatId: 'chat-media',
+      characters: [],
+      messages: [],
+      chatLines: [
+        { chat_metadata: { variables: {}, extensions: {} }, user_name: 'User', character_name: 'MediaBot' },
+        {
+          name: 'MediaBot',
+          is_user: false,
+          is_system: false,
+          mes: 'Media payload',
+          send_date: '2026-06-18T00:00:00.000Z',
+          extra: {
+            inline_image: false,
+            media_display: 'gallery',
+            media_index: 1,
+            media: [
+              { type: 'image', url: '/user/files/first.png', title: 'First' },
+              { type: 'video', url: 'https://cdn.example.test/clip.webm', title: 'Clip' },
+              { type: 'image', url: 'javascript:alert(1)', title: 'Blocked' },
+            ],
+            files: [
+              { name: 'notes.txt', size: 1536, url: '/user/files/notes.txt' },
+              { name: 'bad.url', size: 1, url: 'file:///etc/passwd' },
+            ],
+          },
+        },
+      ],
+    })
+
+    const message = (getContext().chat as Array<Record<string, unknown>>)[0]
+    const element = document.getElementById('crafttalker-st-compat-root')?.querySelector('.mes[mesid="0"]')
+    expect(element).toBeInstanceOf(HTMLElement)
+    appendMediaToMessage(message, element)
+
+    expect(element?.getAttribute('data-media-display')).toBe('gallery')
+    expect(element?.querySelector('.mes_text')?.classList.contains('inline_media')).toBe(true)
+    expect(element?.querySelectorAll('.mes_media_wrapper .mes_media_container')).toHaveLength(1)
+    expect(element?.querySelector('.mes_video')).toBeInstanceOf(HTMLVideoElement)
+    expect(element?.querySelector('.mes_video')?.getAttribute('src')).toBe('https://cdn.example.test/clip.webm')
+    expect(element?.querySelector('.mes_img_swipe_counter')?.textContent).toBe('2/2')
+    expect(element?.querySelectorAll('.mes_file_wrapper .mes_file_container')).toHaveLength(2)
+    expect(element?.querySelector('.mes_file_name')?.textContent).toBe('notes.txt')
+    expect(element?.querySelector('.mes_file_size')?.textContent).toBe('1.5 KB')
+    expect(element?.innerHTML).not.toContain('javascript:alert')
+    expect(element?.innerHTML).not.toContain('file:///etc/passwd')
+    expect(getDiagnostics()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'appendMediaToMessage', status: 'partial' }),
     ]))
   })
 
@@ -1305,13 +1560,19 @@ describe('SillyTavern extension host compatibility', () => {
 
   it('cancels active TavernHelper background generation by id', async () => {
     let capturedSignal: AbortSignal | null = null
+    const createAbortError = () => {
+      const error = new Error('Aborted')
+      error.name = 'AbortError'
+      return error
+    }
     const fetchMock = vi.fn((_url: string, init?: RequestInit) => {
       capturedSignal = init?.signal instanceof AbortSignal ? init.signal : null
+      if (capturedSignal?.aborted) {
+        return Promise.reject(createAbortError())
+      }
       return new Promise<Response>((_resolve, reject) => {
         capturedSignal?.addEventListener('abort', () => {
-          const error = new Error('Aborted')
-          error.name = 'AbortError'
-          reject(error)
+          reject(createAbortError())
         })
       })
     })
@@ -1569,6 +1830,488 @@ describe('SillyTavern extension host compatibility', () => {
       expect.objectContaining({ id: 'updateWorldInfoList', status: 'partial' }),
       expect.objectContaining({ id: 'loadWorldInfo', status: 'partial' }),
       expect.objectContaining({ id: 'TavernHelper.getWorldbook', status: 'partial' }),
+    ]))
+  })
+
+  it('persists global worldbook selection through the permissioned ST compatibility bridge', async () => {
+    const worldNames = ['GlobalLore', 'LocalLore']
+    let selectedWorldInfo = ['GlobalLore']
+    const makeWorld = (name: string, globalEnabled: boolean) => ({
+      name,
+      description: '',
+      enabled: globalEnabled,
+      global_enabled: globalEnabled,
+      global_selective: false,
+      selective_default: false,
+      recursive_scanning: false,
+      scan_depth: 100,
+      token_budget: 500,
+      recursive_scanning_depth: 2,
+      extensions: {},
+      entries: {},
+    })
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      if (url === '/api/worlds/settings') {
+        return new Response(JSON.stringify({
+          world_names: worldNames,
+          selected_world_info: selectedWorldInfo,
+          world_info: { globalSelect: selectedWorldInfo, charLore: [], entries: {} },
+          world_info_include_names: true,
+          world_info_case_sensitive: false,
+          world_info_match_whole_words: false,
+          world_info_use_group_scoring: false,
+          world_info_max_recursion_steps: 10,
+          world_info_depth: 4,
+          world_info_min_activations: 0,
+          world_info_min_activations_depth_max: 0,
+          world_info_budget: 25,
+          world_info_budget_cap: 0,
+          world_info_recursive: false,
+          world_info_overflow_alert: false,
+          world_info_character_strategy: 0,
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (url === '/api/worlds/LocalLore' && init?.method === 'PATCH') {
+        const body = JSON.parse(String(init.body)) as { global_enabled: boolean }
+        selectedWorldInfo = body.global_enabled
+          ? Array.from(new Set([...selectedWorldInfo, 'LocalLore']))
+          : selectedWorldInfo.filter(name => name !== 'LocalLore')
+        return new Response(JSON.stringify(makeWorld('LocalLore', body.global_enabled)), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return new Response('', { status: 404 })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const updates: unknown[][] = []
+    const listener = (...args: unknown[]) => updates.push(args)
+    eventSource.on(event_types.WORLDINFO_SETTINGS_UPDATED, listener)
+
+    await updateWorldInfoList()
+    const result = await setWorldInfoSelection('LocalLore', 'toggle')
+    eventSource.off(event_types.WORLDINFO_SETTINGS_UPDATED, listener)
+
+    expect(result).toBe(true)
+    expect(getContext().setWorldInfoSelection).toBe(setWorldInfoSelection)
+    expect(window.CraftTalker?.stHost?.setWorldInfoSelection).toBe(setWorldInfoSelection)
+    expect(fetchMock).toHaveBeenCalledWith('/api/worlds/LocalLore', expect.objectContaining({
+      method: 'PATCH',
+      body: JSON.stringify({ global_enabled: true }),
+    }))
+    expect(window.CraftTalker?.stHost?.selected_world_info).toEqual(['GlobalLore', 'LocalLore'])
+    expect(window.CraftTalker?.stHost?.world_info.globalSelect).toBe(window.CraftTalker?.stHost?.selected_world_info)
+    expect(updates).toEqual([[
+      {
+        selected_world_info: ['GlobalLore', 'LocalLore'],
+        world_names: ['GlobalLore', 'LocalLore'],
+      },
+    ]])
+    expect(getDiagnostics()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'setWorldInfoSelection', status: 'partial' }),
+    ]))
+
+    fetchMock.mockClear()
+    await expect(setWorldInfoSelection('MissingLore', 'on')).resolves.toBe(false)
+    expect(fetchMock).not.toHaveBeenCalled()
+    expect(getDiagnostics()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'setWorldInfoSelection', status: 'blocked' }),
+    ]))
+  })
+
+  it('persists direct selected_world_info mirror rebinding during saveSettings', async () => {
+    const worldNames = ['GlobalLore', 'LocalLore']
+    let selectedWorldInfo = ['GlobalLore']
+    const makeWorld = (name: string, globalEnabled: boolean) => ({
+      name,
+      description: '',
+      enabled: globalEnabled,
+      global_enabled: globalEnabled,
+      global_selective: false,
+      selective_default: false,
+      recursive_scanning: false,
+      scan_depth: 100,
+      token_budget: 500,
+      recursive_scanning_depth: 2,
+      extensions: {},
+      entries: {},
+    })
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      if (url === '/api/worlds/settings') {
+        return new Response(JSON.stringify({
+          world_names: worldNames,
+          selected_world_info: selectedWorldInfo,
+          world_info: { globalSelect: selectedWorldInfo, charLore: [], entries: {} },
+          world_info_include_names: true,
+          world_info_case_sensitive: false,
+          world_info_match_whole_words: false,
+          world_info_use_group_scoring: false,
+          world_info_max_recursion_steps: 10,
+          world_info_depth: 4,
+          world_info_min_activations: 0,
+          world_info_min_activations_depth_max: 0,
+          world_info_budget: 25,
+          world_info_budget_cap: 0,
+          world_info_recursive: false,
+          world_info_overflow_alert: false,
+          world_info_character_strategy: 0,
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if ((url === '/api/worlds/GlobalLore' || url === '/api/worlds/LocalLore') && init?.method === 'PATCH') {
+        const worldName = url.endsWith('/GlobalLore') ? 'GlobalLore' : 'LocalLore'
+        const body = JSON.parse(String(init.body)) as { global_enabled: boolean }
+        selectedWorldInfo = body.global_enabled
+          ? Array.from(new Set([...selectedWorldInfo, worldName]))
+          : selectedWorldInfo.filter(name => name !== worldName)
+        return new Response(JSON.stringify(makeWorld(worldName, body.global_enabled)), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      if (url === '/api/extensions/settings') {
+        return new Response(JSON.stringify(extension_settings), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return new Response('', { status: 404 })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const updates: unknown[][] = []
+    const listener = (...args: unknown[]) => updates.push(args)
+    eventSource.on(event_types.WORLDINFO_SETTINGS_UPDATED, listener)
+
+    await updateWorldInfoList()
+    const selected = getContext().selected_world_info as string[]
+    selected.length = 0
+    selected.push('LocalLore')
+    ;(getContext().world_info as Record<string, unknown>).globalSelect = selected
+
+    await saveSettings()
+    eventSource.off(event_types.WORLDINFO_SETTINGS_UPDATED, listener)
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/worlds/LocalLore', expect.objectContaining({
+      method: 'PATCH',
+      body: JSON.stringify({ global_enabled: true }),
+    }))
+    expect(fetchMock).toHaveBeenCalledWith('/api/worlds/GlobalLore', expect.objectContaining({
+      method: 'PATCH',
+      body: JSON.stringify({ global_enabled: false }),
+    }))
+    expect(fetchMock).toHaveBeenCalledWith('/api/extensions/settings', expect.objectContaining({
+      method: 'POST',
+    }))
+    expect(window.CraftTalker?.stHost?.selected_world_info).toEqual(['LocalLore'])
+    expect(updates).toEqual([[
+      {
+        selected_world_info: ['LocalLore'],
+        world_names: ['GlobalLore', 'LocalLore'],
+      },
+    ]])
+    expect(getDiagnostics()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'saveSettingsWorldInfoSelection', status: 'partial' }),
+    ]))
+
+    fetchMock.mockClear()
+    selected.length = 0
+    selected.push('MissingLore')
+    await saveSettings()
+
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(fetchMock).toHaveBeenCalledWith('/api/extensions/settings', expect.objectContaining({
+      method: 'POST',
+    }))
+    expect(window.CraftTalker?.stHost?.selected_world_info).toEqual(['LocalLore'])
+    expect(getDiagnostics()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'saveSettingsWorldInfoSelection', status: 'blocked' }),
+    ]))
+  })
+
+  it('persists direct world_info.charLore mirror changes during saveSettings', async () => {
+    const worldNames = ['PrimaryLore', 'SideLore', 'LocalLore']
+    let charExtensions: Record<string, unknown> = {
+      keep: true,
+      world: 'PrimaryLore',
+      worlds: ['PrimaryLore', 'SideLore'],
+    }
+    let charLore = [{ name: 'CharBot', extraBooks: ['SideLore'] }]
+    const makeWorld = (name: string) => ({
+      name,
+      description: '',
+      enabled: true,
+      global_enabled: false,
+      global_selective: false,
+      selective_default: false,
+      recursive_scanning: false,
+      scan_depth: 100,
+      token_budget: 500,
+      recursive_scanning_depth: 2,
+      extensions: {},
+      entries: {},
+    })
+    const makeCharacter = () => ({
+      name: 'Char Bot',
+      description: '',
+      tags: [],
+      creator: '',
+      spec: 'chara_card_v2',
+      spec_version: '2.0',
+      avatar: null,
+      file_name: 'CharBot',
+      created_at: 1,
+      updated_at: 2,
+      world: 'PrimaryLore',
+      personality: '',
+      scenario: '',
+      first_mes: '',
+      mes_example: '',
+      creator_notes: '',
+      character_version: '1.0',
+      extensions: charExtensions,
+    })
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      if (url === '/api/worlds/settings') {
+        return new Response(JSON.stringify({
+          world_names: worldNames,
+          selected_world_info: [],
+          world_info: { globalSelect: [], charLore, entries: {} },
+          world_info_include_names: true,
+          world_info_case_sensitive: false,
+          world_info_match_whole_words: false,
+          world_info_use_group_scoring: false,
+          world_info_max_recursion_steps: 10,
+          world_info_depth: 4,
+          world_info_min_activations: 0,
+          world_info_min_activations_depth_max: 0,
+          world_info_budget: 25,
+          world_info_budget_cap: 0,
+          world_info_recursive: false,
+          world_info_overflow_alert: false,
+          world_info_character_strategy: 0,
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (url === '/api/worlds/LocalLore' && init?.method === 'PATCH') {
+        return new Response(JSON.stringify(makeWorld('LocalLore')), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      if (url === '/api/characters/CharBot' && !init?.method) {
+        return new Response(JSON.stringify(makeCharacter()), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      if (url === '/api/characters/CharBot' && init?.method === 'PATCH') {
+        const body = JSON.parse(String(init.body)) as { extensions: Record<string, unknown> }
+        charExtensions = body.extensions
+        const primary = typeof charExtensions.world === 'string' ? charExtensions.world : ''
+        charLore = [{
+          name: 'CharBot',
+          extraBooks: Array.isArray(charExtensions.worlds)
+            ? charExtensions.worlds.filter((name): name is string => typeof name === 'string' && name !== primary)
+            : [],
+        }].filter(entry => entry.extraBooks.length > 0)
+        return new Response(JSON.stringify(makeCharacter()), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      if (url === '/api/extensions/settings') {
+        return new Response(JSON.stringify(extension_settings), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return new Response('', { status: 404 })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    updateStExtensionContext({
+      activeCharacter: {
+        id: 'char-bot',
+        name: 'Char Bot',
+        avatar: null,
+        description: '',
+        model: 'default',
+        lastMessage: '',
+        pinned: false,
+        file_name: 'CharBot',
+        world: 'PrimaryLore',
+        extensions: charExtensions,
+      } as never,
+      characters: [{
+        id: 'char-bot',
+        name: 'Char Bot',
+        avatar: null,
+        description: '',
+        model: 'default',
+        lastMessage: '',
+        pinned: false,
+        file_name: 'CharBot',
+        world: 'PrimaryLore',
+        extensions: charExtensions,
+      } as never],
+    })
+
+    await updateWorldInfoList()
+    ;(getContext().world_info as Record<string, unknown>).charLore = [{ name: 'CharBot', extraBooks: ['LocalLore'] }]
+
+    await saveSettings()
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/worlds/LocalLore', expect.objectContaining({
+      method: 'PATCH',
+      body: JSON.stringify({ enabled: true }),
+    }))
+    const characterPatch = fetchMock.mock.calls.find(([url, init]) => url === '/api/characters/CharBot' && init?.method === 'PATCH')
+    expect(characterPatch).toBeTruthy()
+    expect(JSON.parse(String(characterPatch?.[1]?.body)).extensions).toEqual({
+      keep: true,
+      world: 'PrimaryLore',
+      worlds: ['PrimaryLore', 'LocalLore'],
+    })
+    expect(window.CraftTalker?.stHost?.world_info.charLore).toEqual([{ name: 'CharBot', extraBooks: ['LocalLore'] }])
+    expect(getDiagnostics()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'saveSettingsWorldInfoCharLore', status: 'partial' }),
+    ]))
+
+    fetchMock.mockClear()
+    ;(getContext().world_info as Record<string, unknown>).charLore = [{ name: 'CharBot', extraBooks: ['MissingLore'] }]
+    await saveSettings()
+
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(fetchMock).toHaveBeenCalledWith('/api/extensions/settings', expect.objectContaining({
+      method: 'POST',
+    }))
+    expect(window.CraftTalker?.stHost?.world_info.charLore).toEqual([{ name: 'CharBot', extraBooks: ['LocalLore'] }])
+    expect(getDiagnostics()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'saveSettingsWorldInfoCharLore', status: 'blocked' }),
+    ]))
+  })
+
+  it('persists existing worldbooks through the permissioned ST compatibility bridge', async () => {
+    const savedWorld = {
+      name: 'GlobalLore',
+      description: 'saved',
+      enabled: true,
+      global_enabled: true,
+      global_selective: false,
+      selective_default: false,
+      recursive_scanning: false,
+      scan_depth: 100,
+      token_budget: 500,
+      recursive_scanning_depth: 2,
+      extensions: {},
+      entries: {
+        '2': {
+          uid: 2,
+          key: ['gate'],
+          keysecondary: [],
+          comment: 'Gate',
+          content: 'Saved gate lore.',
+          constant: false,
+          selective: false,
+          insertion_order: 100,
+          enabled: true,
+          position: 0,
+          depth: 4,
+          order: 100,
+          use_regexp: false,
+          probability: 100,
+          group: '',
+          group_override: false,
+          exclude_recursion: false,
+          prevent_recursion: false,
+          delay_until_recursion: false,
+          scan_depth: 100,
+          match_whole_words: false,
+          use_group_scoring: false,
+          case_sensitive: false,
+          automation_id: '',
+          role: 0,
+          sticky: 0,
+          cooldown: 0,
+          delay: 0,
+          display_index: 2,
+          extensions: {},
+        },
+      },
+    }
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url === '/api/worldinfo/edit') {
+        return new Response(JSON.stringify(savedWorld), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return new Response('', { status: 404 })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const updates: unknown[][] = []
+    const listener = (...args: unknown[]) => updates.push(args)
+    eventSource.on(event_types.WORLDINFO_UPDATED, listener)
+
+    const data = { entries: { 2: { uid: 2, key: ['gate'], content: 'Saved gate lore.' } } }
+    const result = await saveWorldInfo('GlobalLore', data, true)
+    eventSource.off(event_types.WORLDINFO_UPDATED, listener)
+
+    expect(result).toBe(true)
+    expect(getContext().saveWorldInfo).toBe(saveWorldInfo)
+    expect(fetchMock).toHaveBeenCalledWith('/api/worldinfo/edit', expect.objectContaining({
+      method: 'POST',
+      body: JSON.stringify({ name: 'GlobalLore', data }),
+    }))
+    expect(window.CraftTalker?.stHost?.world_info.entries).toMatchObject({
+      GlobalLore: savedWorld.entries,
+    })
+    expect(updates).toEqual([['GlobalLore', savedWorld]])
+    expect(getDiagnostics()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'saveWorldInfo', status: 'partial' }),
+    ]))
+  })
+
+  it('creates new worldbooks through the permissioned ST compatibility bridge', async () => {
+    const createdWorld = {
+      name: 'NewLore',
+      description: '',
+      enabled: false,
+      global_enabled: false,
+      global_selective: false,
+      selective_default: false,
+      recursive_scanning: false,
+      scan_depth: 100,
+      token_budget: 500,
+      recursive_scanning_depth: 2,
+      extensions: {},
+      entries: {},
+    }
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url === '/api/worlds') {
+        return new Response(JSON.stringify(createdWorld), {
+          status: 201,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return new Response('', { status: 404 })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(createNewWorldInfo('NewLore')).resolves.toBe(true)
+    expect(fetchMock).toHaveBeenCalledWith('/api/worlds', expect.objectContaining({
+      method: 'POST',
+      body: JSON.stringify({ name: 'NewLore' }),
+    }))
+    expect(window.CraftTalker?.stHost?.world_names).toContain('NewLore')
+    expect(window.CraftTalker?.stHost?.world_info.entries).toMatchObject({ NewLore: {} })
+    expect(getContext().createNewWorldInfo).toBe(createNewWorldInfo)
+    expect(getDiagnostics()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'createNewWorldInfo', status: 'partial' }),
+    ]))
+
+    fetchMock.mockClear()
+    await expect(createNewWorldInfo('NewLore')).resolves.toBe(false)
+    expect(fetchMock).not.toHaveBeenCalled()
+    expect(getDiagnostics()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'createNewWorldInfo', status: 'blocked' }),
     ]))
   })
 })
