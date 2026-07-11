@@ -11,7 +11,7 @@ export function matchWorldEntries(
   const result = checkWorldInfoSync({
     sources: [{ name: 'legacy', type: 'character', entries }],
     chat: [scanText.slice(-scanDepth * 200)],
-    settings: { depth: 1, budgetTokens: Number.MAX_SAFE_INTEGER },
+    settings: { depth: 1, budgetTokens: Number.MAX_SAFE_INTEGER, legacyUseRegexp: true },
   })
   return result.matchedEntries
 }

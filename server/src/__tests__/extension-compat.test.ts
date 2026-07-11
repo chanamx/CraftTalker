@@ -296,6 +296,7 @@ describe('SillyTavern extension compatibility routes', () => {
       loading_order: 5,
       js: 'index.js',
       css: 'style.css',
+      hooks: { activate: 'activateHook' },
     })
     writeTestExtension('NeedsMissingDependency', {
       display_name: 'Needs Missing Dependency',
@@ -329,6 +330,7 @@ describe('SillyTavern extension compatibility routes', () => {
       expect.objectContaining({ id: 'worldbook-api', status: 'partial' }),
       expect.objectContaining({ id: 'character-api', status: 'partial' }),
       expect.objectContaining({ id: 'generation-api', status: 'partial' }),
+      expect.objectContaining({ id: 'trusted-browser-extension-runtime', status: 'partial' }),
       expect.objectContaining({ id: 'image-and-cors-proxy', status: 'blocked' }),
       expect.objectContaining({ id: 'unsafe-script-runtime', status: 'blocked' }),
     ]))
@@ -339,6 +341,7 @@ describe('SillyTavern extension compatibility routes', () => {
       scriptOk: true,
       cssOk: true,
       enabled: true,
+      hooks: { activate: 'activateHook' },
     }))
     expect(report.extensions).toContainEqual(expect.objectContaining({
       name: 'third-party/NeedsMissingDependency',

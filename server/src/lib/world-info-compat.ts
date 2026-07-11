@@ -29,6 +29,8 @@ const DEFAULT_WEIGHT = 100
 const DEFAULT_CONTEXT_SIZE = 4096
 const MAX_SCAN_DEPTH = 1000
 const KNOWN_DECORATORS = ['@@activate', '@@dont_activate']
+const SCAN_SEGMENT_MARKER = '\x01'
+const SCAN_SEGMENT_JOINER = `\n${SCAN_SEGMENT_MARKER}`
 
 type SourceType = 'chat' | 'persona' | 'character' | 'global'
 export type WorldInfoScanState = 'initial' | 'recursion' | 'min_activations'
@@ -76,10 +78,12 @@ export interface WorldInfoScanSettings {
   trigger?: string
   characterName?: string
   characterTags?: string[]
+  characterTagNames?: string[]
   globalScanData?: WorldInfoGlobalScanData
   timedEffects?: WorldInfoTimedEffectsMetadata
   dryRun?: boolean
   tokenCounter?: TokenCounter
+  entriesLoadedHooks?: WorldInfoEntriesLoadedHook[]
   scanDoneHooks?: WorldInfoScanDoneHook[]
   includeNames?: boolean
   scanInjects?: string[]
@@ -87,6 +91,7 @@ export interface WorldInfoScanSettings {
   vectorActivations?: WorldInfoVectorActivation[]
   vectorActivator?: WorldInfoVectorActivator
   macroResolver?: WorldInfoMacroResolver
+  legacyUseRegexp?: boolean
 }
 
 export interface WorldInfoChatMessage {
@@ -119,6 +124,7 @@ export interface WorldInfoVectorActivationInput {
 }
 
 export interface WorldInfoGlobalScanData {
+  trigger?: string
   personaDescription?: string
   characterDescription?: string
   characterPersonality?: string
@@ -129,6 +135,7 @@ export interface WorldInfoGlobalScanData {
 
 export interface WorldInfoPromptResult {
   matchedEntries: MatchedEntry[]
+  worldInfoString: string
   worldInfoBefore: string
   worldInfoAfter: string
   worldInfoExamples: Array<{ position: 'before' | 'after'; content: string }>
@@ -136,11 +143,13 @@ export interface WorldInfoPromptResult {
   anBefore: string[]
   anAfter: string[]
   outletEntries: Record<string, string[]>
-  allActivatedEntries: WorldInfoCompatEntry[]
+  allActivatedEntries: WorldInfoScanEventEntry[]
   overflowed: boolean
   timedEffects: WorldInfoTimedEffectsMetadata
   timedEffectsChanged: boolean
   scanEvents: WorldInfoScanEvent[]
+  sortedEntries: WorldInfoScanEventEntry[]
+  sourceEntries: WorldInfoSourceEntryGroups
   vectorizedSkipped: WorldInfoScanEvent[]
   vectorizedActivated: WorldInfoScanEvent[]
 }
@@ -158,6 +167,33 @@ export interface WorldInfoScanEvent {
   nextState?: ScanState | null
   activatedCount?: number
   overflowed?: boolean
+  budgetCurrent?: number
+  recursionDelayAvailableLevels?: number[]
+  recursionDelayCurrentLevel?: number
+  newAllEntries?: WorldInfoScanEventEntry[]
+  newSuccessfulEntries?: WorldInfoScanEventEntry[]
+  timedEffectActiveEntryIds?: WorldInfoTimedEffectActiveEntryIds
+}
+
+export type WorldInfoScanEventEntry = Omit<WorldInfoCompatEntry, 'raw'>
+
+export interface WorldInfoTimedEffectActiveEntryIds {
+  sticky: string[]
+  cooldown: string[]
+  delay: string[]
+}
+
+export interface WorldInfoSourceEntryGroups {
+  globalLore: WorldInfoScanEventEntry[]
+  characterLore: WorldInfoScanEventEntry[]
+  chatLore: WorldInfoScanEventEntry[]
+  personaLore: WorldInfoScanEventEntry[]
+}
+
+export interface WorldInfoEntriesLoadedHookInput extends WorldInfoCompatEntryGroups {
+  trigger: string
+  isDryRun: boolean
+  characterStrategy: number
 }
 
 export interface WorldInfoScanHookInput {
@@ -225,6 +261,8 @@ type WorldInfoScanHookPatch = Partial<Pick<WorldInfoScanHookInput, 'nextState' |
   recursionDelay?: Partial<WorldInfoScanHookRecursionDelay>
   budget?: Partial<WorldInfoScanHookBudget>
 }
+type WorldInfoEntriesLoadedHookPatch = Partial<WorldInfoCompatEntryGroups>
+export type WorldInfoEntriesLoadedHook = (input: WorldInfoEntriesLoadedHookInput) => void | WorldInfoEntriesLoadedHookPatch | Promise<void | WorldInfoEntriesLoadedHookPatch>
 export type WorldInfoScanDoneHook = (input: WorldInfoScanHookInput) => void | WorldInfoScanHookPatch | Promise<void | WorldInfoScanHookPatch>
 
 export interface WorldInfoTimedEffect {
@@ -273,6 +311,7 @@ export interface WorldInfoCompatEntry {
   useGroupScoring: boolean | null
   useRegexp: boolean
   outletName: string
+  automationId: string
   sticky: number
   cooldown: number
   delay: number
@@ -287,6 +326,13 @@ export interface WorldInfoCompatEntry {
   characterFilter: WorldInfoCharacterFilter | null
   decorators: string[]
   raw: WorldBookEntry
+}
+
+interface WorldInfoCompatEntryGroups {
+  globalLore: WorldInfoCompatEntry[]
+  characterLore: WorldInfoCompatEntry[]
+  chatLore: WorldInfoCompatEntry[]
+  personaLore: WorldInfoCompatEntry[]
 }
 
 interface WorldInfoCharacterFilter {
@@ -333,7 +379,6 @@ interface CheckWorldInfoRuntime {
   availableRecursionDelayLevels: number[]
   activated: Map<string, WorldInfoCompatEntry>
   failedProbability: Set<string>
-  skippedVectorized: Set<string>
   activatedVectorized: Set<string>
   forceActivations: Map<string, Partial<WorldInfoCompatEntry>>
   timedEffects: TimedEffectRuntime
@@ -343,33 +388,48 @@ interface CheckWorldInfoRuntime {
 }
 
 type CheckWorldInfoExecutionEffect =
+  | { type: 'get-sorted-entries'; sources: WorldInfoSource[]; settings: WorldInfoScanSettings }
   | { type: 'apply-vector-activations'; runtime: CheckWorldInfoRuntime; settings: WorldInfoScanSettings }
   | { type: 'count-tokens'; tokenCounter: TokenCounter; text: string }
   | { type: 'emit-scan-done-hooks'; settings: WorldInfoScanSettings; input: WorldInfoScanHookInput }
 
-type CheckWorldInfoExecutionResult = void | number | WorldInfoScanHookPatch
+type CheckWorldInfoExecutionResult = void | number | WorldInfoCompatEntry[] | WorldInfoScanHookPatch
 
 export function getSortedWorldInfoEntries(
   sources: WorldInfoSource[],
   settings: WorldInfoScanSettings = {},
 ): WorldInfoCompatEntry[] {
-  const byType: Record<SourceType, WorldInfoCompatEntry[]> = {
-    chat: [],
-    persona: [],
-    character: [],
-    global: [],
+  const groups = getCompatSourceEntryGroups(sources)
+  emitEntriesLoadedHooksSync(settings, groups)
+  return sortCompatSourceEntryGroups(groups, settings)
+}
+
+function getCompatSourceEntryGroups(sources: WorldInfoSource[]): WorldInfoCompatEntryGroups {
+  const groups: WorldInfoCompatEntryGroups = {
+    globalLore: [],
+    characterLore: [],
+    chatLore: [],
+    personaLore: [],
   }
 
   for (const source of sources) {
+    const group = getCompatSourceEntryGroup(groups, source.type)
     for (const [entryKey, entry] of Object.entries(source.entries)) {
-      byType[source.type].push(toCompatEntry(entry, source, entryKey))
+      group.push(toCompatEntry(entry, source, entryKey))
     }
   }
 
-  const chatLore = sortByOrder(byType.chat)
-  const personaLore = sortByOrder(byType.persona)
-  const characterLore = sortByOrder(byType.character)
-  const globalLore = sortByOrder(byType.global)
+  return groups
+}
+
+function sortCompatSourceEntryGroups(
+  groups: WorldInfoCompatEntryGroups,
+  settings: WorldInfoScanSettings,
+): WorldInfoCompatEntry[] {
+  const chatLore = sortByOrder(asSourceType(groups.chatLore, 'chat'))
+  const personaLore = sortByOrder(asSourceType(groups.personaLore, 'persona'))
+  const characterLore = sortByOrder(asSourceType(groups.characterLore, 'character'))
+  const globalLore = sortByOrder(asSourceType(groups.globalLore, 'global'))
   const characterStrategy = settings.characterStrategy ?? WORLD_INFO_INSERTION_STRATEGY.character_first
   let regularLore: WorldInfoCompatEntry[]
 
@@ -389,6 +449,107 @@ export function getSortedWorldInfoEntries(
   }
 
   return [...chatLore, ...personaLore, ...regularLore]
+}
+
+function getCompatSourceEntryGroup(
+  groups: WorldInfoCompatEntryGroups,
+  sourceType: SourceType,
+): WorldInfoCompatEntry[] {
+  switch (sourceType) {
+    case 'global':
+      return groups.globalLore
+    case 'character':
+      return groups.characterLore
+    case 'chat':
+      return groups.chatLore
+    case 'persona':
+      return groups.personaLore
+  }
+}
+
+function asSourceType(entries: WorldInfoCompatEntry[], sourceType: SourceType): WorldInfoCompatEntry[] {
+  return entries.map(entry => entry.sourceType === sourceType ? entry : { ...entry, sourceType })
+}
+
+async function getSortedWorldInfoEntriesAsync(
+  sources: WorldInfoSource[],
+  settings: WorldInfoScanSettings,
+): Promise<WorldInfoCompatEntry[]> {
+  const groups = getCompatSourceEntryGroups(sources)
+  await emitEntriesLoadedHooks(settings, groups)
+  return sortCompatSourceEntryGroups(groups, settings)
+}
+
+async function emitEntriesLoadedHooks(
+  settings: WorldInfoScanSettings,
+  groups: WorldInfoCompatEntryGroups,
+): Promise<void> {
+  for (const hook of settings.entriesLoadedHooks ?? []) {
+    const input = buildEntriesLoadedHookInput(settings, groups)
+    const result = await hook(input)
+    applyEntriesLoadedHookPatch(groups, input)
+    if (result && typeof result === 'object') applyEntriesLoadedHookPatch(groups, result)
+  }
+}
+
+function emitEntriesLoadedHooksSync(
+  settings: WorldInfoScanSettings,
+  groups: WorldInfoCompatEntryGroups,
+): void {
+  for (const hook of settings.entriesLoadedHooks ?? []) {
+    const input = buildEntriesLoadedHookInput(settings, groups)
+    const result = hook(input)
+    if (isPromiseLike(result)) {
+      throw new Error('getSortedWorldInfoEntries and checkWorldInfoSync require synchronous entriesLoadedHooks')
+    }
+    applyEntriesLoadedHookPatch(groups, input)
+    if (result && typeof result === 'object') applyEntriesLoadedHookPatch(groups, result)
+  }
+}
+
+function buildEntriesLoadedHookInput(
+  settings: WorldInfoScanSettings,
+  groups: WorldInfoCompatEntryGroups,
+): WorldInfoEntriesLoadedHookInput {
+  return {
+    globalLore: groups.globalLore,
+    characterLore: groups.characterLore,
+    chatLore: groups.chatLore,
+    personaLore: groups.personaLore,
+    trigger: settings.trigger ?? 'normal',
+    isDryRun: settings.dryRun === true,
+    characterStrategy: settings.characterStrategy ?? WORLD_INFO_INSERTION_STRATEGY.character_first,
+  }
+}
+
+function applyEntriesLoadedHookPatch(
+  groups: WorldInfoCompatEntryGroups,
+  patch: Partial<WorldInfoCompatEntryGroups>,
+): void {
+  replaceEntriesLoadedGroup(groups, patch, 'globalLore')
+  replaceEntriesLoadedGroup(groups, patch, 'characterLore')
+  replaceEntriesLoadedGroup(groups, patch, 'chatLore')
+  replaceEntriesLoadedGroup(groups, patch, 'personaLore')
+}
+
+function replaceEntriesLoadedGroup(
+  groups: WorldInfoCompatEntryGroups,
+  patch: Partial<WorldInfoCompatEntryGroups>,
+  key: keyof WorldInfoCompatEntryGroups,
+): void {
+  if (!Object.hasOwn(patch, key)) return
+  const value = patch[key]
+  if (!Array.isArray(value)) return
+  groups[key] = value.filter(isCompatEntryLike)
+}
+
+function isCompatEntryLike(value: unknown): value is WorldInfoCompatEntry {
+  if (!value || typeof value !== 'object') return false
+  const record = value as Record<string, unknown>
+  return typeof record.world === 'string'
+    && Number.isFinite(numberValue(record.uid, Number.NaN))
+    && Array.isArray(record.key)
+    && typeof record.content === 'string'
 }
 
 export function checkWorldInfo(input: CheckWorldInfoInput): Promise<WorldInfoPromptResult> {
@@ -421,7 +582,8 @@ function* executeCheckWorldInfo(
   input: CheckWorldInfoInput,
 ): Generator<CheckWorldInfoExecutionEffect, WorldInfoPromptResult, CheckWorldInfoExecutionResult> {
   const settings = normalizeScanSettings(input.settings)
-  const runtime = createRuntime(input, settings)
+  const sortedEntries = (yield { type: 'get-sorted-entries', sources: input.sources, settings }) as WorldInfoCompatEntry[]
+  const runtime = createRuntime(input, settings, sortedEntries)
   yield { type: 'apply-vector-activations', runtime, settings }
 
   while (runtime.scanState) {
@@ -442,22 +604,15 @@ function* executeCheckWorldInfo(
       if (runtime.scanState !== 'recursion' && entry.delayUntilRecursion > 0 && !isSticky) continue
       if (runtime.scanState === 'recursion' && entry.delayUntilRecursion > runtime.currentRecursionDelayLevel && !isSticky) continue
 
-      if (entry.decorators.includes('@@dont_activate')) continue
       if (entry.decorators.includes('@@activate')) {
         possibleEntries.push(entry)
         continue
       }
+      if (entry.decorators.includes('@@dont_activate')) continue
 
       const forcedEntry = getForcedActivation(runtime, entry)
       if (forcedEntry) {
         possibleEntries.push(forcedEntry)
-        continue
-      }
-
-      if (!entry.content) continue
-
-      if (entry.vectorized) {
-        pushVectorizedSkippedEvent(runtime, entry)
         continue
       }
 
@@ -500,6 +655,7 @@ function* executeCheckWorldInfo(
       if (!passesProbabilityCheck(runtime, entry)) continue
 
       const activatedEntry = resolveEntryForActivation(entry, settings)
+      successfulEntries.push(activatedEntry)
       newContent += `${activatedEntry.content}\n`
       const prospectiveTokens = activatedTokens + ((yield {
         type: 'count-tokens',
@@ -512,7 +668,6 @@ function* executeCheckWorldInfo(
       }
 
       runtime.activated.set(entryId(entry), activatedEntry)
-      successfulEntries.push(activatedEntry)
     }
 
     const successfulForRecursion = successfulEntries.filter(entry => !entry.preventRecursion)
@@ -539,6 +694,12 @@ function* executeCheckWorldInfo(
       nextState: patchResult.nextState,
       activatedCount: runtime.activated.size,
       overflowed: patchResult.overflowed,
+      budgetCurrent: runtime.budget,
+      recursionDelayAvailableLevels: [...runtime.availableRecursionDelayLevels],
+      recursionDelayCurrentLevel: runtime.currentRecursionDelayLevel,
+      newAllEntries: newEntries.map(toScanEventEntry),
+      newSuccessfulEntries: successfulEntries.map(toScanEventEntry),
+      timedEffectActiveEntryIds: getTimedEffectActiveEntryIds(runtime.timedEffects),
     })
 
     runtime.overflowed = patchResult.overflowed
@@ -546,11 +707,13 @@ function* executeCheckWorldInfo(
   }
 
   setTimedEffects(runtime.timedEffects, [...runtime.activated.values()], settings.dryRun === true)
-  return buildPromptResult([...runtime.activated.values()], runtime.overflowed, runtime.timedEffects, runtime.scanEvents)
+  return buildPromptResult([...runtime.activated.values()], runtime.overflowed, runtime.timedEffects, runtime.scanEvents, runtime.sortedEntries)
 }
 
 async function runCheckWorldInfoEffect(effect: CheckWorldInfoExecutionEffect): Promise<CheckWorldInfoExecutionResult> {
   switch (effect.type) {
+    case 'get-sorted-entries':
+      return getSortedWorldInfoEntriesAsync(effect.sources, effect.settings)
     case 'apply-vector-activations':
       return applyVectorActivations(effect.runtime, effect.settings)
     case 'count-tokens':
@@ -562,6 +725,8 @@ async function runCheckWorldInfoEffect(effect: CheckWorldInfoExecutionEffect): P
 
 function runCheckWorldInfoEffectSync(effect: CheckWorldInfoExecutionEffect): CheckWorldInfoExecutionResult {
   switch (effect.type) {
+    case 'get-sorted-entries':
+      return getSortedWorldInfoEntries(effect.sources, effect.settings)
     case 'apply-vector-activations':
       return applyVectorActivationsSync(effect.runtime, effect.settings)
     case 'count-tokens':
@@ -582,8 +747,11 @@ function normalizeScanSettings(settings: WorldInfoScanSettings | undefined): Wor
   return normalized
 }
 
-function createRuntime(input: CheckWorldInfoInput, settings: WorldInfoScanSettings): CheckWorldInfoRuntime {
-  const sortedEntries = getSortedWorldInfoEntries(input.sources, settings)
+function createRuntime(
+  input: CheckWorldInfoInput,
+  settings: WorldInfoScanSettings,
+  sortedEntries: WorldInfoCompatEntry[],
+): CheckWorldInfoRuntime {
   const chat = normalizeScanChat(input, settings)
   const availableRecursionDelayLevels = getRecursionDelayLevels(sortedEntries)
   const currentRecursionDelayLevel = availableRecursionDelayLevels.shift() ?? 0
@@ -591,7 +759,7 @@ function createRuntime(input: CheckWorldInfoInput, settings: WorldInfoScanSettin
     chat,
     recurse: [],
     inject: normalizeScanInjects(settings.scanInjects),
-    depth: clampDepth(settings.depth ?? inferDepth(sortedEntries)),
+    depth: clampDepth(settings.depth ?? DEFAULT_DEPTH),
     startDepth: 0,
   }
   const maxContext = input.maxContext ?? DEFAULT_CONTEXT_SIZE
@@ -607,7 +775,6 @@ function createRuntime(input: CheckWorldInfoInput, settings: WorldInfoScanSettin
     availableRecursionDelayLevels,
     activated: new Map(),
     failedProbability: new Set(),
-    skippedVectorized: new Set(),
     activatedVectorized: new Set(),
     forceActivations: normalizeForceActivations(settings.forceActivations),
     timedEffects: prepareTimedEffects(settings.timedEffects, sortedEntries, chat.length, settings.dryRun === true),
@@ -797,6 +964,7 @@ function toCompatEntry(entry: WorldBookEntry, source: WorldInfoSource, entryKey:
     useGroupScoring: nullableBooleanFrom(entry, extensions, ['useGroupScoring', 'use_group_scoring']),
     useRegexp: booleanFrom(entry, extensions, ['use_regexp', 'use_regex'], false),
     outletName: stringFrom(entry, extensions, ['outletName', 'outlet_name'], ''),
+    automationId: stringFrom(entry, extensions, ['automationId', 'automation_id'], ''),
     sticky: numberFrom(entry, extensions, ['sticky'], 0),
     cooldown: numberFrom(entry, extensions, ['cooldown'], 0),
     delay: numberFrom(entry, extensions, ['delay'], 0),
@@ -820,12 +988,30 @@ function isEntryAllowedForScan(entry: WorldInfoCompatEntry, settings: WorldInfoS
   if (!entry.characterFilter) return true
 
   const filter = entry.characterFilter
-  const characterName = settings.characterName
-  const tags = settings.characterTags ?? []
-  const nameIncluded = !!characterName && filter.names.includes(characterName)
-  const tagIncluded = filter.tags.some(tag => tags.includes(tag))
-  const matched = nameIncluded || tagIncluded
-  return filter.isExclude ? !matched : matched
+  if (filter.names.length > 0) {
+    const characterName = settings.characterName
+    const nameIncluded = !!characterName && filter.names.includes(characterName)
+    if (filter.isExclude ? nameIncluded : !nameIncluded) return false
+  }
+
+  const characterTags = characterFilterTagCandidates(settings)
+  if (filter.tags.length > 0 && characterTags) {
+    const tagIncluded = characterTags.some(tag => filter.tags.includes(tag))
+    if (filter.isExclude ? tagIncluded : !tagIncluded) return false
+  }
+
+  return true
+}
+
+function characterFilterTagCandidates(settings: WorldInfoScanSettings): string[] | null {
+  if (!Array.isArray(settings.characterTags) && !Array.isArray(settings.characterTagNames)) return null
+
+  const tags = [
+    ...(settings.characterTags ?? []),
+    ...(settings.characterTagNames ?? []),
+  ].map(tag => String(tag).trim()).filter(Boolean)
+
+  return [...new Set(tags)]
 }
 
 function getActivationScore(
@@ -872,7 +1058,11 @@ function getTextToScan(
   if (globalParts.length > 0) parts.push(...globalParts)
   if (buffer.inject.length > 0) parts.push(...buffer.inject)
   if (scanState !== 'min_activations' && buffer.recurse.length > 0) parts.push(...buffer.recurse)
-  return parts.join('\n')
+  return joinScanSegments(parts)
+}
+
+function joinScanSegments(parts: string[]): string {
+  return parts.length > 0 ? `${SCAN_SEGMENT_MARKER}${parts.join(SCAN_SEGMENT_JOINER)}` : ''
 }
 
 function getActivatedText(activated: Map<string, WorldInfoCompatEntry>): string {
@@ -885,6 +1075,41 @@ function getActivatedText(activated: Map<string, WorldInfoCompatEntry>): string 
 function resolveEntryForActivation(entry: WorldInfoCompatEntry, settings: WorldInfoScanSettings): WorldInfoCompatEntry {
   const content = resolveScanMacros(entry.content, settings)
   return content === entry.content ? entry : { ...entry, content }
+}
+
+function toScanEventEntry(entry: WorldInfoCompatEntry): WorldInfoScanEventEntry {
+  const result: Partial<WorldInfoCompatEntry> = { ...entry }
+  delete result.raw
+  return result as WorldInfoScanEventEntry
+}
+
+function getSourceEntryGroups(entries: WorldInfoCompatEntry[]): WorldInfoSourceEntryGroups {
+  const groups: WorldInfoSourceEntryGroups = {
+    globalLore: [],
+    characterLore: [],
+    chatLore: [],
+    personaLore: [],
+  }
+
+  for (const entry of entries) {
+    const eventEntry = toScanEventEntry(entry)
+    switch (entry.sourceType) {
+      case 'global':
+        groups.globalLore.push(eventEntry)
+        break
+      case 'character':
+        groups.characterLore.push(eventEntry)
+        break
+      case 'chat':
+        groups.chatLore.push(eventEntry)
+        break
+      case 'persona':
+        groups.personaLore.push(eventEntry)
+        break
+    }
+  }
+
+  return groups
 }
 
 async function countTokens(tokenCounter: TokenCounter, text: string): Promise<number> {
@@ -949,10 +1174,10 @@ function getNextScanState(
   const minActivations = settings.minActivations ?? 0
   const minActivationsDepthMax = settings.minActivationsDepthMax ?? 0
   if (!runtime.overflowed && minActivations > 0 && runtime.activated.size < minActivations) {
-    const nextDepth = runtime.buffer.depth + 1
-    const overDepth = (minActivationsDepthMax > 0 && nextDepth > minActivationsDepthMax) || nextDepth > runtime.buffer.chat.length
+    const currentDepth = runtime.buffer.depth
+    const overDepth = (minActivationsDepthMax > 0 && currentDepth > minActivationsDepthMax) || currentDepth > runtime.buffer.chat.length
     if (!overDepth) {
-      runtime.buffer.depth = clampDepth(nextDepth)
+      runtime.buffer.depth = clampDepth(currentDepth + 1)
       return 'min_activations'
     }
   }
@@ -976,7 +1201,7 @@ function updateRecursionBuffer(
   if (!nextScanState) return
   const text = successfulForRecursion.map(entry => entry.content).filter(Boolean).join('\n')
   if (!text) return
-  runtime.buffer.recurse.unshift(text)
+  runtime.buffer.recurse.push(text)
   runtime.activatedText = `${text}\n${runtime.activatedText}`
 }
 
@@ -1040,6 +1265,14 @@ function createTimedEffectsHookState(runtime: TimedEffectRuntime): WorldInfoTime
     isEffectActive: (type, entry) => isTimedEffectActive(runtime, type, entry),
     getEffectMetadata: (type, entry) => getTimedEffectMetadata(runtime, type, entry),
     setTimedEffect: (type, entry, newState) => setTimedEffect(runtime, type, entry, newState),
+  }
+}
+
+function getTimedEffectActiveEntryIds(runtime: TimedEffectRuntime): WorldInfoTimedEffectActiveEntryIds {
+  return {
+    sticky: [...runtime.sticky].sort(),
+    cooldown: [...runtime.cooldown].sort(),
+    delay: [...runtime.delay].sort(),
   }
 }
 
@@ -1137,40 +1370,31 @@ function mapOrFallback<K, V>(value: unknown, fallback: Map<K, V>): Map<K, V> {
   return value instanceof Map ? value as Map<K, V> : fallback
 }
 
-function pushVectorizedSkippedEvent(runtime: CheckWorldInfoRuntime, entry: WorldInfoCompatEntry): void {
-  const id = entryId(entry)
-  if (runtime.activatedVectorized.has(id)) return
-  if (runtime.skippedVectorized.has(id)) return
-  runtime.skippedVectorized.add(id)
-  runtime.scanEvents.push(vectorizedSkippedEvent(entry))
-}
-
 function pushVectorizedActivatedEvent(
   runtime: CheckWorldInfoRuntime,
   entry: WorldInfoCompatEntry,
   activation: WorldInfoVectorActivation,
 ): void {
   const id = entryId(entry)
-  if (runtime.activatedVectorized.has(id)) return
+  const source = typeof activation.source === 'string' ? activation.source : undefined
+  const score = typeof activation.score === 'number' && Number.isFinite(activation.score) ? activation.score : undefined
+  if (runtime.activatedVectorized.has(id)) {
+    const existing = runtime.scanEvents.find(event => event.type === 'vectorized_activated' && event.entryId === id)
+    if (existing) {
+      existing.source = source
+      existing.score = score
+    }
+    return
+  }
   runtime.activatedVectorized.add(id)
   runtime.scanEvents.push({
     type: 'vectorized_activated',
     entryId: id,
     world: entry.world,
     uid: entry.uid,
-    source: typeof activation.source === 'string' ? activation.source : undefined,
-    score: typeof activation.score === 'number' && Number.isFinite(activation.score) ? activation.score : undefined,
+    source,
+    score,
   })
-}
-
-function vectorizedSkippedEvent(entry: WorldInfoCompatEntry): WorldInfoScanEvent {
-  return {
-    type: 'vectorized_skipped',
-    entryId: entryId(entry),
-    world: entry.world,
-    uid: entry.uid,
-    reason: 'vectorized world-info entries require an embedding/vector store runtime',
-  }
 }
 
 async function emitScanDoneHooks(
@@ -1300,6 +1524,7 @@ function applyPatchToScanHookInput(input: WorldInfoScanHookInput, patch: WorldIn
   input.budgetRemaining = Math.max(0, Math.floor(budgetRemaining))
 
   input.activated.text = stringOrFallback(patch.activated?.text, input.activated.text)
+  input.activated.entries = mapOrFallback(patch.activated?.entries, input.activated.entries)
   input.recursionDelay.currentLevel = Math.max(
     0,
     Math.floor(numberOrFallback(patch.recursionDelay?.currentLevel, input.recursionDelay.currentLevel)),
@@ -1338,7 +1563,7 @@ function matchKey(
   const caseSensitive = entry.caseSensitive ?? settings.caseSensitive ?? false
   const wholeWords = entry.matchWholeWords ?? settings.matchWholeWords ?? false
 
-  if (entry.useRegexp) {
+  if (settings.legacyUseRegexp && entry.useRegexp) {
     try {
       return new RegExp(key, caseSensitive ? '' : 'i').test(text)
     } catch {
@@ -1387,18 +1612,19 @@ function filterByInclusionGroups(
     }
   }
 
+  const stickyGroups = applyGroupTimedEffects(groups, keep, timedEffects)
+  applyGroupScoring(groups, keep, buffer, scanState, settings, stickyGroups)
+
   for (const [groupName, groupEntries] of groups) {
     const liveEntries = groupEntries.filter(entry => keep.has(entry))
-    if (liveEntries.length <= 1) continue
-    if ([...allActivatedEntries.values()].some(entry => splitGroups(entry.group).includes(groupName))) {
+    if (stickyGroups.has(groupName)) continue
+    if ([...allActivatedEntries.values()].some(entry => entry.group === groupName)) {
       for (const entry of liveEntries) keep.delete(entry)
       continue
     }
+    if (liveEntries.length <= 1) continue
 
-    const stickyEntries = timedEffects ? liveEntries.filter(entry => isTimedEffectActive(timedEffects, 'sticky', entry)) : []
-    const winner = stickyEntries[0]
-      ?? sortByOrder(liveEntries.filter(entry => entry.groupOverride))[0]
-      ?? getScoredGroupWinner(liveEntries, buffer, scanState, settings)
+    const winner = sortByOrder(liveEntries.filter(entry => entry.groupOverride))[0]
       ?? getWeightedGroupWinner(liveEntries)
     for (const entry of liveEntries) {
       if (entry !== winner) keep.delete(entry)
@@ -1408,31 +1634,92 @@ function filterByInclusionGroups(
   return entries.filter(entry => keep.has(entry))
 }
 
-function getScoredGroupWinner(
-  entries: WorldInfoCompatEntry[],
+function applyGroupTimedEffects(
+  groups: Map<string, WorldInfoCompatEntry[]>,
+  keep: Set<WorldInfoCompatEntry>,
+  timedEffects: TimedEffectRuntime | undefined,
+): Set<string> {
+  const stickyGroups = new Set<string>()
+  if (!timedEffects) return stickyGroups
+
+  for (const [groupName, groupEntries] of groups) {
+    const liveEntries = groupEntries.filter(entry => keep.has(entry))
+    const stickyEntries = liveEntries.filter(entry => isTimedEffectActive(timedEffects, 'sticky', entry))
+    if (stickyEntries.length > 0) {
+      stickyGroups.add(groupName)
+      for (const entry of liveEntries) {
+        if (!stickyEntries.includes(entry)) keep.delete(entry)
+      }
+    }
+
+    for (const entry of liveEntries) {
+      if (isTimedEffectActive(timedEffects, 'cooldown', entry) || isTimedEffectActive(timedEffects, 'delay', entry)) {
+        keep.delete(entry)
+      }
+    }
+  }
+
+  return stickyGroups
+}
+
+function applyGroupScoring(
+  groups: Map<string, WorldInfoCompatEntry[]>,
+  keep: Set<WorldInfoCompatEntry>,
   buffer: ScanBuffer,
   scanState: ScanState,
   settings: WorldInfoScanSettings,
-): WorldInfoCompatEntry | null {
-  if (!settings.useGroupScoring && !entries.some(entry => entry.useGroupScoring)) return null
-  let winner: WorldInfoCompatEntry | null = null
-  let maxScore = -1
-  for (const entry of entries) {
-    const score = getActivationScore(entry, buffer, scanState, settings)
-    if (score > maxScore || (score === maxScore && winner && entry.order > winner.order)) {
-      winner = entry
-      maxScore = score
+  stickyGroups: Set<string>,
+): void {
+  for (const [groupName, groupEntries] of groups) {
+    if (stickyGroups.has(groupName)) continue
+
+    const liveEntries = groupEntries.filter(entry => keep.has(entry))
+    if (!settings.useGroupScoring && !liveEntries.some(entry => entry.useGroupScoring === true)) continue
+
+    const scores = liveEntries.map(entry => getGroupMatchScore(entry, buffer, scanState, settings))
+    const maxScore = Math.max(...scores)
+    for (let index = 0; index < liveEntries.length; index += 1) {
+      const entry = liveEntries[index]
+      const isScored = entry.useGroupScoring ?? (settings.useGroupScoring === true)
+      if (isScored && scores[index] < maxScore) {
+        keep.delete(entry)
+      }
     }
   }
-  return winner
+}
+
+function getGroupMatchScore(
+  entry: WorldInfoCompatEntry,
+  buffer: ScanBuffer,
+  scanState: ScanState,
+  settings: WorldInfoScanSettings,
+): number {
+  if (entry.key.length === 0) return 0
+
+  const textToScan = getTextToScan(entry, buffer, scanState, settings)
+  const primaryScore = entry.key.filter(key => matchKey(key, textToScan, entry, settings)).length
+  const secondaryScore = entry.keysecondary.filter(key => matchKey(key, textToScan, entry, settings)).length
+
+  if (entry.keysecondary.length > 0) {
+    switch (entry.selectiveLogic) {
+      case WORLD_INFO_LOGIC.AND_ANY:
+        return primaryScore + secondaryScore
+      case WORLD_INFO_LOGIC.AND_ALL:
+        return secondaryScore === entry.keysecondary.length ? primaryScore + secondaryScore : primaryScore
+      default:
+        return primaryScore
+    }
+  }
+
+  return primaryScore
 }
 
 function getWeightedGroupWinner(entries: WorldInfoCompatEntry[]): WorldInfoCompatEntry {
-  const totalWeight = entries.reduce((sum, entry) => sum + Math.max(1, entry.groupWeight), 0)
+  const totalWeight = entries.reduce((sum, entry) => sum + entry.groupWeight, 0)
   const rollValue = Math.random() * totalWeight
   let currentWeight = 0
   for (const entry of entries) {
-    currentWeight += Math.max(1, entry.groupWeight)
+    currentWeight += entry.groupWeight
     if (rollValue <= currentWeight) return entry
   }
   return entries[0]
@@ -1443,6 +1730,7 @@ function buildPromptResult(
   overflowed: boolean,
   timedEffects: TimedEffectRuntime,
   scanEvents: WorldInfoScanEvent[],
+  sortedEntries: WorldInfoCompatEntry[],
 ): WorldInfoPromptResult {
   const beforeEntries: string[] = []
   const afterEntries: string[] = []
@@ -1455,6 +1743,7 @@ function buildPromptResult(
 
   for (const entry of sortByOrder(entries)) {
     const content = entry.content
+    if (!content) continue
     const matchedEntry: MatchedEntry = {
       content,
       position: entry.position,
@@ -1502,20 +1791,26 @@ function buildPromptResult(
 
   matchedEntries.sort((a, b) => a.insertion_order - b.insertion_order)
 
+  const worldInfoBefore = beforeEntries.join('\n')
+  const worldInfoAfter = afterEntries.join('\n')
+
   return {
     matchedEntries,
-    worldInfoBefore: beforeEntries.join('\n'),
-    worldInfoAfter: afterEntries.join('\n'),
+    worldInfoString: worldInfoBefore + worldInfoAfter,
+    worldInfoBefore,
+    worldInfoAfter,
     worldInfoExamples,
     worldInfoDepth,
     anBefore,
     anAfter,
     outletEntries,
-    allActivatedEntries: entries,
+    allActivatedEntries: entries.map(toScanEventEntry),
     overflowed,
     timedEffects: timedEffects.metadata,
     timedEffectsChanged: timedEffects.changed,
     scanEvents,
+    sortedEntries: sortedEntries.map(toScanEventEntry),
+    sourceEntries: getSourceEntryGroups(sortedEntries),
     vectorizedSkipped: scanEvents.filter(event => event.type === 'vectorized_skipped'),
     vectorizedActivated: scanEvents.filter(event => event.type === 'vectorized_activated'),
   }
@@ -1527,7 +1822,7 @@ function prepareTimedEffects(
   chatLength: number,
   dryRun: boolean,
 ): TimedEffectRuntime {
-  const clonedMetadata = cloneTimedEffects(metadata)
+  const clonedMetadata = cloneTimedEffects(metadata, entries, chatLength)
   const runtime: TimedEffectRuntime = {
     metadata: clonedMetadata.metadata,
     changed: clonedMetadata.changed,
@@ -1552,12 +1847,18 @@ function prepareTimedEffects(
   return runtime
 }
 
-function cloneTimedEffects(metadata: WorldInfoTimedEffectsMetadata | undefined): { metadata: WorldInfoTimedEffectsMetadata; changed: boolean } {
+function cloneTimedEffects(
+  metadata: WorldInfoTimedEffectsMetadata | undefined,
+  entries: WorldInfoCompatEntry[],
+  chatLength: number,
+): { metadata: WorldInfoTimedEffectsMetadata; changed: boolean } {
   if (!metadata) {
     return { metadata: { sticky: {}, cooldown: {} }, changed: false }
   }
-  const sticky = cloneTimedEffectRecord(metadata.sticky)
-  const cooldown = cloneTimedEffectRecord(metadata.cooldown)
+  const entryLookup = createTimedEffectEntryLookup(entries)
+  const metadataRecord = recordValue(metadata)
+  const sticky = cloneTimedEffectRecord(metadataRecord.sticky, 'sticky', entryLookup, chatLength)
+  const cooldown = cloneTimedEffectRecord(metadataRecord.cooldown, 'cooldown', entryLookup, chatLength)
   return {
     metadata: {
       sticky: sticky.record,
@@ -1567,25 +1868,97 @@ function cloneTimedEffects(metadata: WorldInfoTimedEffectsMetadata | undefined):
   }
 }
 
-function cloneTimedEffectRecord(record: Record<string, WorldInfoTimedEffect> | undefined): { record: Record<string, WorldInfoTimedEffect>; changed: boolean } {
+function cloneTimedEffectRecord(
+  record: unknown,
+  type: TimedEffectType,
+  entryLookup: Map<string, WorldInfoCompatEntry>,
+  chatLength: number,
+): { record: Record<string, WorldInfoTimedEffect>; changed: boolean } {
   const result: Record<string, WorldInfoTimedEffect> = {}
-  let changed = !record
-  if (!record) return { record: result, changed }
+  let changed = record === undefined
+  if (!record || typeof record !== 'object' || Array.isArray(record)) {
+    return { record: result, changed: true }
+  }
   for (const [key, value] of Object.entries(record)) {
     if (!value || typeof value !== 'object') {
       changed = true
       continue
     }
-    const hash = numberValue(value.hash, Number.NaN)
-    const start = numberValue(value.start, Number.NaN)
-    const end = numberValue(value.end, Number.NaN)
+    const valueRecord = value as Record<string, unknown>
+    const hash = numberValue(valueRecord.hash, Number.NaN)
+    const start = numberValue(valueRecord.start, Number.NaN)
+    const end = numberValue(valueRecord.end, Number.NaN)
     if (!Number.isFinite(hash) || !Number.isFinite(start) || !Number.isFinite(end)) {
+      const normalized = normalizeForeignTimedEffect(key, valueRecord, type, entryLookup, chatLength)
+      if (normalized) {
+        result[normalized.key] = normalized.effect
+      }
       changed = true
       continue
     }
-    result[key] = { hash, start, end, protected: value.protected === true }
+    result[key] = { hash, start, end, protected: valueRecord.protected === true }
   }
   return { record: result, changed }
+}
+
+function createTimedEffectEntryLookup(entries: WorldInfoCompatEntry[]): Map<string, WorldInfoCompatEntry> {
+  const lookup = new Map<string, WorldInfoCompatEntry>()
+  for (const entry of entries) {
+    lookup.set(entryId(entry), entry)
+    const rawUid = recordValue(entry.raw).uid
+    if (typeof rawUid === 'string' || typeof rawUid === 'number') {
+      lookup.set(`${entry.world}.${rawUid}`, entry)
+    }
+  }
+  return lookup
+}
+
+function normalizeForeignTimedEffect(
+  key: string,
+  value: Record<string, unknown>,
+  type: TimedEffectType,
+  entryLookup: Map<string, WorldInfoCompatEntry>,
+  chatLength: number,
+): { key: string; effect: WorldInfoTimedEffect } | null {
+  const entry = resolveTimedEffectEntry(key, value, entryLookup)
+  if (!entry || entry[type] <= 0) return null
+
+  const end = numberValue(value.end, Number.NaN)
+  if (!Number.isFinite(end)) return null
+
+  const explicitStart = numberValue(value.start, Number.NaN)
+  const start = Number.isFinite(explicitStart)
+    ? Math.floor(explicitStart)
+    : inferForeignTimedEffectStart(end, entry[type], chatLength)
+
+  return {
+    key: entryId(entry),
+    effect: {
+      hash: entry.hash,
+      start,
+      end: Math.floor(end),
+      protected: value.protected === true,
+    },
+  }
+}
+
+function resolveTimedEffectEntry(
+  key: string,
+  value: Record<string, unknown>,
+  entryLookup: Map<string, WorldInfoCompatEntry>,
+): WorldInfoCompatEntry | undefined {
+  const directEntry = entryLookup.get(key)
+  if (directEntry) return directEntry
+
+  if (typeof value.world !== 'string' || !value.world) return undefined
+  if (typeof value.uid !== 'string' && typeof value.uid !== 'number') return undefined
+
+  return entryLookup.get(`${value.world}.${value.uid}`)
+}
+
+function inferForeignTimedEffectStart(end: number, duration: number, chatLength: number): number {
+  const nominalStart = Math.floor(end) - Math.max(1, Math.floor(duration))
+  return Math.min(nominalStart, Math.floor(chatLength) - 1)
 }
 
 function applyStoredTimedEffects(
@@ -1734,11 +2107,6 @@ function getBudget(maxContext: number, settings: WorldInfoScanSettings): number 
   let budget = Math.round((budgetPercent * maxContext) / 100) || 1
   if (settings.budgetCap && settings.budgetCap > 0 && budget > settings.budgetCap) budget = settings.budgetCap
   return budget
-}
-
-function inferDepth(entries: WorldInfoCompatEntry[]): number {
-  const depths = entries.map(entry => entry.scanDepth ?? 0).filter(depth => depth > 0)
-  return depths.length ? Math.max(...depths) : DEFAULT_DEPTH
 }
 
 function getRecursionDelayLevels(entries: WorldInfoCompatEntry[]): number[] {

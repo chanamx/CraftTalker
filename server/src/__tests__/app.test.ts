@@ -3,8 +3,9 @@ import fs from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
 import { createApp } from '../app.js'
-import { cancelRun, createGenerationRun, failRun, updateRunPartial } from '../services/run.service.js'
-import { createChat, getChat } from '../services/chat.service.js'
+import { cancelRun, completeRun, createGenerationRun, failRun, updateRunPartial } from '../services/run.service.js'
+import { addMessage, createChat, editMessage, getChat } from '../services/chat.service.js'
+import * as chatService from '../services/chat.service.js'
 import { clearGenerationLocksForTest, tryAcquireGenerationLock } from '../lib/generation-locks.js'
 import { clearLlmKeySessionsForTest } from '../services/llm-session.service.js'
 import { writeChatFile } from '../lib/jsonl.js'
@@ -844,6 +845,107 @@ describe('API Routes', () => {
     expect(afterDuplicate.lines.filter(line => 'mes' in line)).toHaveLength(1)
   })
 
+  it('POST /api/runs/:runId/finalize-st-output commits plugin output for an empty completed generation', async () => {
+    const app = createApp()
+    const chat = await createChat('CompatEmptyBot')
+    const run = await createGenerationRun({
+      characterName: 'CompatEmptyBot',
+      chatId: chat.chatId,
+      operation: 'generate',
+    })
+    await completeRun(run.runId, { partialContent: '' })
+
+    const res = await app.request(`/api/runs/${run.runId}/finalize-st-output`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: 'Created entirely by before-end' }),
+    })
+
+    expect(res.status).toBe(200)
+    const body = await res.json() as { runId: string; committedLineIndex: number; line: { mes?: string } }
+    expect(body).toMatchObject({ runId: run.runId, committedLineIndex: 1 })
+    expect(body.line.mes).toBe('Created entirely by before-end')
+    const stored = await getChat('CompatEmptyBot', chat.chatId)
+    expect(stored.lines[1]).toMatchObject({ is_user: false, mes: 'Created entirely by before-end' })
+  })
+
+  it('POST /api/runs/:runId/finalize-st-output replaces only the assistant line committed by that run', async () => {
+    const app = createApp()
+    const chat = await createChat('CompatReplaceBot')
+    await addMessage('CompatReplaceBot', chat.chatId, false, 'Raw provider reply')
+    const run = await createGenerationRun({
+      characterName: 'CompatReplaceBot',
+      chatId: chat.chatId,
+      operation: 'generate',
+    })
+    await completeRun(run.runId, { partialContent: 'Raw provider reply', committedLineIndex: 1 })
+
+    const res = await app.request(`/api/runs/${run.runId}/finalize-st-output`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: 'Plugin-finalized reply' }),
+    })
+
+    expect(res.status).toBe(200)
+    const stored = await getChat('CompatReplaceBot', chat.chatId)
+    expect(stored.lines[1]).toMatchObject({ is_user: false, mes: 'Plugin-finalized reply' })
+  })
+
+  it('POST /api/runs/:runId/finalize-st-output rejects a stale or user-edited target line', async () => {
+    const app = createApp()
+    const chat = await createChat('CompatStaleBot')
+    await addMessage('CompatStaleBot', chat.chatId, false, 'Raw provider reply')
+    const run = await createGenerationRun({
+      characterName: 'CompatStaleBot',
+      chatId: chat.chatId,
+      operation: 'generate',
+    })
+    await completeRun(run.runId, { partialContent: 'Raw provider reply', committedLineIndex: 1 })
+    await editMessage('CompatStaleBot', chat.chatId, 1, 'Edited elsewhere')
+
+    const res = await app.request(`/api/runs/${run.runId}/finalize-st-output`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: 'Must not overwrite newer text' }),
+    })
+
+    expect(res.status).toBe(409)
+    const stored = await getChat('CompatStaleBot', chat.chatId)
+    expect(stored.lines[1]).toMatchObject({ mes: 'Edited elsewhere' })
+  })
+
+  it('POST /api/runs/:runId/finalize-st-output replaces only the generated suffix for continue runs', async () => {
+    const app = createApp()
+    const chat = await createChat('CompatContinueBot')
+    await addMessage('CompatContinueBot', chat.chatId, false, 'Existing raw suffix')
+    const run = await createGenerationRun({
+      characterName: 'CompatContinueBot',
+      chatId: chat.chatId,
+      operation: 'continue',
+    })
+    await completeRun(run.runId, { partialContent: ' raw suffix', committedLineIndex: 1 })
+
+    const res = await app.request(`/api/runs/${run.runId}/finalize-st-output`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: ' templated suffix' }),
+    })
+
+    expect(res.status).toBe(200)
+    const stored = await getChat('CompatContinueBot', chat.chatId)
+    expect(stored.lines[1]).toMatchObject({ mes: 'Existing templated suffix' })
+
+    const duplicate = await app.request(`/api/runs/${run.runId}/finalize-st-output`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: ' second mutation' }),
+    })
+    expect(duplicate.status).toBe(409)
+    expect((await getChat('CompatContinueBot', chat.chatId)).lines[1]).toMatchObject({
+      mes: 'Existing templated suffix',
+    })
+  })
+
   it('POST /api/runs/:runId/commit is idempotent under duplicate recovery requests', async () => {
     const app = createApp()
     const chat = await createChat('RaceBot')
@@ -1213,7 +1315,15 @@ describe('API Routes', () => {
         is_system: false,
         send_date: '2026-06-22T00:00:00.000Z',
         mes: 'Imported hello',
-        extra: { files: [{ name: 'note.txt' }] },
+        extra: {
+          files: [{ name: 'note.txt' }],
+          media: [{ type: 'image', url: '/user/files/scene.png' }],
+          quick_replies: [{ label: 'Inspect', message: '/inspect' }],
+          reasoning: { text: 'chain hidden from normal rendering' },
+          logprobs: { tokens: ['Imported', ' hello'] },
+        },
+        variables: [{ mood: 'curious' }],
+        variables_initialized: [true],
       }),
     ].join('\n')
     const multipart = multipartFormBody([
@@ -1233,7 +1343,18 @@ describe('API Routes', () => {
     expect(body).toMatchObject({ chatId: 'session', file_name: 'session.jsonl', success: true })
     const stored = await getChat('ImportChatBot', 'session')
     expect(stored.lines[0]).toMatchObject({ chat_metadata: { chat_name: 'Imported Chat', custom: true } })
-    expect(stored.lines[1]).toMatchObject({ mes: 'Imported hello', extra: { files: [{ name: 'note.txt' }] } })
+    expect(stored.lines[1]).toMatchObject({
+      mes: 'Imported hello',
+      extra: {
+        files: [{ name: 'note.txt' }],
+        media: [{ type: 'image', url: '/user/files/scene.png' }],
+        quick_replies: [{ label: 'Inspect', message: '/inspect' }],
+        reasoning: { text: 'chain hidden from normal rendering' },
+        logprobs: { tokens: ['Imported', ' hello'] },
+      },
+      variables: [{ mood: 'curious' }],
+      variables_initialized: [true],
+    })
   })
 
   multipartIt('POST /api/chats/import adds metadata and avoids overwriting existing chats', async () => {
@@ -1323,6 +1444,35 @@ describe('API Routes', () => {
       user_name: 'User',
       character_name: 'MetaBot',
     })
+  })
+
+  it('PATCH /api/chats/:name/:chatId/messages/:lineIndex allows empty generated commit text', async () => {
+    const app = createApp()
+    const chat = await createChat('MetaBot', 'User')
+    const chatPath = path.join(testDataDir, 'chats', 'MetaBot', `${chat.chatId}.jsonl`)
+    await writeChatFile(chatPath, [
+      { chat_metadata: {}, user_name: 'User', character_name: 'MetaBot' },
+      {
+        name: 'MetaBot',
+        is_user: false,
+        is_system: false,
+        send_date: '2026-07-07T00:00:00.000Z',
+        mes: 'Original generated text',
+        extra: {},
+      },
+    ])
+
+    const res = await app.request(`/api/chats/MetaBot/${chat.chatId}/messages/1`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: '' }),
+    })
+
+    expect(res.status).toBe(200)
+    const body = await res.json() as Json
+    expect(body.mes).toBe('')
+    const stored = await getChat('MetaBot', chat.chatId)
+    expect(stored.lines[1]).toMatchObject({ mes: '' })
   })
 
   it('PATCH /api/chats/:name/:chatId/message-variables persists only ST message variable fields', async () => {
@@ -1929,15 +2079,201 @@ describe('API Routes', () => {
     expect(res.status).toBe(200)
     const body = await res.json() as Json & {
       matchedEntries: Array<Json & { content: string }>
+      worldInfoString: string
       worldInfoBefore: string
       worldInfoAfter: string
       allActivatedEntries: Array<Json & { world: string; uid: number }>
     }
     expect(body.matchedEntries).toHaveLength(1)
     expect(body.matchedEntries[0]?.content).toBe('The dragon remembers the old gate.')
+    expect(body.worldInfoString).toBe('The dragon remembers the old gate.')
     expect(body.worldInfoBefore).toContain('The dragon remembers the old gate.')
     expect(body.worldInfoAfter).toBe('')
     expect(body.allActivatedEntries[0]).toMatchObject({ world: 'GlobalLore', uid: 1 })
+    expect(body.allActivatedEntries[0]).not.toHaveProperty('raw')
+  })
+
+  it('does not treat missing character context as an empty ST tag map for worldinfo checks', async () => {
+    const app = createApp()
+    fs.writeFileSync(
+      path.join(testDataDir, 'worlds', 'TagFilteredGlobalLore.json'),
+      JSON.stringify({
+        name: 'TagFilteredGlobalLore',
+        enabled: true,
+        global_enabled: true,
+        entries: {
+          1: {
+            uid: 1,
+            key: ['dragon'],
+            content: 'Tag-only filters are ignored without a current character tag map.',
+            enabled: true,
+            position: 0,
+            insertion_order: 10,
+            character_filter: { names: [], tags: ['hero'], isExclude: false },
+          },
+        },
+      }),
+      'utf8',
+    )
+
+    const res = await app.request('/api/worldinfo/check', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat: [{ name: 'You', content: 'A dragon waits nearby.' }],
+        maxContext: 4096,
+        isDryRun: true,
+      }),
+    })
+
+    expect(res.status).toBe(200)
+    const body = await res.json() as Json & { matchedEntries: Array<Json & { content: string }> }
+    expect(body.matchedEntries.map(entry => entry.content)).toEqual([
+      'Tag-only filters are ignored without a current character tag map.',
+    ])
+  })
+
+  it('uses ST-compatible character tag ids and names supplied by worldinfo prompt checks', async () => {
+    const app = createApp()
+    fs.writeFileSync(
+      path.join(testDataDir, 'worlds', 'TagAliasGlobalLore.json'),
+      JSON.stringify({
+        name: 'TagAliasGlobalLore',
+        enabled: true,
+        global_enabled: true,
+        entries: {
+          1: {
+            uid: 1,
+            key: ['dragon'],
+            content: 'The display-name tag allows this lore.',
+            enabled: true,
+            position: 0,
+            insertion_order: 10,
+            character_filter: { names: [], tags: ['Hero'], isExclude: false },
+          },
+          2: {
+            uid: 2,
+            key: ['dragon'],
+            content: 'The display-name tag excludes this lore.',
+            enabled: true,
+            position: 0,
+            insertion_order: 20,
+            character_filter: { names: [], tags: ['Hero'], isExclude: true },
+          },
+        },
+      }),
+      'utf8',
+    )
+
+    const res = await app.request('/api/worldinfo/check', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat: [{ name: 'You', content: 'A dragon waits nearby.' }],
+        maxContext: 4096,
+        isDryRun: true,
+        characterTags: ['tag-hero'],
+        characterTagNames: ['Hero'],
+      }),
+    })
+
+    expect(res.status).toBe(200)
+    const body = await res.json() as Json & { matchedEntries: Array<Json & { content: string }> }
+    expect(body.matchedEntries.map(entry => entry.content)).toEqual([
+      'The display-name tag allows this lore.',
+    ])
+  })
+
+  it('keeps entry scan_depth scoped to that entry in ST-compatible worldinfo checks', async () => {
+    const app = createApp()
+    fs.writeFileSync(
+      path.join(testDataDir, 'worlds', 'ScopedDepthLore.json'),
+      JSON.stringify({
+        name: 'ScopedDepthLore',
+        enabled: true,
+        global_enabled: true,
+        scan_depth: 4,
+        entries: {
+          1: {
+            uid: 1,
+            key: ['fifth message'],
+            content: 'Ordinary lore should not see the fifth message.',
+            enabled: true,
+            position: 0,
+            insertion_order: 10,
+          },
+          2: {
+            uid: 2,
+            key: ['fifth message'],
+            content: 'Deep lore sees the fifth message.',
+            enabled: true,
+            position: 0,
+            insertion_order: 20,
+            scan_depth: 8,
+          },
+        },
+      }),
+      'utf8',
+    )
+
+    const res = await app.request('/api/worldinfo/check', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat: [
+          { name: 'You', content: 'first message' },
+          { name: 'Bot', content: 'second message' },
+          { name: 'You', content: 'third message' },
+          { name: 'Bot', content: 'fourth message' },
+          { name: 'You', content: 'fifth message' },
+        ],
+        maxContext: 4096,
+        isDryRun: true,
+      }),
+    })
+
+    expect(res.status).toBe(200)
+    const body = await res.json() as Json & { matchedEntries: Array<Json & { content: string }> }
+    expect(body.matchedEntries.map(entry => entry.content)).toEqual(['Deep lore sees the fifth message.'])
+  })
+
+  it('uses ST-compatible worldinfo prompt context for user macros', async () => {
+    const app = createApp()
+    fs.writeFileSync(
+      path.join(testDataDir, 'worlds', 'MacroLore.json'),
+      JSON.stringify({
+        name: 'MacroLore',
+        enabled: true,
+        global_enabled: true,
+        entries: {
+          1: {
+            uid: 1,
+            key: ['{{user}}'],
+            content: 'The caller-specific user macro resolved.',
+            enabled: true,
+            position: 0,
+            insertion_order: 10,
+          },
+        },
+      }),
+      'utf8',
+    )
+
+    const res = await app.request('/api/worldinfo/check', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat: [{ name: 'Riley', content: 'Riley opens the old journal.' }],
+        userName: 'Riley',
+        model: 'gpt-4o-mini',
+        maxContext: 4096,
+        isDryRun: true,
+      }),
+    })
+
+    expect(res.status).toBe(200)
+    const body = await res.json() as Json & { matchedEntries: Array<Json & { content: string }> }
+    expect(body.matchedEntries.map(entry => entry.content)).toEqual(['The caller-specific user macro resolved.'])
   })
 
   it('serves ST-compatible worldinfo checks for character-bound non-global worldbooks', async () => {
@@ -2069,6 +2405,29 @@ describe('API Routes', () => {
     })
     expect(metadataRes.status).toBe(200)
 
+    const dryRunRes = await app.request('/api/worldinfo/check', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        characterName: 'TimedBot',
+        chatId: createdChat.chatId,
+        chat: [{ name: 'You', content: 'A dragon is nearby.' }],
+        maxContext: 4096,
+        isDryRun: true,
+      }),
+    })
+    expect(dryRunRes.status).toBe(200)
+
+    const afterDryRunRes = await app.request(`/api/chats/TimedBot/${createdChat.chatId}`)
+    expect(afterDryRunRes.status).toBe(200)
+    const afterDryRun = await afterDryRunRes.json() as Json & { lines: Json[] }
+    const afterDryRunMetadata = afterDryRun.lines[0]?.chat_metadata as Json
+    expect(afterDryRunMetadata.worldInfoBuffer).toEqual({
+      externalActivations: [
+        { world: 'TimedLore', uid: 4, source: 'route-test-vector', score: 0.73 },
+      ],
+    })
+
     const res = await app.request('/api/worldinfo/check', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -2107,6 +2466,240 @@ describe('API Routes', () => {
     const sticky = timedWorldInfo.sticky as Record<string, Json>
     expect(sticky['TimedLore.3']).toMatchObject({ start: 1, end: 3 })
     expect(metadata.worldInfoBuffer).toEqual({})
+  })
+
+  it('fails closed when consuming external worldinfo activations cannot be persisted', async () => {
+    const app = createApp()
+    const charDir = path.join(testDataDir, 'characters', 'FailedActivationCleanupBot')
+    fs.mkdirSync(charDir, { recursive: true })
+    fs.writeFileSync(
+      path.join(charDir, 'character.json'),
+      JSON.stringify({
+        name: 'FailedActivationCleanupBot',
+        description: 'Uses one-shot external lore.',
+        extensions: { world: 'FailedActivationCleanupWorld' },
+      }),
+      'utf8',
+    )
+    fs.writeFileSync(
+      path.join(testDataDir, 'worlds', 'FailedActivationCleanupWorld.json'),
+      JSON.stringify({
+        name: 'FailedActivationCleanupWorld',
+        enabled: true,
+        global_enabled: false,
+        entries: {
+          5: {
+            uid: 5,
+            key: ['not-present'],
+            content: 'One-shot external lore.',
+            enabled: true,
+            position: 0,
+            insertion_order: 10,
+            vectorized: true,
+          },
+        },
+      }),
+      'utf8',
+    )
+
+    const createChatRes = await app.request('/api/chats/FailedActivationCleanupBot', { method: 'POST' })
+    expect(createChatRes.status).toBe(201)
+    const createdChat = await createChatRes.json() as Json & { chatId: string }
+    const externalActivations = [{
+      world: 'FailedActivationCleanupWorld',
+      uid: 5,
+      source: 'cleanup-failure-test',
+    }]
+    await chatService.updateChatMetadata('FailedActivationCleanupBot', createdChat.chatId, {
+      worldInfoBuffer: { externalActivations },
+    })
+
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const updateMetadataSpy = vi.spyOn(chatService, 'updateChatMetadata')
+      .mockRejectedValueOnce(new Error('metadata write failed'))
+
+    const res = await app.request('/api/worldinfo/check', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        characterName: 'FailedActivationCleanupBot',
+        chatId: createdChat.chatId,
+        chat: ['plain message'],
+        isDryRun: false,
+      }),
+    })
+
+    expect(res.status).toBe(500)
+    const storedChat = await getChat('FailedActivationCleanupBot', createdChat.chatId)
+    const metadata = (storedChat.lines[0] as { chat_metadata?: Json }).chat_metadata
+    expect(metadata?.worldInfoBuffer).toEqual({ externalActivations })
+
+    updateMetadataSpy.mockResolvedValueOnce(false)
+    const missingMetadataRes = await app.request('/api/worldinfo/check', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        characterName: 'FailedActivationCleanupBot',
+        chatId: createdChat.chatId,
+        chat: ['plain message'],
+        isDryRun: false,
+      }),
+    })
+    expect(missingMetadataRes.status).toBe(500)
+  })
+
+  it('keeps timed-only worldinfo metadata persistence best-effort', async () => {
+    const app = createApp()
+    const charDir = path.join(testDataDir, 'characters', 'TimedPersistenceBot')
+    fs.mkdirSync(charDir, { recursive: true })
+    fs.writeFileSync(
+      path.join(charDir, 'character.json'),
+      JSON.stringify({
+        name: 'TimedPersistenceBot',
+        description: 'Uses sticky lore.',
+        extensions: { world: 'TimedPersistenceWorld' },
+      }),
+      'utf8',
+    )
+    fs.writeFileSync(
+      path.join(testDataDir, 'worlds', 'TimedPersistenceWorld.json'),
+      JSON.stringify({
+        name: 'TimedPersistenceWorld',
+        enabled: true,
+        global_enabled: false,
+        entries: {
+          7: {
+            uid: 7,
+            key: ['dragon'],
+            content: 'Sticky lore remains usable.',
+            enabled: true,
+            position: 0,
+            insertion_order: 10,
+            sticky: 2,
+          },
+        },
+      }),
+      'utf8',
+    )
+
+    const createChatRes = await app.request('/api/chats/TimedPersistenceBot', { method: 'POST' })
+    expect(createChatRes.status).toBe(201)
+    const createdChat = await createChatRes.json() as Json & { chatId: string }
+    const consoleWarn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    vi.spyOn(chatService, 'updateChatMetadata').mockRejectedValueOnce(new Error('timed metadata write failed'))
+
+    const res = await app.request('/api/worldinfo/check', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        characterName: 'TimedPersistenceBot',
+        chatId: createdChat.chatId,
+        chat: ['A dragon appears.'],
+        isDryRun: false,
+      }),
+    })
+
+    expect(res.status).toBe(200)
+    const body = await res.json() as Json & { matchedEntries: Array<Json & { content: string }> }
+    expect(body.matchedEntries.map(entry => entry.content)).toContain('Sticky lore remains usable.')
+    expect(consoleWarn).toHaveBeenCalledOnce()
+  })
+
+  it('normalizes and persists plugin-shaped worldinfo timed metadata during non-dry-run checks', async () => {
+    const app = createApp()
+    const charDir = path.join(testDataDir, 'characters', 'ForeignTimedBot')
+    fs.mkdirSync(charDir, { recursive: true })
+    fs.writeFileSync(
+      path.join(charDir, 'character.json'),
+      JSON.stringify({
+        spec: 'chara_card_v2',
+        spec_version: '2.0',
+        name: 'ForeignTimedBot',
+        description: 'Uses externally written timed lore.',
+        extensions: { world: 'ForeignTimedLore' },
+      }),
+      'utf8',
+    )
+    fs.writeFileSync(
+      path.join(testDataDir, 'worlds', 'ForeignTimedLore.json'),
+      JSON.stringify({
+        name: 'ForeignTimedLore',
+        enabled: true,
+        global_enabled: false,
+        entries: {
+          8: {
+            uid: 8,
+            key: ['not-present'],
+            content: 'The externally stickied lore is active.',
+            enabled: true,
+            position: 0,
+            insertion_order: 10,
+            sticky: 3,
+          },
+        },
+      }),
+      'utf8',
+    )
+
+    const createChatRes = await app.request('/api/chats/ForeignTimedBot', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ userName: 'Tester' }),
+    })
+    expect(createChatRes.status).toBe(201)
+    const createdChat = await createChatRes.json() as Json & { chatId: string }
+
+    const metadataRes = await app.request(`/api/chats/ForeignTimedBot/${createdChat.chatId}/metadata`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_metadata: {
+          timedWorldInfo: {
+            sticky: {
+              'ForeignTimedLore.8': { end: 5, world: 'ForeignTimedLore', uid: 8 },
+            },
+            cooldown: {},
+          },
+        },
+      }),
+    })
+    expect(metadataRes.status).toBe(200)
+
+    const res = await app.request('/api/worldinfo/check', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        characterName: 'ForeignTimedBot',
+        chatId: createdChat.chatId,
+        chat: [{ name: 'You', content: 'Plain follow-up.' }, { name: 'Bot', content: 'No trigger here.' }],
+        maxContext: 4096,
+        isDryRun: false,
+      }),
+    })
+
+    expect(res.status).toBe(200)
+    const body = await res.json() as Json & {
+      matchedEntries: Array<Json & { content: string }>
+      timedEffectsChanged: boolean
+    }
+    expect(body.matchedEntries.map(entry => entry.content)).toEqual(['The externally stickied lore is active.'])
+    expect(body.timedEffectsChanged).toBe(true)
+
+    const storedChatRes = await app.request(`/api/chats/ForeignTimedBot/${createdChat.chatId}`)
+    expect(storedChatRes.status).toBe(200)
+    const storedChat = await storedChatRes.json() as Json & { lines: Json[] }
+    const metadata = storedChat.lines[0]?.chat_metadata as Json
+    const timedWorldInfo = metadata.timedWorldInfo as Json
+    const sticky = timedWorldInfo.sticky as Record<string, Json>
+    expect(sticky['ForeignTimedLore.8']).toMatchObject({
+      hash: expect.any(Number),
+      start: 1,
+      end: 5,
+      protected: false,
+    })
+    expect(sticky['ForeignTimedLore.8']).not.toHaveProperty('world')
+    expect(sticky['ForeignTimedLore.8']).not.toHaveProperty('uid')
   })
 
   it('rejects ST-compatible worldinfo get requests without a name', async () => {

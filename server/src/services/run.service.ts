@@ -30,6 +30,7 @@ export interface GenerationRunRecord {
   partialContent: string
   error?: string
   committedLineIndex?: number
+  stFinalizedAt?: string
 }
 
 export interface CreateGenerationRunInput {
@@ -199,6 +200,17 @@ export async function markRunCommitted(
     status: 'committed',
     finishedAt: new Date().toISOString(),
     committedLineIndex: input.committedLineIndex,
+  })
+}
+
+export async function finalizeStRunOutput(
+  runId: string,
+  input: { partialContent: string; committedLineIndex: number },
+): Promise<GenerationRunRecord | null> {
+  return updateGenerationRun(runId, {
+    partialContent: input.partialContent,
+    committedLineIndex: input.committedLineIndex,
+    stFinalizedAt: new Date().toISOString(),
   })
 }
 

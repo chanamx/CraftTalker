@@ -35,6 +35,7 @@ export interface ExtensionManifest {
   homePage?: string
   auto_update?: boolean
   generate_interceptor?: string
+  hooks?: Record<string, unknown>
   [key: string]: unknown
 }
 
@@ -87,6 +88,7 @@ export interface ExtensionCompatibilityReportItem extends ExtensionDiscovery {
   homePage: string | null
   autoUpdate: boolean
   generateInterceptor: string | null
+  hooks: Record<string, string>
 }
 
 export interface ExtensionCompatibilityReport {
@@ -542,6 +544,7 @@ async function buildExtensionCompatibilityReportItem(
     homePage: typeof manifest?.homePage === 'string' ? manifest.homePage : null,
     autoUpdate: manifest?.auto_update === true,
     generateInterceptor: typeof manifest?.generate_interceptor === 'string' ? manifest.generate_interceptor : null,
+    hooks: getManifestHooks(manifest),
   }
 }
 
@@ -638,6 +641,19 @@ function getStringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === 'string' && entry.trim() !== '') : []
 }
 
+function getManifestHooks(manifest: ExtensionManifest | null): Record<string, string> {
+  const hooks = manifest?.hooks
+  if (!hooks || typeof hooks !== 'object' || Array.isArray(hooks)) return {}
+  return Object.fromEntries(Object.entries(hooks)
+    .filter((entry): entry is [string, string] =>
+      typeof entry[0] === 'string'
+      && entry[0].trim() !== ''
+      && typeof entry[1] === 'string'
+      && entry[1].trim() !== '',
+    )
+    .map(([key, value]) => [key.trim(), value.trim()]))
+}
+
 function getManifestDependencies(manifest: ExtensionManifest | null): string[] {
   return [...new Set([
     ...getStringArray(manifest?.requires),
@@ -718,7 +734,12 @@ function getExtensionRuntimeCapabilities(): ExtensionRuntimeCapability[] {
     {
       id: 'generation-api',
       status: 'partial',
-      note: 'ST host chat-completions status/generate endpoints proxy direct provider calls through CraftTalker provider rules across common OpenAI-compatible, Claude, Gemini, and custom sources; fallback model-list GET endpoints and tokenizer count estimates support plugin configuration UIs without exposing keys; TavernHelper generate/generateRaw can run governed background requests with explicit custom_api/oai_settings, streaming token events, and AbortController cancellation without writing chats, runs, or plugin state.',
+      note: 'ST host chat-completions status/generate endpoints proxy direct provider calls through CraftTalker provider rules across common OpenAI-compatible, Claude, Gemini, and custom sources; fallback model-list GET endpoints and tokenizer count estimates support plugin configuration UIs without exposing keys; TavernHelper generate/generateRaw can run governed background requests with explicit custom_api/oai_settings, streaming token events, and AbortController cancellation without writing chats, runs, or plugin state; manifest generate_interceptor and hooks.activate run as bounded frontend lifecycle callbacks.',
+    },
+    {
+      id: 'trusted-browser-extension-runtime',
+      status: 'partial',
+      note: 'Enabled extension JavaScript runs as user-trusted same-origin browser code and may use DOM access, iframe/srcdoc, workers, dynamic JavaScript, browser storage, and direct browser network requests. It is not a security sandbox and must not receive native API keys, arbitrary filesystem access, TaskJS, or system execution.',
     },
     {
       id: 'image-and-cors-proxy',

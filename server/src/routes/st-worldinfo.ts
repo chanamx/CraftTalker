@@ -29,6 +29,8 @@ stWorldInfoRoute.post('/worldinfo/check', async (c) => {
     dryRun: payload.isDryRun === true || payload.dryRun === true,
     globalScanData: recordValue(payload.globalScanData ?? payload.global_scan_data),
     characterName: stringValue(payload.characterName ?? payload.character_name),
+    characterTags: stringArrayValue(payload.characterTags ?? payload.character_tags ?? payload.characterTagIds ?? payload.character_tag_ids),
+    characterTagNames: stringArrayValue(payload.characterTagNames ?? payload.character_tag_names),
     chatId: stringValue(payload.chatId ?? payload.chat_id),
     model: stringValue(payload.model),
     userName: stringValue(payload.userName ?? payload.user_name),
@@ -95,6 +97,11 @@ function finiteNumber(value: unknown): number | undefined {
 
 function stringValue(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined
+}
+
+function stringArrayValue(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined
+  return value.map(item => String(item ?? '').trim()).filter(Boolean)
 }
 
 function recordValue(value: unknown): Record<string, unknown> | undefined {

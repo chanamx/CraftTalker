@@ -6,6 +6,7 @@ import {
   checkWorldInfo,
   checkWorldInfoSync,
   getSortedWorldInfoEntries,
+  type WorldInfoEntriesLoadedHookInput,
   type WorldInfoScanHookInput,
   type WorldInfoVectorActivationInput,
 } from '../lib/world-info-compat.js'
@@ -92,6 +93,30 @@ describe('world-info compatibility scanning', () => {
     expect(result.matchedEntries.map(entry => entry.content)).toEqual(['constant'])
   })
 
+  it('activates empty-content automation entries without injecting prompt content', () => {
+    const result = scan({
+      '1': makeEntry({
+        uid: 1,
+        key: ['dragon'],
+        content: '',
+        automation_id: 'open-gate',
+      }),
+    }, ['dragon'])
+
+    expect(result.allActivatedEntries).toEqual([
+      expect.objectContaining({
+        world: 'test-world',
+        uid: 1,
+        content: '',
+        automationId: 'open-gate',
+      }),
+    ])
+    expect(result.matchedEntries).toEqual([])
+    expect(result.worldInfoString).toBe('')
+    expect(result.worldInfoDepth).toEqual([])
+    expect(result.outletEntries).toEqual({})
+  })
+
   it('supports ST selective logic variants', () => {
     const base = {
       key: ['magic'],
@@ -125,6 +150,27 @@ describe('world-info compatibility scanning', () => {
     expect(wholeWordHit.matchedEntries).toHaveLength(1)
   })
 
+  it('keeps ST scan segment boundaries so regex keys do not span adjacent chat messages', () => {
+    const result = scan({
+      '1': makeEntry({ uid: 1, key: ['/hello\\s+world/'], content: 'cross-message regex hit' }),
+    }, ['hello', 'world'], { depth: 2 })
+
+    expect(result.matchedEntries).toHaveLength(0)
+  })
+
+  it('does not let one entry scanDepth raise the default depth for other entries', () => {
+    const result = checkWorldInfoSync({
+      sources: [{ name: 'test-world', type: 'character', entries: {
+        '1': makeEntry({ uid: 1, key: ['fifth message'], content: 'ordinary depth hit', insertion_order: 1 }),
+        '2': makeEntry({ uid: 2, key: ['fifth message'], content: 'deep scan depth hit', insertion_order: 2, scan_depth: 8 }),
+      } }],
+      chat: ['first', 'second', 'third', 'fourth', 'fifth message'],
+      settings: { budgetTokens: Number.MAX_SAFE_INTEGER },
+    })
+
+    expect(result.matchedEntries.map(entry => entry.content)).toEqual(['deep scan depth hit'])
+  })
+
   it('recursively scans activated entry content', () => {
     const result = scan({
       '1': makeEntry({ uid: 1, key: ['dragon'], content: 'ancient rune' }),
@@ -150,6 +196,51 @@ describe('world-info compatibility scanning', () => {
     expect(result.matchedEntries.map(entry => entry.content)).toEqual(['Luna sigil', 'macro recursive hit'])
   })
 
+  it('keeps recursive buffer text in ST activation order across multiple recursion loops', () => {
+    const result = scan({
+      '1': makeEntry({ uid: 1, key: ['alpha'], content: 'first lore', insertion_order: 1 }),
+      '2': makeEntry({ uid: 2, key: ['first lore'], content: 'second lore', insertion_order: 2 }),
+      '3': makeEntry({
+        uid: 3,
+        key: ['/first lore[\\s\\S]*second lore/'],
+        content: 'ordered recursive hit',
+        insertion_order: 3,
+        prevent_recursion: true,
+      }),
+    }, ['alpha'], {
+      recursive: true,
+    })
+
+    expect(result.matchedEntries.map(entry => entry.content)).toEqual([
+      'first lore',
+      'second lore',
+      'ordered recursive hit',
+    ])
+    expect(result.scanEvents.map(event => event.currentState)).toEqual(['initial', 'recursion', 'recursion'])
+  })
+
+  it('does not activate later recursive entries from an inclusion group already used by ST', () => {
+    const result = scan({
+      '1': makeEntry({ uid: 1, key: ['alpha'], content: 'beta clue', group: 'guild', insertion_order: 1 }),
+      '2': makeEntry({ uid: 2, key: ['beta clue'], content: 'same group recursive hit', group: 'guild', insertion_order: 2 }),
+    }, ['alpha'], {
+      recursive: true,
+    })
+
+    expect(result.matchedEntries.map(entry => entry.content)).toEqual(['beta clue'])
+  })
+
+  it('uses ST exact group-string checks for previously activated inclusion groups', () => {
+    const result = scan({
+      '1': makeEntry({ uid: 1, key: ['alpha'], content: 'beta clue', group: 'guild, party', insertion_order: 1 }),
+      '2': makeEntry({ uid: 2, key: ['beta clue'], content: 'single group recursive hit', group: 'guild', insertion_order: 2 }),
+    }, ['alpha'], {
+      recursive: true,
+    })
+
+    expect(result.matchedEntries.map(entry => entry.content)).toEqual(['beta clue', 'single group recursive hit'])
+  })
+
   it('runs recursion after min-activation depth expansion when recurse context exists', () => {
     const result = scan({
       '1': makeEntry({ uid: 1, key: ['alpha'], content: 'rune', insertion_order: 1 }),
@@ -169,6 +260,22 @@ describe('world-info compatibility scanning', () => {
     })
 
     expect(result.matchedEntries.map(entry => entry.content)).toEqual(['rune', 'combined recursive hit'])
+  })
+
+  it('keeps ST-style final min-activation scan at the chat depth boundary', () => {
+    const hook = vi.fn()
+    const result = scan({
+      '1': makeEntry({ uid: 1, key: ['alpha'], content: 'first hit', insertion_order: 1 }),
+    }, ['alpha'], {
+      depth: 1,
+      minActivations: 2,
+      scanDoneHooks: [hook],
+    })
+
+    expect(result.matchedEntries.map(entry => entry.content)).toEqual(['first hit'])
+    expect(hook).toHaveBeenCalledTimes(2)
+    expect(result.scanEvents.map(event => event.currentState)).toEqual(['initial', 'min_activations'])
+    expect(result.scanEvents.map(event => event.nextState)).toEqual(['min_activations', null])
   })
 
   it('treats max recursion steps and min activations as ST-mutually-exclusive settings', () => {
@@ -278,6 +385,14 @@ describe('world-info compatibility scanning', () => {
     expect(result.matchedEntries.map(entry => entry.content)).toEqual(['forced'])
   })
 
+  it('matches ST decorator precedence when activate and dont-activate are both present', () => {
+    const result = scan({
+      '1': makeEntry({ uid: 1, key: ['missing'], content: '@@activate\n@@dont_activate\nforced anyway' }),
+    }, ['plain chat'])
+
+    expect(result.matchedEntries.map(entry => entry.content)).toEqual(['forced anyway'])
+  })
+
   it('supports ST external force activations for vectorized entries', () => {
     const entries = {
       '0': makeEntry({ uid: 0, key: ['missing'], content: 'vector lore', vectorized: true }),
@@ -285,13 +400,22 @@ describe('world-info compatibility scanning', () => {
 
     const unforced = scan(entries, ['plain chat'])
     expect(unforced.matchedEntries).toHaveLength(0)
-    expect(unforced.vectorizedSkipped.map(event => event.entryId)).toEqual(['test-world.0'])
+    expect(unforced.vectorizedSkipped).toHaveLength(0)
 
     const forced = scan(entries, ['plain chat'], {
       forceActivations: [{ world: 'test-world', uid: 0 }],
     })
     expect(forced.matchedEntries.map(entry => entry.content)).toEqual(['vector lore'])
     expect(forced.vectorizedSkipped).toHaveLength(0)
+  })
+
+  it('keeps ST keyword scanning active for vectorized entries without a vector hit', () => {
+    const result = scan({
+      '1': makeEntry({ uid: 1, key: ['dragon'], content: 'keyword vector lore', vectorized: true }),
+    }, ['a dragon appears'])
+
+    expect(result.matchedEntries.map(entry => entry.content)).toEqual(['keyword vector lore'])
+    expect(result.vectorizedSkipped).toHaveLength(0)
   })
 
   it('activates vectorized entries from static vector activations', () => {
@@ -348,6 +472,36 @@ describe('world-info compatibility scanning', () => {
     ])
   })
 
+  it('reports the vector activation metadata that supplied the final entry override', async () => {
+    const result = await scanAsync({
+      '4': makeEntry({ uid: 4, key: ['missing'], content: 'stored vector lore', vectorized: true }),
+    }, ['plain chat'], {
+      vectorActivations: [{
+        world: 'test-world',
+        uid: 4,
+        content: 'metadata vector lore',
+        source: 'chat-metadata',
+        score: 0.4,
+      }],
+      vectorActivator: async () => [{
+        world: 'test-world',
+        uid: 4,
+        content: 'runtime vector lore',
+        source: 'runtime-vector-store',
+        score: 0.93,
+      }],
+    })
+
+    expect(result.matchedEntries.map(entry => entry.content)).toEqual(['runtime vector lore'])
+    expect(result.vectorizedActivated).toEqual([
+      expect.objectContaining({
+        entryId: 'test-world.4',
+        source: 'runtime-vector-store',
+        score: 0.93,
+      }),
+    ])
+  })
+
   it('requires synchronous vector activators in checkWorldInfoSync', () => {
     expect(() => scan({
       '3': makeEntry({ uid: 3, key: ['missing'], content: 'vector lore', vectorized: true }),
@@ -394,6 +548,56 @@ describe('world-info compatibility scanning', () => {
       characterTags: [],
     })
     expect(continued.matchedEntries.map(entry => entry.content)).toEqual(['triggered', 'character matched', 'tag excluded'])
+  })
+
+  it('requires ST character filter names and tags to pass as separate include checks', () => {
+    const entries = {
+      '1': makeEntry({
+        uid: 1,
+        key: ['dragon'],
+        content: 'name and tag matched',
+        characterFilter: { names: ['Alice'], tags: ['hero'], isExclude: false },
+      }),
+    }
+
+    expect(scan(entries, ['dragon'], {
+      characterName: 'Alice',
+      characterTags: ['villain'],
+    }).matchedEntries).toHaveLength(0)
+
+    expect(scan(entries, ['dragon'], {
+      characterName: 'Bob',
+      characterTags: ['hero'],
+    }).matchedEntries).toHaveLength(0)
+
+    expect(scan(entries, ['dragon'], {
+      characterName: 'Alice',
+      characterTags: ['hero'],
+    }).matchedEntries.map(entry => entry.content)).toEqual(['name and tag matched'])
+  })
+
+  it('matches character filter tags against resolved tag ids and display names', () => {
+    const entries = {
+      '1': makeEntry({
+        uid: 1,
+        key: ['dragon'],
+        content: 'tag display name matched',
+        characterFilter: { names: [], tags: ['Hero'], isExclude: false },
+      }),
+      '2': makeEntry({
+        uid: 2,
+        key: ['dragon'],
+        content: 'tag display name excluded',
+        characterFilter: { names: [], tags: ['Hero'], isExclude: true },
+      }),
+    }
+
+    const result = scan(entries, ['dragon'], {
+      characterTags: ['tag-hero'],
+      characterTagNames: ['Hero'],
+    } as any)
+
+    expect(result.matchedEntries.map(entry => entry.content)).toEqual(['tag display name matched'])
   })
 
   it('honors token budget unless an entry ignores budget', () => {
@@ -474,20 +678,19 @@ describe('world-info compatibility scanning', () => {
     expect(result.matchedEntries.map(entry => entry.content)).toEqual(['one two'])
   })
 
-  it('skips vectorized entries without a vector runtime and reports scan events', () => {
+  it('uses keyword-matched vectorized content in recursive scans without a vector runtime', () => {
     const result = scan({
       '1': makeEntry({ uid: 1, key: ['dragon'], content: 'normal lore', insertion_order: 1 }),
-      '2': makeEntry({ uid: 2, key: ['dragon'], content: 'vector lore', insertion_order: 2, extensions: { vectorized: true } }),
+      '2': makeEntry({ uid: 2, key: ['dragon'], content: 'vector clue', insertion_order: 2, extensions: { vectorized: true } }),
+      '3': makeEntry({ uid: 3, key: ['vector clue'], content: 'recursive vector lore', insertion_order: 3 }),
     }, ['dragon'], { recursive: true, maxRecursionSteps: 3 })
 
-    expect(result.matchedEntries.map(entry => entry.content)).toEqual(['normal lore'])
-    expect(result.vectorizedSkipped).toHaveLength(1)
-    expect(result.vectorizedSkipped[0]).toMatchObject({
-      entryId: 'test-world.2',
-      world: 'test-world',
-      uid: 2,
-      type: 'vectorized_skipped',
-    })
+    expect(result.matchedEntries.map(entry => entry.content)).toEqual([
+      'normal lore',
+      'vector clue',
+      'recursive vector lore',
+    ])
+    expect(result.vectorizedSkipped).toHaveLength(0)
   })
 
   it('lets scan-done hooks inspect and patch the next scan state', async () => {
@@ -576,6 +779,92 @@ describe('world-info compatibility scanning', () => {
       sortedUids: [1, 2],
       firstSuccessfulStickyActive: false,
     })
+    expect(result.scanEvents[0]).toMatchObject({
+      type: 'scan_done',
+      newAllEntries: [expect.objectContaining({ uid: 1, content: 'first rune' })],
+      newSuccessfulEntries: [expect.objectContaining({ uid: 1, content: 'first rune' })],
+    })
+    expect(result.scanEvents[0]?.newAllEntries?.[0]).not.toHaveProperty('raw')
+    expect(result.sortedEntries.map(entry => entry.uid)).toEqual([1, 2])
+    expect(result.sortedEntries[0]).not.toHaveProperty('raw')
+    expect(result.sourceEntries.characterLore.map(entry => entry.uid)).toEqual([1, 2])
+    expect(result.sourceEntries.characterLore[0]).not.toHaveProperty('raw')
+    expect(result.allActivatedEntries[0]).not.toHaveProperty('raw')
+  })
+
+  it('returns ST-shaped source entry groups for entries-loaded event mirrors', () => {
+    const result = checkWorldInfoSync({
+      sources: [
+        { name: 'global-world', type: 'global', entries: { '1': makeEntry({ uid: 1, key: ['g'], content: 'global lore' }) } },
+        { name: 'character-world', type: 'character', entries: { '2': makeEntry({ uid: 2, key: ['c'], content: 'character lore' }) } },
+        { name: 'chat-world', type: 'chat', entries: { '3': makeEntry({ uid: 3, key: ['ch'], content: 'chat lore' }) } },
+        { name: 'persona-world', type: 'persona', entries: { '4': makeEntry({ uid: 4, key: ['p'], content: 'persona lore' }) } },
+      ],
+      chat: ['plain'],
+      settings: { depth: 4, budgetTokens: Number.MAX_SAFE_INTEGER },
+    })
+
+    expect(result.sourceEntries.globalLore.map(entry => `${entry.world}.${entry.uid}`)).toEqual(['global-world.1'])
+    expect(result.sourceEntries.characterLore.map(entry => `${entry.world}.${entry.uid}`)).toEqual(['character-world.2'])
+    expect(result.sourceEntries.chatLore.map(entry => `${entry.world}.${entry.uid}`)).toEqual(['chat-world.3'])
+    expect(result.sourceEntries.personaLore.map(entry => `${entry.world}.${entry.uid}`)).toEqual(['persona-world.4'])
+    expect(result.sourceEntries.globalLore[0]).not.toHaveProperty('raw')
+  })
+
+  it('lets trusted entries-loaded hooks adjust source groups before sorting and scanning', () => {
+    const hook = vi.fn((input: WorldInfoEntriesLoadedHookInput) => {
+      expect(input.globalLore.map(entry => entry.content)).toEqual(['global lore'])
+      expect(input.characterLore.map(entry => entry.content)).toEqual(['blocked character lore', 'kept character lore'])
+      expect(input.trigger).toBe('normal')
+
+      input.globalLore[0].content = 'mutated global lore'
+      input.characterLore.splice(0, 1)
+      return {
+        personaLore: [
+          {
+            ...input.characterLore[0],
+            sourceType: 'persona' as const,
+            world: 'hook-persona',
+            uid: 99,
+            key: ['dragon'],
+            content: 'hook-added persona lore',
+          },
+        ],
+      }
+    })
+
+    const result = checkWorldInfoSync({
+      sources: [
+        { name: 'global-world', type: 'global', entries: { '1': makeEntry({ uid: 1, key: ['dragon'], content: 'global lore', order: 30 }) } },
+        { name: 'character-world', type: 'character', entries: {
+          '2': makeEntry({ uid: 2, key: ['dragon'], content: 'blocked character lore', order: 20 }),
+          '3': makeEntry({ uid: 3, key: ['dragon'], content: 'kept character lore', order: 10 }),
+        } },
+      ],
+      chat: ['dragon'],
+      settings: {
+        depth: 4,
+        budgetTokens: Number.MAX_SAFE_INTEGER,
+        entriesLoadedHooks: [hook],
+      },
+    })
+
+    expect(hook).toHaveBeenCalledTimes(1)
+    expect(result.sortedEntries.map(entry => entry.content)).toEqual([
+      'hook-added persona lore',
+      'kept character lore',
+      'mutated global lore',
+    ])
+    expect(result.matchedEntries.map(entry => entry.content)).toEqual(expect.arrayContaining([
+      'hook-added persona lore',
+      'kept character lore',
+      'mutated global lore',
+    ]))
+    expect(result.matchedEntries.map(entry => entry.content)).not.toContain('blocked character lore')
+    expect(result.sourceEntries.globalLore.map(entry => entry.content)).toEqual(['mutated global lore'])
+    expect(result.sourceEntries.characterLore.map(entry => entry.content)).toEqual(['kept character lore'])
+    expect(result.sourceEntries.personaLore.map(entry => entry.content)).toEqual(['hook-added persona lore'])
+    expect(result.sourceEntries.personaLore[0]).not.toHaveProperty('raw')
   })
 
   it('lets ST-shaped scan-done hooks mutate state, budget, recursion text, and timed effects', () => {
@@ -617,6 +906,74 @@ describe('world-info compatibility scanning', () => {
     expect(Object.keys(result.timedEffects.sticky)).toEqual(['test-world.1'])
   })
 
+  it('applies scan-done activated entry patches before later hooks observe the same scan', () => {
+    const replacementEntry = {
+      ...getSortedWorldInfoEntries([{ name: 'test-world', type: 'character', entries: {
+        '99': makeEntry({ uid: 99, content: 'hook replacement lore' }),
+      } }])[0],
+      content: 'hook replacement lore',
+    }
+    const replacementEntries = new Map([[`test-world.${replacementEntry.uid}`, replacementEntry]])
+    const observedKeys: string[][] = []
+    const firstHook = vi.fn(() => ({
+      activated: {
+        entries: replacementEntries,
+        text: 'hook replacement lore',
+      },
+    }))
+    const secondHook = vi.fn((input: WorldInfoScanHookInput) => {
+      observedKeys.push([...input.activated.entries.keys()])
+      expect(input.activatedEntries.map(entry => entry.content)).toEqual(['hook replacement lore'])
+    })
+
+    const result = scan({
+      '1': makeEntry({ uid: 1, key: ['dragon'], content: 'original lore' }),
+    }, ['dragon'], {
+      scanDoneHooks: [firstHook, secondHook],
+    })
+
+    expect(firstHook).toHaveBeenCalledTimes(1)
+    expect(secondHook).toHaveBeenCalledTimes(1)
+    expect(observedKeys).toEqual([['test-world.99']])
+    expect(result.matchedEntries.map(entry => entry.content)).toEqual(['hook replacement lore'])
+  })
+
+  it('reports probability-passed entries as scan-done successful even when budget blocks insertion', () => {
+    const snapshots: Array<{
+      successful: string[]
+      activated: string[]
+    }> = []
+    const hook = vi.fn((input: WorldInfoScanHookInput) => {
+      snapshots.push({
+        successful: input.new.successful.map(entry => entry.content),
+        activated: [...input.activated.entries.values()].map(entry => entry.content),
+      })
+    })
+
+    const result = scan({
+      '1': makeEntry({ uid: 1, key: ['dragon'], content: 'one two', order: 20, insertion_order: 1 }),
+      '2': makeEntry({ uid: 2, key: ['dragon'], content: 'three four', order: 10, insertion_order: 2 }),
+    }, ['dragon'], {
+      budgetTokens: 3,
+      tokenCounter: (text: string) => text.trim().split(/\s+/).filter(Boolean).length,
+      scanDoneHooks: [hook],
+    })
+
+    expect(result.overflowed).toBe(true)
+    expect(result.matchedEntries.map(entry => entry.content)).toEqual(['one two'])
+    expect(snapshots).toEqual([{
+      successful: ['one two', 'three four'],
+      activated: ['one two'],
+    }])
+    expect(result.scanEvents[0]).toMatchObject({
+      type: 'scan_done',
+      newSuccessfulEntries: [
+        expect.objectContaining({ uid: 1, content: 'one two' }),
+        expect.objectContaining({ uid: 2, content: 'three four' }),
+      ],
+    })
+  })
+
   it('keeps scan-done timed-effect hook writes dry-run compatible', () => {
     const hook = vi.fn((input: WorldInfoScanHookInput) => {
       const entry = input.new.successful[0]
@@ -637,6 +994,13 @@ describe('world-info compatibility scanning', () => {
     expect(result.matchedEntries.map(entry => entry.content)).toEqual(['dry-run hook lore'])
     expect(result.timedEffectsChanged).toBe(false)
     expect(result.timedEffects).toEqual({ sticky: {}, cooldown: {} })
+    expect(result.scanEvents[0]).toMatchObject({
+      timedEffectActiveEntryIds: {
+        sticky: [],
+        cooldown: [],
+        delay: ['test-world.1'],
+      },
+    })
   })
 
   it('keeps one entry per inclusion group using override, scoring, or weight', () => {
@@ -647,8 +1011,8 @@ describe('world-info compatibility scanning', () => {
     expect(overrideResult.matchedEntries.map(entry => entry.content)).toEqual(['override'])
 
     const scoredResult = scan({
-      '1': makeEntry({ uid: 1, key: ['a'], content: 'lower score', group: 'score', groupWeight: 1 }),
-      '2': makeEntry({ uid: 2, key: ['a', 'b'], content: 'higher score', group: 'score', groupWeight: 1 }),
+      '1': makeEntry({ uid: 1, key: ['a'], content: 'lower score', group: 'score', groupWeight: 1, useGroupScoring: null }),
+      '2': makeEntry({ uid: 2, key: ['a', 'b'], content: 'higher score', group: 'score', groupWeight: 1, useGroupScoring: null }),
     }, ['a b'], { useGroupScoring: true })
     expect(scoredResult.matchedEntries.map(entry => entry.content)).toEqual(['higher score'])
 
@@ -658,6 +1022,82 @@ describe('world-info compatibility scanning', () => {
       '2': makeEntry({ uid: 2, key: ['a'], content: 'high weight', group: 'weight', groupWeight: 9 }),
     }, ['a'])
     expect(weightedResult.matchedEntries.map(entry => entry.content)).toEqual(['high weight'])
+  })
+
+  it('keeps tied ST group-scoring entries eligible for weighted winner selection', () => {
+    vi.spyOn(Math, 'random').mockReturnValue(0.9)
+
+    const result = scan({
+      '1': makeEntry({ uid: 1, key: ['a'], content: 'low weight tied score', group: 'score', groupWeight: 1, useGroupScoring: null }),
+      '2': makeEntry({ uid: 2, key: ['a'], content: 'high weight tied score', group: 'score', groupWeight: 9, useGroupScoring: null }),
+    }, ['a'], { useGroupScoring: true })
+
+    expect(result.matchedEntries.map(entry => entry.content)).toEqual(['high weight tied score'])
+  })
+
+  it('keeps zero-weight inclusion-group entries out of positive ST rolls', () => {
+    vi.spyOn(Math, 'random').mockReturnValue(0.001)
+
+    const result = scan({
+      '1': makeEntry({ uid: 1, key: ['a'], content: 'zero weight', group: 'weight', groupWeight: 0 }),
+      '2': makeEntry({ uid: 2, key: ['a'], content: 'positive weight', group: 'weight', groupWeight: 100 }),
+    }, ['a'])
+
+    expect(result.matchedEntries.map(entry => entry.content)).toEqual(['positive weight'])
+  })
+
+  it('does not remove unscored entries during ST group scoring', () => {
+    vi.spyOn(Math, 'random').mockReturnValue(0.01)
+
+    const result = scan({
+      '1': makeEntry({
+        uid: 1,
+        key: ['a'],
+        content: 'unscored low score high weight',
+        group: 'score',
+        groupWeight: 100,
+        useGroupScoring: false,
+      }),
+      '2': makeEntry({
+        uid: 2,
+        key: ['a', 'b'],
+        content: 'scored high score low weight',
+        group: 'score',
+        groupWeight: 1,
+        useGroupScoring: true,
+      }),
+    }, ['a b'], { useGroupScoring: true })
+
+    expect(result.matchedEntries.map(entry => entry.content)).toEqual(['unscored low score high weight'])
+  })
+
+  it('keeps all active sticky entries in the same inclusion group like ST', () => {
+    const result = scan({
+      '1': makeEntry({ uid: 1, key: ['missing'], content: 'first sticky', group: 'sticky', sticky: 4, insertion_order: 1 }),
+      '2': makeEntry({ uid: 2, key: ['missing'], content: 'second sticky', group: 'sticky', sticky: 4, insertion_order: 2 }),
+    }, ['plain', 'second'], {
+      timedEffects: {
+        sticky: {
+          'test-world.1': { end: 5, world: 'test-world', uid: 1 },
+          'test-world.2': { end: 5, world: 'test-world', uid: 2 },
+        },
+        cooldown: {},
+      },
+    })
+
+    expect(result.matchedEntries.map(entry => entry.content)).toEqual(['first sticky', 'second sticky'])
+  })
+
+  it('treats non-slash use_regexp keys as plaintext in ST-compatible scans', () => {
+    const regexLike = scan({
+      '1': makeEntry({ uid: 1, key: ['drag(on|ons)'], content: 'regex-like hit', use_regexp: true }),
+    }, ['dragons fly'])
+    expect(regexLike.matchedEntries).toHaveLength(0)
+
+    const literal = scan({
+      '1': makeEntry({ uid: 1, key: ['drag(on|ons)'], content: 'literal hit', use_regexp: true }),
+    }, ['drag(on|ons)'])
+    expect(literal.matchedEntries.map(entry => entry.content)).toEqual(['literal hit'])
   })
 
   it('suppresses delayed entries until the chat is long enough', () => {
@@ -775,6 +1215,67 @@ describe('world-info compatibility scanning', () => {
         cooldown: {
           primitive: 'bad-value',
         },
+      },
+    })
+
+    expect(result.timedEffectsChanged).toBe(true)
+    expect(result.timedEffects).toEqual({ sticky: {}, cooldown: {} })
+  })
+
+  it('normalizes plugin-shaped sticky timedWorldInfo records by world and uid', () => {
+    vi.spyOn(Math, 'random').mockReturnValue(0.99)
+    const result = scan({
+      '1': makeEntry({ uid: 1, key: ['dragon'], content: 'foreign sticky lore', sticky: 3, probability: 1 }),
+    }, ['plain', 'second'], {
+      timedEffects: {
+        sticky: {
+          'test-world.1': { end: 5, world: 'test-world', uid: 1 },
+        },
+        cooldown: {},
+      },
+    })
+
+    expect(result.matchedEntries.map(entry => entry.content)).toEqual(['foreign sticky lore'])
+    expect(result.timedEffectsChanged).toBe(true)
+    expect(result.timedEffects.sticky['test-world.1']).toMatchObject({
+      hash: expect.any(Number),
+      start: 1,
+      end: 5,
+      protected: false,
+    })
+    expect(result.timedEffects.sticky['test-world.1']).not.toHaveProperty('world')
+    expect(result.timedEffects.sticky['test-world.1']).not.toHaveProperty('uid')
+  })
+
+  it('normalizes plugin-shaped cooldown timedWorldInfo records before filtering entries', () => {
+    const result = scan({
+      '1': makeEntry({ uid: 1, key: ['dragon'], content: 'foreign cooldown lore', cooldown: 3 }),
+    }, ['dragon', 'second'], {
+      timedEffects: {
+        sticky: {},
+        cooldown: {
+          'test-world.1': { end: 5, world: 'test-world', uid: '1' },
+        },
+      },
+    })
+
+    expect(result.matchedEntries).toHaveLength(0)
+    expect(result.timedEffectsChanged).toBe(true)
+    expect(result.timedEffects.cooldown['test-world.1']).toMatchObject({
+      hash: expect.any(Number),
+      start: 1,
+      end: 5,
+      protected: false,
+    })
+  })
+
+  it('cleans plugin-shaped timedWorldInfo records when the referenced entry is missing', () => {
+    const result = scan({}, ['plain'], {
+      timedEffects: {
+        sticky: {
+          'test-world.404': { end: 4, world: 'test-world', uid: 404 },
+        },
+        cooldown: {},
       },
     })
 

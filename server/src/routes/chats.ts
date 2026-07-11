@@ -4,13 +4,22 @@ import { z } from 'zod'
 import * as chatService from '../services/chat.service.js'
 import * as presetService from '../services/preset.service.js'
 import { llmConfigSchema } from '../lib/llm-config.js'
-import { handleGenerate } from './chat-generation.js'
+import { handleGenerate, type StCompatChatOverrideLine, type StCompatExtensionPrompt, type StCompatPromptMessage } from './chat-generation.js'
 import type { GenerationOperation } from '../lib/generation-locks.js'
 import { loadWorldEntriesForGeneration } from '../services/world-info-runtime.service.js'
 import { createError, ErrorCode } from '../lib/errors.js'
 
 const chatsRoute = new Hono()
 const MAX_IMPORTED_CHAT_BYTES = 20 * 1024 * 1024
+const MAX_ST_COMPAT_CHAT_OVERRIDE_LINES = 5000
+const MAX_ST_COMPAT_CHAT_OVERRIDE_MESSAGE_CHARS = 200000
+const MAX_ST_COMPAT_CHAT_OVERRIDE_TOTAL_CHARS = 2000000
+const MAX_ST_COMPAT_EXTENSION_PROMPTS = 200
+const MAX_ST_COMPAT_EXTENSION_PROMPT_CHARS = 200000
+const MAX_ST_COMPAT_EXTENSION_PROMPT_TOTAL_CHARS = 500000
+const MAX_ST_COMPAT_PROMPT_MESSAGES = 5000
+const MAX_ST_COMPAT_PROMPT_MESSAGE_CHARS = 200000
+const MAX_ST_COMPAT_PROMPT_MESSAGE_TOTAL_CHARS = 2000000
 
 type UploadedFormFile = {
   name?: string
@@ -165,47 +174,131 @@ const generateSchema = z.object({
     contextLength: z.number().int().min(1).max(2000000).optional(),
     maxReplyLength: z.number().int().min(1).max(2000000).optional(),
   }).optional(),
+  stCompatChatOverride: z.array(z.object({
+    name: z.string().max(200).optional(),
+    is_user: z.boolean().optional(),
+    is_system: z.boolean().optional(),
+    mes: z.string().max(MAX_ST_COMPAT_CHAT_OVERRIDE_MESSAGE_CHARS),
+  }).strict())
+    .max(MAX_ST_COMPAT_CHAT_OVERRIDE_LINES)
+    .superRefine((lines, ctx) => {
+      const totalChars = lines.reduce((sum, line) => sum + line.mes.length, 0)
+      if (totalChars > MAX_ST_COMPAT_CHAT_OVERRIDE_TOTAL_CHARS) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `ST-compatible chat override exceeds ${MAX_ST_COMPAT_CHAT_OVERRIDE_TOTAL_CHARS} characters`,
+        })
+      }
+    })
+    .optional(),
+  stCompatExtensionPrompts: z.array(z.object({
+    key: z.string().min(1).max(200),
+    value: z.string().max(MAX_ST_COMPAT_EXTENSION_PROMPT_CHARS),
+    position: z.number().int().min(0).max(3).optional(),
+    depth: z.number().int().min(0).max(1000).optional(),
+    scan: z.boolean().optional(),
+    role: z.number().int().min(0).max(2).optional(),
+  }).strict())
+    .max(MAX_ST_COMPAT_EXTENSION_PROMPTS)
+    .superRefine((prompts, ctx) => {
+      const totalChars = prompts.reduce((sum, prompt) => sum + prompt.value.length, 0)
+      if (totalChars > MAX_ST_COMPAT_EXTENSION_PROMPT_TOTAL_CHARS) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `ST-compatible extension prompts exceed ${MAX_ST_COMPAT_EXTENSION_PROMPT_TOTAL_CHARS} characters`,
+        })
+      }
+    })
+    .optional(),
+  stCompatPromptMessages: z.array(z.object({
+    role: z.enum(['system', 'user', 'assistant']),
+    content: z.string().max(MAX_ST_COMPAT_PROMPT_MESSAGE_CHARS),
+  }).strict())
+    .max(MAX_ST_COMPAT_PROMPT_MESSAGES)
+    .superRefine((messages, ctx) => {
+      const totalChars = messages.reduce((sum, message) => sum + message.content.length, 0)
+      if (totalChars > MAX_ST_COMPAT_PROMPT_MESSAGE_TOTAL_CHARS) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `ST-compatible prompt messages exceed ${MAX_ST_COMPAT_PROMPT_MESSAGE_TOTAL_CHARS} characters`,
+        })
+      }
+    })
+    .optional(),
 })
 
 chatsRoute.post('/:characterName/:chatId/generate', zValidator('json', generateSchema), async (c) => {
   const characterName = decodeURIComponent(c.req.param('characterName'))
   const chatId = c.req.param('chatId')
-  const { config, presetType, presetName, genOverrides } = c.req.valid('json')
-  return generateChatResponse(c, characterName, chatId, config, presetType, presetName, false, genOverrides, false, 'generate')
-})
-
-chatsRoute.post('/:characterName/:chatId/stream', zValidator('json', generateSchema), async (c) => {
-  const characterName = decodeURIComponent(c.req.param('characterName'))
-  const chatId = c.req.param('chatId')
-  const { config, presetType, presetName, genOverrides } = c.req.valid('json')
-  return generateChatResponse(c, characterName, chatId, config, presetType, presetName, true, genOverrides, false, 'generate')
-})
-
-function generateChatResponse(
-  c: Context,
-  characterName: string,
-  chatId: string,
-  config: z.infer<typeof generateSchema>['config'],
-  presetType?: z.infer<typeof generateSchema>['presetType'],
-  presetName?: string,
-  stream: boolean = true,
-  genOverrides?: z.infer<typeof generateSchema>['genOverrides'],
-  isContinue: boolean = false,
-  operation: GenerationOperation = 'generate',
-  beforeGenerate?: () => Promise<void>,
-) {
-  return handleGenerate({
+  const { config, presetType, presetName, genOverrides, stCompatChatOverride, stCompatExtensionPrompts, stCompatPromptMessages } = c.req.valid('json')
+  return generateChatResponse({
     c,
     characterName,
     chatId,
     config,
     presetType,
     presetName,
-    stream,
+    stream: false,
     genOverrides,
-    isContinue,
-    operation,
-    beforeGenerate,
+    operation: 'generate',
+    stCompatChatOverride,
+    stCompatExtensionPrompts,
+    stCompatPromptMessages,
+  })
+})
+
+chatsRoute.post('/:characterName/:chatId/stream', zValidator('json', generateSchema), async (c) => {
+  const characterName = decodeURIComponent(c.req.param('characterName'))
+  const chatId = c.req.param('chatId')
+  const { config, presetType, presetName, genOverrides, stCompatChatOverride, stCompatExtensionPrompts, stCompatPromptMessages } = c.req.valid('json')
+  return generateChatResponse({
+    c,
+    characterName,
+    chatId,
+    config,
+    presetType,
+    presetName,
+    genOverrides,
+    operation: 'generate',
+    stCompatChatOverride,
+    stCompatExtensionPrompts,
+    stCompatPromptMessages,
+  })
+})
+
+type GenerateChatResponseInput = {
+  c: Context,
+  characterName: string
+  chatId: string
+  config: z.infer<typeof generateSchema>['config']
+  presetType?: z.infer<typeof generateSchema>['presetType']
+  presetName?: string
+  stream?: boolean
+  genOverrides?: z.infer<typeof generateSchema>['genOverrides']
+  isContinue?: boolean
+  operation?: GenerationOperation
+  beforeGenerate?: () => Promise<void>
+  stCompatChatOverride?: StCompatChatOverrideLine[]
+  stCompatExtensionPrompts?: StCompatExtensionPrompt[]
+  stCompatPromptMessages?: StCompatPromptMessage[]
+}
+
+function generateChatResponse(input: GenerateChatResponseInput) {
+  return handleGenerate({
+    c: input.c,
+    characterName: input.characterName,
+    chatId: input.chatId,
+    config: input.config,
+    presetType: input.presetType,
+    presetName: input.presetName,
+    stream: input.stream ?? true,
+    genOverrides: input.genOverrides,
+    isContinue: input.isContinue ?? false,
+    operation: input.operation ?? 'generate',
+    beforeGenerate: input.beforeGenerate,
+    stCompatChatOverride: input.stCompatChatOverride,
+    stCompatExtensionPrompts: input.stCompatExtensionPrompts,
+    stCompatPromptMessages: input.stCompatPromptMessages,
     loadWorldEntries: loadWorldEntriesForGeneration,
   })
 }
@@ -227,7 +320,7 @@ chatsRoute.delete('/:characterName/:chatId/messages/:lineIndex', async (c) => {
 })
 
 const editMsgSchema = z.object({
-  content: z.string().min(1),
+  content: z.string(),
 })
 
 chatsRoute.patch('/:characterName/:chatId/messages/:lineIndex', zValidator('json', editMsgSchema), async (c) => {
@@ -243,27 +336,44 @@ chatsRoute.patch('/:characterName/:chatId/messages/:lineIndex', zValidator('json
 chatsRoute.post('/:characterName/:chatId/regenerate', zValidator('json', generateSchema), async (c) => {
   const characterName = decodeURIComponent(c.req.param('characterName'))
   const chatId = c.req.param('chatId')
-  const { config, presetType, presetName, genOverrides } = c.req.valid('json')
-  return generateChatResponse(
+  const { config, presetType, presetName, genOverrides, stCompatChatOverride, stCompatExtensionPrompts, stCompatPromptMessages } = c.req.valid('json')
+  return generateChatResponse({
     c,
     characterName,
     chatId,
     config,
     presetType,
     presetName,
-    true,
+    stream: true,
     genOverrides,
-    false,
-    'regenerate',
-    () => chatService.regenerateLast(characterName, chatId).then(() => undefined),
-  )
+    isContinue: false,
+    operation: 'regenerate',
+    beforeGenerate: () => chatService.regenerateLast(characterName, chatId).then(() => undefined),
+    stCompatChatOverride,
+    stCompatExtensionPrompts,
+    stCompatPromptMessages,
+  })
 })
 
 chatsRoute.post('/:characterName/:chatId/continue', zValidator('json', generateSchema), async (c) => {
   const characterName = decodeURIComponent(c.req.param('characterName'))
   const chatId = c.req.param('chatId')
-  const { config, presetType, presetName, genOverrides } = c.req.valid('json')
-  return generateChatResponse(c, characterName, chatId, config, presetType, presetName, true, genOverrides, true, 'continue')
+  const { config, presetType, presetName, genOverrides, stCompatChatOverride, stCompatExtensionPrompts, stCompatPromptMessages } = c.req.valid('json')
+  return generateChatResponse({
+    c,
+    characterName,
+    chatId,
+    config,
+    presetType,
+    presetName,
+    stream: true,
+    genOverrides,
+    isContinue: true,
+    operation: 'continue',
+    stCompatChatOverride,
+    stCompatExtensionPrompts,
+    stCompatPromptMessages,
+  })
 })
 
 const swipeSchema = z.object({

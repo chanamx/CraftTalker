@@ -107,18 +107,23 @@ function streamRequest(app: ReturnType<typeof createApp>, characterName: string,
   })
 }
 
-function generateRequest(app: ReturnType<typeof createApp>, characterName: string, chatId: string) {
+function generationBody(extra: Record<string, unknown> = {}) {
+  return JSON.stringify({
+    config: {
+      apiUrl: 'http://localhost:1234/v1',
+      apiKey: '',
+      model: 'test-model',
+      type: 'openai',
+    },
+    ...extra,
+  })
+}
+
+function generateRequest(app: ReturnType<typeof createApp>, characterName: string, chatId: string, extra: Record<string, unknown> = {}) {
   return app.request(`/api/chats/${characterName}/${chatId}/generate`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      config: {
-        apiUrl: 'http://localhost:1234/v1',
-        apiKey: '',
-        model: 'test-model',
-        type: 'openai',
-      },
-    }),
+    body: generationBody(extra),
   })
 }
 
@@ -206,6 +211,177 @@ describe('generation locks', () => {
     expect(completed?.committedLineIndex).toBeUndefined()
   })
 
+  it('uses ST-compatible chat overrides only for the current generation request', async () => {
+    const app = createApp()
+    writeCharacter('OverrideBot')
+    const chatId = await createChat(app, 'OverrideBot')
+    await addMessage('OverrideBot', chatId, true, 'Draw this <lwb-artifact>hidden</lwb-artifact> scene')
+
+    const res = await generateRequest(app, 'OverrideBot', chatId, {
+      stCompatChatOverride: [
+        {
+          name: 'User',
+          is_user: true,
+          is_system: false,
+          mes: 'Draw this clean scene',
+        },
+      ],
+    })
+
+    expect(res.status).toBe(200)
+    await res.json()
+
+    expect(lastEngineRequest?.messages).toEqual([
+      { role: 'user', content: 'Draw this clean scene' },
+    ])
+
+    const chat = await getChat('OverrideBot', chatId)
+    const userLine = chat.lines.find(line => line.is_user === true)
+    expect(userLine?.mes).toBe('Draw this <lwb-artifact>hidden</lwb-artifact> scene')
+  })
+
+  it('uses ST-compatible extension prompts only for the current generation request', async () => {
+    const app = createApp()
+    writeCharacter('ExtensionPromptBot')
+    const chatId = await createChat(app, 'ExtensionPromptBot')
+    await addMessage('ExtensionPromptBot', chatId, true, 'What should I remember?')
+
+    const res = await generateRequest(app, 'ExtensionPromptBot', chatId, {
+      stCompatExtensionPrompts: [
+        {
+          key: 'plugin-system-note',
+          value: 'Remember the plugin-provided rule.',
+          position: 0,
+          role: 0,
+        },
+      ],
+    })
+
+    expect(res.status).toBe(200)
+    await res.json()
+
+    expect(lastEngineRequest?.messages).toEqual([
+      { role: 'system', content: 'Remember the plugin-provided rule.' },
+      { role: 'user', content: 'What should I remember?' },
+    ])
+
+    const chat = await getChat('ExtensionPromptBot', chatId)
+    expect(chat.lines.some(line => line.mes === 'Remember the plugin-provided rule.')).toBe(false)
+  })
+
+  it('applies ST-compatible in-chat extension prompts by role and depth', async () => {
+    const app = createApp()
+    writeCharacter('ExtensionDepthBot')
+    const chatId = await createChat(app, 'ExtensionDepthBot')
+    await addMessage('ExtensionDepthBot', chatId, true, 'First')
+    await addMessage('ExtensionDepthBot', chatId, false, 'Second')
+    await addMessage('ExtensionDepthBot', chatId, true, 'Third')
+
+    const res = await generateRequest(app, 'ExtensionDepthBot', chatId, {
+      stCompatExtensionPrompts: [
+        {
+          key: 'plugin-depth-note',
+          value: 'Assistant-side injected note.',
+          position: 1,
+          depth: 1,
+          role: 2,
+        },
+      ],
+    })
+
+    expect(res.status).toBe(200)
+    await res.json()
+
+    expect(lastEngineRequest?.messages).toEqual([
+      { role: 'user', content: 'First' },
+      { role: 'assistant', content: 'Second' },
+      { role: 'assistant', content: 'Assistant-side injected note.' },
+      { role: 'user', content: 'Third' },
+    ])
+  })
+
+  it('uses ST-compatible prompt messages after frontend generation lifecycle hooks only for the current request', async () => {
+    const app = createApp()
+    writeCharacter('PromptHookBot')
+    const chatId = await createChat(app, 'PromptHookBot')
+    await addMessage('PromptHookBot', chatId, true, 'Hello {{macro_like}}')
+
+    const res = await generateRequest(app, 'PromptHookBot', chatId, {
+      stCompatChatOverride: [
+        {
+          name: 'User',
+          is_user: true,
+          is_system: false,
+          mes: 'Hello {{macro_like}}',
+        },
+      ],
+      stCompatExtensionPrompts: [
+        {
+          key: 'plugin-system-note',
+          value: 'This prompt is already inside promptMessages.',
+          position: 0,
+          role: 0,
+        },
+      ],
+      stCompatPromptMessages: [
+        { role: 'system', content: 'This prompt is already inside promptMessages.' },
+        { role: 'user', content: 'Hello after lifecycle hook' },
+      ],
+    })
+
+    expect(res.status).toBe(200)
+    await res.json()
+
+    expect(lastEngineRequest?.messages).toEqual([
+      { role: 'system', content: 'This prompt is already inside promptMessages.' },
+      { role: 'user', content: 'Hello after lifecycle hook' },
+    ])
+
+    const chat = await getChat('PromptHookBot', chatId)
+    const userLine = chat.lines.find(line => line.is_user === true)
+    expect(userLine?.mes).toBe('Hello {{macro_like}}')
+  })
+
+  it('rejects unsafe fields in ST-compatible generation overrides', async () => {
+    const app = createApp()
+    writeCharacter('UnsafeOverrideBot')
+    const chatId = await createChat(app, 'UnsafeOverrideBot')
+
+    const res = await generateRequest(app, 'UnsafeOverrideBot', chatId, {
+      stCompatChatOverride: [
+        {
+          name: 'User',
+          is_user: true,
+          is_system: false,
+          mes: 'hello',
+          domNode: '<button>unsafe</button>',
+        },
+      ],
+    })
+
+    expect(res.status).toBe(400)
+    expect(lastEngineRequest).toBeNull()
+  })
+
+  it('rejects unsafe fields in ST-compatible prompt message overrides', async () => {
+    const app = createApp()
+    writeCharacter('UnsafePromptHookBot')
+    const chatId = await createChat(app, 'UnsafePromptHookBot')
+
+    const res = await generateRequest(app, 'UnsafePromptHookBot', chatId, {
+      stCompatPromptMessages: [
+        {
+          role: 'user',
+          content: 'hello',
+          fetchOptions: { credentials: 'include' },
+        },
+      ],
+    })
+
+    expect(res.status).toBe(400)
+    expect(lastEngineRequest).toBeNull()
+  })
+
   it('marks non-stream generation failures and releases the chat lock', async () => {
     setEngine(new FailingGenerateEngine())
     const app = createApp()
@@ -255,6 +431,21 @@ describe('generation locks', () => {
       partialContent: 'part-1part-2',
       committedLineIndex: 2,
     })
+  })
+
+  it('includes committed line metadata in streamed terminal SSE events', async () => {
+    const app = createApp()
+    writeCharacter('StreamMetaBot')
+    const chatId = await createChat(app, 'StreamMetaBot')
+    await addMessage('StreamMetaBot', chatId, true, 'Prompt')
+
+    const res = await streamRequest(app, 'StreamMetaBot', chatId)
+    expect(res.status).toBe(200)
+    const text = await res.text()
+    const [run] = (await listGenerationRuns()).filter(item => item.characterName === 'StreamMetaBot' && item.chatId === chatId)
+
+    expect(text).toContain(`data: {"done":true,"runId":"${run?.runId}","committedLineIndex":2}`)
+    expect(text.trimEnd()).toContain('data: [DONE]')
   })
 
   it('rejects concurrent generation for the same chat but allows other chats', async () => {
@@ -627,6 +818,58 @@ describe('generation locks', () => {
     await drain(res)
 
     expect(lastEngineRequest?.worldEntries?.map(entry => entry.content)).toEqual(['extension-scanned lore'])
+  })
+
+  it('uses the native generation operation for ST world-info trigger filters', async () => {
+    const app = createApp()
+    writeCharacter('ContinueTriggerBot')
+    const charPath = path.join(testDataDir, 'characters', 'ContinueTriggerBot', 'character.json')
+    fs.writeFileSync(
+      charPath,
+      JSON.stringify({
+        name: 'ContinueTriggerBot',
+        description: 'Test bot',
+        extensions: { world: 'ContinueTriggerWorld' },
+      }),
+      'utf8',
+    )
+    fs.writeFileSync(
+      path.join(testDataDir, 'worlds', 'ContinueTriggerWorld.json'),
+      JSON.stringify({
+        name: 'ContinueTriggerWorld',
+        enabled: true,
+        global_enabled: false,
+        entries: {
+          '1': {
+            uid: 1,
+            key: ['sealed gate'],
+            content: 'continue-only lore',
+            enabled: true,
+            insertion_order: 100,
+            triggers: ['continue'],
+          },
+          '2': {
+            uid: 2,
+            key: ['sealed gate'],
+            content: 'regenerate-only lore',
+            enabled: true,
+            insertion_order: 90,
+            triggers: ['regenerate'],
+          },
+        },
+      }),
+      'utf8',
+    )
+
+    const chatId = await createChat(app, 'ContinueTriggerBot')
+    await addMessage('ContinueTriggerBot', chatId, true, 'The sealed gate remains.', 'Alice')
+    await addMessage('ContinueTriggerBot', chatId, false, 'Existing reply.', 'ContinueTriggerBot')
+
+    const res = await continueRequest(app, 'ContinueTriggerBot', chatId)
+    expect(res.status).toBe(200)
+    await drain(res)
+
+    expect(lastEngineRequest?.worldEntries?.map(entry => entry.content)).toEqual(['continue-only lore'])
   })
 
   it('force activates vectorized world info entries from ST-compatible metadata during generation', async () => {

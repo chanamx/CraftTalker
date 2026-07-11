@@ -3,6 +3,8 @@ import * as characterService from './character.service.js'
 import * as worldService from './world.service.js'
 import { resolveMacros } from '../lib/macros.js'
 import { createTokenCounter } from '../lib/tokenizer.js'
+import { createError, ErrorCode } from '../lib/errors.js'
+import type { GenerationOperation } from '../lib/generation-locks.js'
 import {
   checkWorldInfo,
   WORLD_INFO_INSERTION_STRATEGY,
@@ -26,6 +28,8 @@ export interface CheckWorldInfoPromptInput {
   dryRun?: boolean
   globalScanData?: WorldInfoGlobalScanData
   characterName?: string
+  characterTags?: string[]
+  characterTagNames?: string[]
   chatId?: string
   model?: string
   userName?: string
@@ -38,6 +42,7 @@ export async function loadWorldEntriesForGeneration(
   maxContext: number,
   model?: string,
   userName?: string,
+  operation: GenerationOperation = 'generate',
 ): Promise<MatchedEntry[] | undefined> {
   const scanChatMessages = messages.map(({ name, content }) => ({ name, content })).reverse()
   const result = await scanWorldInfoForContext({
@@ -48,6 +53,7 @@ export async function loadWorldEntriesForGeneration(
     model,
     userName,
     dryRun: false,
+    globalScanData: { trigger: worldInfoTriggerForOperation(operation) },
     persistRuntimeMetadata: true,
   })
   return result.matchedEntries.length > 0 ? result.matchedEntries : undefined
@@ -70,6 +76,8 @@ export async function getWorldInfoPromptForContext(input: CheckWorldInfoPromptIn
     userName: input.userName,
     dryRun: input.dryRun ?? true,
     globalScanData: input.globalScanData,
+    characterTags: input.characterTags,
+    characterTagNames: input.characterTagNames,
     persistRuntimeMetadata: input.dryRun !== true,
   })
 }
@@ -83,10 +91,19 @@ async function scanWorldInfoForContext(input: {
   userName?: string
   dryRun: boolean
   globalScanData?: WorldInfoGlobalScanData
+  characterTags?: string[]
+  characterTagNames?: string[]
   persistRuntimeMetadata: boolean
 }): Promise<WorldInfoPromptResult> {
   const sources = await collectWorldInfoSources(input.character, input.chatRecord)
-  const settings = buildWorldInfoSettings(sources, input.character, input.chatRecord, input.globalScanData)
+  const settings = buildWorldInfoSettings(
+    sources,
+    input.character,
+    input.chatRecord,
+    input.globalScanData,
+    input.characterTags,
+    input.characterTagNames,
+  )
   settings.dryRun = input.dryRun
   settings.tokenCounter = createTokenCounter(input.model)
   settings.macroResolver = text => resolveMacros(text, {
@@ -202,6 +219,8 @@ function buildWorldInfoSettings(
   character: Character | undefined,
   chat: Chat | undefined,
   globalScanData: WorldInfoGlobalScanData | undefined,
+  characterTags: string[] | undefined,
+  characterTagNames: string[] | undefined,
 ): WorldInfoScanSettings {
   let depth = 4
   let recursive = false
@@ -229,11 +248,6 @@ function buildWorldInfoSettings(
         budgetPercent = Math.min(budgetPercent ?? 100, source.tokenBudget)
       } else {
         budgetCap = Math.min(budgetCap ?? Number.MAX_SAFE_INTEGER, source.tokenBudget)
-      }
-    }
-    for (const entry of Object.values(source.entries)) {
-      if (typeof entry.scan_depth === 'number' && entry.scan_depth > depth) {
-        depth = entry.scan_depth
       }
     }
   }
@@ -272,6 +286,7 @@ function buildWorldInfoSettings(
   }
 
   includeNames = booleanValue(metadataSettings?.world_info_include_names) ?? includeNames
+  const cardTags = character && Array.isArray(character.tags) ? character.tags : undefined
 
   return {
     depth,
@@ -286,10 +301,11 @@ function buildWorldInfoSettings(
     matchWholeWords,
     useGroupScoring,
     characterStrategy,
-    trigger: 'normal',
+    trigger: stringValue(globalScanData?.trigger) ?? 'normal',
     includeNames,
     characterName: character?.name,
-    characterTags: character && Array.isArray(character.tags) ? character.tags : [],
+    characterTags: mergeStringArrays(characterTags, cardTags),
+    characterTagNames: mergeStringArrays(characterTagNames, cardTags),
     globalScanData: {
       personaDescription: chat ? getPersonaDescription(chat) : undefined,
       characterDescription: character?.description,
@@ -300,6 +316,19 @@ function buildWorldInfoSettings(
       ...globalScanData,
     },
   }
+}
+
+function worldInfoTriggerForOperation(operation: GenerationOperation): string {
+  return operation === 'generate' ? 'normal' : operation
+}
+
+function mergeStringArrays(...values: Array<string[] | undefined>): string[] | undefined {
+  if (!values.some(Array.isArray)) return undefined
+  const merged = values
+    .flatMap(value => value ?? [])
+    .map(value => String(value).trim())
+    .filter(Boolean)
+  return [...new Set(merged)]
 }
 
 function normalizePromptChat(chat: Array<string | WorldInfoChatMessage>): WorldInfoChatMessage[] {
@@ -421,9 +450,20 @@ async function saveWorldInfoRuntimeMetadata(
     clearWorldInfoExternalActivations(chatMetadata, 'worldInfoBuffer')
     clearWorldInfoExternalActivations(chatMetadata, 'world_info_buffer')
   }
-  await chatService.updateChatMetadata(characterName, chatId, chatMetadata).catch((error) => {
+  try {
+    const updated = await chatService.updateChatMetadata(characterName, chatId, chatMetadata)
+    if (!updated) {
+      throw new Error('Chat metadata is no longer available')
+    }
+  } catch (error) {
     console.warn('[WI] Failed to persist world info runtime metadata:', error)
-  })
+    if (clearExternalActivations) {
+      throw createError(
+        ErrorCode.FILE_WRITE_ERROR,
+        'Failed to consume external world info activations',
+      )
+    }
+  }
 }
 
 function clearWorldInfoExternalActivations(chatMetadata: Record<string, unknown>, key: string): void {

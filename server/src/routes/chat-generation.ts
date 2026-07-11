@@ -23,6 +23,27 @@ export interface GenerationOverrides {
   maxReplyLength?: number
 }
 
+export interface StCompatChatOverrideLine {
+  name?: string
+  is_user?: boolean
+  is_system?: boolean
+  mes: string
+}
+
+export interface StCompatExtensionPrompt {
+  key: string
+  value: string
+  position?: number
+  depth?: number
+  scan?: boolean
+  role?: number
+}
+
+export interface StCompatPromptMessage {
+  role: EngineMessage['role']
+  content: string
+}
+
 type Character = Awaited<ReturnType<typeof characterService.getCharacter>>
 type Chat = Awaited<ReturnType<typeof chatService.getChat>>
 type GenerationRun = Awaited<ReturnType<typeof runService.createGenerationRun>>
@@ -39,6 +60,7 @@ export type LoadWorldEntries = (
   maxContext: number,
   model?: string,
   userName?: string,
+  operation?: GenerationOperation,
 ) => Promise<WorldEntries>
 
 interface PreparedGenerationContext {
@@ -62,6 +84,9 @@ export async function handleGenerate(input: {
   isContinue?: boolean
   operation?: GenerationOperation
   beforeGenerate?: () => Promise<void>
+  stCompatChatOverride?: StCompatChatOverrideLine[]
+  stCompatExtensionPrompts?: StCompatExtensionPrompt[]
+  stCompatPromptMessages?: StCompatPromptMessage[]
   loadWorldEntries: LoadWorldEntries
 }) {
   const stream = input.stream ?? true
@@ -90,7 +115,11 @@ export async function handleGenerate(input: {
       presetName: input.presetName,
       genOverrides: input.genOverrides,
       beforeGenerate: input.beforeGenerate,
+      stCompatChatOverride: input.stCompatChatOverride,
+      stCompatExtensionPrompts: input.stCompatExtensionPrompts,
+      stCompatPromptMessages: input.stCompatPromptMessages,
       loadWorldEntries: input.loadWorldEntries,
+      operation,
     })
 
     if (stream) {
@@ -137,7 +166,11 @@ async function prepareGenerationContext(input: {
   presetName?: string
   genOverrides?: GenerationOverrides
   beforeGenerate?: () => Promise<void>
+  stCompatChatOverride?: StCompatChatOverrideLine[]
+  stCompatExtensionPrompts?: StCompatExtensionPrompt[]
+  stCompatPromptMessages?: StCompatPromptMessage[]
   loadWorldEntries: LoadWorldEntries
+  operation: GenerationOperation
 }): Promise<PreparedGenerationContext> {
   const resolvedConfig = resolveLlmConfigApiKey(input.config)
 
@@ -147,15 +180,28 @@ async function prepareGenerationContext(input: {
   const basePreset = await presetService.getGenerationPreset(input.presetType, input.presetName)
   const preset = mergePresetWithOverrides(basePreset, input.genOverrides)
   const userName = extractUserName(chat)
-  const chatMessages = extractChatMessages(chat)
-  const messages = chatMessages.map(({ role, content }) => ({ role, content }))
+  const chatMessages = input.stCompatChatOverride
+    ? extractStCompatChatOverrideMessages(input.stCompatChatOverride)
+    : extractChatMessages(chat)
+  const extensionPrompts = input.stCompatExtensionPrompts ?? []
+  const messagesWithExtensionPrompts = applyStCompatExtensionPrompts(chatMessages, extensionPrompts)
+  const promptMessages = input.stCompatPromptMessages
+    ? extractStCompatPromptMessages(input.stCompatPromptMessages)
+    : messagesWithExtensionPrompts
+  const messagesForWorldScan = input.stCompatPromptMessages
+    ? promptMessages
+    : extensionPrompts.some(prompt => prompt.scan === true)
+      ? applyStCompatExtensionPrompts(chatMessages, extensionPrompts.filter(prompt => prompt.scan === true))
+      : chatMessages
+  const messages = promptMessages.map(({ role, content }) => ({ role, content }))
   const worldEntries = await input.loadWorldEntries(
     character,
     chat,
-    chatMessages,
+    messagesForWorldScan,
     getContextLength(preset, input.genOverrides),
     resolvedConfig.model,
     userName,
+    input.operation,
   )
 
   return {
@@ -284,6 +330,11 @@ class StreamGenerationHandler {
       await this.flushPartial(true)
       this.committedLineIndex = await this.saveGeneratedContent()
       await this.completeRun()
+      controller.enqueue(this.encodeSse({
+        done: true,
+        runId: this.options.run.runId,
+        ...(this.committedLineIndex !== undefined ? { committedLineIndex: this.committedLineIndex } : {}),
+      }))
       controller.enqueue(this.encoder.encode('data: [DONE]\n\n'))
       controller.close()
     } catch (error) {
@@ -432,6 +483,88 @@ function extractChatMessages(chat: Chat): ChatMessageForGeneration[] {
         content: message.mes,
       }
     })
+}
+
+function extractStCompatChatOverrideMessages(lines: StCompatChatOverrideLine[]): ChatMessageForGeneration[] {
+  return lines.map(line => ({
+    name: line.name,
+    role: line.is_system ? 'system' as const : line.is_user ? 'user' as const : 'assistant' as const,
+    content: line.mes,
+  }))
+}
+
+function extractStCompatPromptMessages(messages: StCompatPromptMessage[]): ChatMessageForGeneration[] {
+  return messages.map(message => ({
+    role: message.role,
+    content: message.content,
+  }))
+}
+
+const EXTENSION_PROMPT_POSITION = {
+  IN_PROMPT: 0,
+  IN_CHAT: 1,
+  BEFORE_PROMPT: 2,
+  AFTER_PROMPT: 3,
+} as const
+
+const EXTENSION_PROMPT_ROLE = {
+  SYSTEM: 0,
+  USER: 1,
+  ASSISTANT: 2,
+} as const
+
+function extensionPromptRole(prompt: StCompatExtensionPrompt): ChatMessageForGeneration['role'] {
+  switch (prompt.role) {
+    case EXTENSION_PROMPT_ROLE.USER:
+      return 'user'
+    case EXTENSION_PROMPT_ROLE.ASSISTANT:
+      return 'assistant'
+    case EXTENSION_PROMPT_ROLE.SYSTEM:
+    default:
+      return 'system'
+  }
+}
+
+function extensionPromptMessage(prompt: StCompatExtensionPrompt): ChatMessageForGeneration {
+  return {
+    name: prompt.key,
+    role: extensionPromptRole(prompt),
+    content: prompt.value,
+  }
+}
+
+function applyStCompatExtensionPrompts(
+  messages: ChatMessageForGeneration[],
+  prompts: StCompatExtensionPrompt[],
+): ChatMessageForGeneration[] {
+  if (prompts.length === 0) return messages
+
+  const result = [...messages]
+  const before: ChatMessageForGeneration[] = []
+  const after: ChatMessageForGeneration[] = []
+
+  for (const prompt of prompts) {
+    if (!prompt.value) continue
+    const message = extensionPromptMessage(prompt)
+
+    if (prompt.position === EXTENSION_PROMPT_POSITION.AFTER_PROMPT) {
+      after.push(message)
+      continue
+    }
+
+    if (prompt.position === EXTENSION_PROMPT_POSITION.IN_CHAT) {
+      const depth = typeof prompt.depth === 'number' && Number.isFinite(prompt.depth)
+        ? Math.max(0, Math.floor(prompt.depth))
+        : 0
+      const insertIdx = Math.max(0, result.length - depth)
+      result.splice(insertIdx, 0, message)
+      continue
+    }
+
+    before.push(message)
+  }
+
+  return [...before, ...result, ...after]
 }
 
 function getContextLength(
