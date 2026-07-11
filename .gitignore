@@ -37,7 +37,7 @@ lerna-debug.log*
 *.sw?
 Thumbs.db
 
-# User data — test characters, chat logs, personal world books, presets
+# User data — test characters, chat logs, personal world books, presets, runs
 server/data/characters/
 server/data/chats/
 server/data/worlds/
@@ -45,6 +45,7 @@ server/data/presets/
 server/data/extensions/
 server/data/backups/
 server/data/user/
+server/data/runs/
 
 # Preserve directory structure with .gitkeep
 !server/data/.gitkeep
@@ -52,6 +53,7 @@ server/data/user/
 # AI coding context files
 AGENTS.md
 CLAUDE.md
+.agents/
 docs/
 技术债.md
 illytavern
@@ -64,3 +66,4 @@ ehthumbs.db
 
 # Test/debug screenshots
 .browser-st-*.png
+tmp-st-smoke-*.png
