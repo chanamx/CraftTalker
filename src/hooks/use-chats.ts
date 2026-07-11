@@ -1,5 +1,5 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { api, type ChatInfo, type ChatDetail, type LlmRequestConfig, type PresetType, ApiRequestError } from '@/lib/api'
+import { api, type ChatInfo, type ChatDetail, type LlmRequestConfig, type PresetType, type StCompatGenerationOptions, ApiRequestError } from '@/lib/api'
 
 export function useChats(characterName: string | null) {
   return useQuery<ChatInfo[]>({
@@ -70,6 +70,7 @@ export function useGenerateStream() {
       presetName,
       signal,
       genOverrides,
+      stCompat,
     }: {
       characterName: string
       chatId: string
@@ -78,8 +79,15 @@ export function useGenerateStream() {
       presetName?: string
       signal?: AbortSignal
       genOverrides?: { temperature?: number; topP?: number; contextLength?: number; maxReplyLength?: number }
+      stCompat?: StCompatGenerationOptions
     }) => {
-      const response = await api.chats.generate(characterName, chatId, config, presetType, presetName, signal, genOverrides)
+      const response = await api.chats.generate(characterName, chatId, config, {
+        presetType,
+        presetName,
+        signal,
+        genOverrides,
+        stCompat,
+      })
       if (!response.ok) {
         const err = await response.json().catch(() => ({
           error: 'Stream failed',
