@@ -45,8 +45,8 @@ export function loadExtensionSettings(settings = {}) {
 export function initExtensions() {
   return getHost().initialize()
 }
-export function runGenerationInterceptors(_chat, _maxDepth, _isDryRun) {
-  return Promise.resolve()
+export function runGenerationInterceptors(chat, contextSize, type) {
+  return getHost().runGenerationInterceptors?.(chat, contextSize, type) ?? Promise.resolve(false)
 }
 
 export default {
@@ -67,4 +67,5 @@ export default {
   builtin,
   registerMacroLike,
   unregisterMacroLike,
+  runGenerationInterceptors,
 }

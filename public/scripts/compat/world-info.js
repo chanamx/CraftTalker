@@ -41,6 +41,12 @@ export const wi_anchor_position = {
   before: 0,
   after: 1,
 }
+export const scan_state = {
+  NONE: 0,
+  INITIAL: 1,
+  RECURSION: 2,
+  MIN_ACTIVATIONS: 3,
+}
 export const newWorldInfoEntryTemplate = {
   uid: 0,
   key: [],
@@ -76,17 +82,21 @@ export function updateWorldInfoList() {
 export async function getWorldInfoPrompt(chat = [], maxContext, isDryRun = false, globalScanData = {}) {
   const context = getCompatContext()
   const activeCharacter = getActiveCharacter(context)
+  const activeCharacterTagPayload = getActiveCharacterTagPayload(context, activeCharacter)
   const payload = {
     chat: normalizePromptChat(chat),
     maxContext,
     isDryRun: Boolean(isDryRun),
     globalScanData,
     characterName: activeCharacter?.file_name ?? activeCharacter?.avatar ?? activeCharacter?.name,
+    ...activeCharacterTagPayload,
     chatId: typeof context?.chatId === 'string'
       ? context.chatId
       : typeof context?.getCurrentChatId === 'function'
         ? context.getCurrentChatId()
         : undefined,
+    userName: getCompatUserName(context),
+    model: getCompatModel(context),
   }
 
   try {
@@ -96,7 +106,11 @@ export async function getWorldInfoPrompt(chat = [], maxContext, isDryRun = false
       body: JSON.stringify(payload),
     })
     if (!response.ok) throw new Error(`World info check failed with ${response.status}`)
-    return await response.json()
+    const result = await response.json()
+    await emitWorldInfoEntriesLoaded(result)
+    await emitWorldInfoScanDone(result)
+    await emitActivatedWorldInfo(result, Boolean(isDryRun))
+    return result
   } catch (error) {
     host.recordCompatDiagnostic?.(
       'getWorldInfoPrompt',
@@ -173,9 +187,393 @@ function getCompatContext() {
 }
 
 function getActiveCharacter(context) {
-  const characters = Array.isArray(context?.characters) ? context.characters : []
+  const characters = Array.isArray(context?.characters)
+    ? context.characters
+    : Array.isArray(context?.charactersData)
+      ? context.charactersData
+      : []
   const index = Number(context?.characterId ?? context?.this_chid)
   return Number.isInteger(index) && index >= 0 ? characters[index] : null
+}
+
+function getActiveCharacterTagPayload(context, activeCharacter) {
+  const tagMap = getCompatTagMap(context)
+  const tagKey = getActiveCharacterTagKey(context, activeCharacter, tagMap)
+  const mappedTags = tagKey && Object.hasOwn(tagMap, tagKey)
+    ? asStringList(tagMap[tagKey])
+    : undefined
+  const cardTags = asStringList(activeCharacter?.tags ?? activeCharacter?.data?.tags)
+  const characterTags = mappedTags ?? (cardTags.length > 0 ? cardTags : undefined)
+  if (!characterTags) return {}
+
+  const characterTagNames = resolveCharacterTagNames(characterTags, getCompatTags(context), mappedTags ? [] : cardTags)
+  return {
+    characterTags,
+    ...(characterTagNames.length > 0 ? { characterTagNames } : {}),
+  }
+}
+
+function getCompatTagMap(context) {
+  for (const value of [context?.tagMap, context?.tag_map, host.tagMap, host.tag_map, globalThis.tagMap, globalThis.tag_map]) {
+    const record = recordValue(value)
+    if (Object.keys(record).length > 0) return record
+  }
+  return {}
+}
+
+function getCompatTags(context) {
+  for (const value of [context?.tags, host.tags, globalThis.tags]) {
+    if (Array.isArray(value)) return value
+  }
+  return []
+}
+
+function getActiveCharacterTagKey(context, activeCharacter, tagMap) {
+  const index = Number(context?.characterId ?? context?.this_chid)
+  const candidates = [
+    activeCharacter?.avatar,
+    activeCharacter?.file_name,
+    activeCharacter?.id,
+    activeCharacter?.name,
+    Number.isInteger(index) && index >= 0 ? String(index) : undefined,
+  ].map(value => typeof value === 'string' ? value.trim() : '').filter(Boolean)
+
+  return candidates.find(candidate => Object.hasOwn(tagMap, candidate)) ?? candidates[0]
+}
+
+function resolveCharacterTagNames(tagIds, tags, fallbackNames = []) {
+  const namesById = new Map()
+  for (const tag of tags) {
+    if (!tag || typeof tag !== 'object') continue
+    const id = typeof tag.id === 'string' ? tag.id.trim() : ''
+    const name = typeof tag.name === 'string' ? tag.name.trim() : ''
+    if (id && name) namesById.set(id, name)
+  }
+
+  return uniqueStrings([
+    ...tagIds.map(tagId => namesById.get(tagId) ?? tagId),
+    ...fallbackNames,
+  ])
+}
+
+function getCompatUserName(context) {
+  return firstStringValue([
+    context?.name1,
+    context?.userName,
+    context?.user_name,
+    context?.chatMetadata?.user_name,
+    context?.chat_metadata?.user_name,
+    Array.isArray(context?.chat) ? context.chat[0]?.user_name : undefined,
+  ])
+}
+
+function getCompatModel(context) {
+  const settings = context?.oai_settings
+    ?? context?.openai_settings
+    ?? globalThis.oai_settings
+    ?? globalThis.openai_settings
+  return firstStringValue([
+    context?.model,
+    context?.selectedModel,
+    context?.selected_model,
+    settings?.model,
+    settings?.openai_model,
+  ])
+}
+
+function firstStringValue(values) {
+  for (const value of values) {
+    if (typeof value === 'string' && value.trim()) return value.trim()
+  }
+  return undefined
+}
+
+function asStringList(value) {
+  if (!Array.isArray(value)) return []
+  return value.map(item => String(item ?? '').trim()).filter(Boolean)
+}
+
+function uniqueStrings(values) {
+  return [...new Set(values.map(value => String(value ?? '').trim()).filter(Boolean))]
+}
+
+async function emitActivatedWorldInfo(result, isDryRun) {
+  if (isDryRun) return
+  const entries = Array.isArray(result?.allActivatedEntries)
+    ? result.allActivatedEntries
+    : Array.isArray(result?.matchedEntries)
+      ? result.matchedEntries
+      : []
+  if (entries.length === 0) return
+
+  const eventName = host.event_types?.WORLD_INFO_ACTIVATED ?? 'world_info_activated'
+  try {
+    await host.eventSource?.emit?.(eventName, entries)
+  } catch (error) {
+    host.recordCompatDiagnostic?.(
+      'WORLD_INFO_ACTIVATED',
+      'stub',
+      'World info activation event listener failed in the public compatibility bridge.',
+    )
+    console.warn('[ST Compat] Failed to emit world info activation event', error)
+  }
+}
+
+async function emitWorldInfoScanDone(result) {
+  const scanEvents = Array.isArray(result?.scanEvents)
+    ? result.scanEvents.filter(event => event?.type === 'scan_done')
+    : []
+  if (scanEvents.length === 0) return
+
+  const eventName = host.event_types?.WORLDINFO_SCAN_DONE ?? 'worldinfo_scan_done'
+  const activatedEntries = getWorldInfoActivatedEntries(result)
+  const activatedMap = createActivatedEntryMap(activatedEntries)
+  const activatedText = activatedEntries
+    .map(entry => typeof entry?.content === 'string' ? entry.content : '')
+    .filter(Boolean)
+    .join('\n')
+
+  try {
+    for (const event of scanEvents) {
+      await host.eventSource?.emit?.(eventName, createScanDoneEventData(event, result, activatedMap, activatedText))
+    }
+    host.recordCompatDiagnostic?.(
+      'WORLDINFO_SCAN_DONE',
+      'partial',
+      'Emitted read-only ST-shaped world-info scan-done events from the public compatibility bridge; listener mutations do not affect the completed server-side scan.',
+    )
+  } catch (error) {
+    host.recordCompatDiagnostic?.(
+      'WORLDINFO_SCAN_DONE',
+      'stub',
+      'World info scan-done event listener failed in the public compatibility bridge.',
+    )
+    console.warn('[ST Compat] Failed to emit world info scan-done event', error)
+  }
+}
+
+async function emitWorldInfoEntriesLoaded(result) {
+  const sourceEntries = recordValue(result?.sourceEntries)
+  if (!Object.hasOwn(sourceEntries, 'globalLore')) return
+
+  const payload = {
+    globalLore: entryArray(sourceEntries.globalLore),
+    characterLore: entryArray(sourceEntries.characterLore),
+    chatLore: entryArray(sourceEntries.chatLore),
+    personaLore: entryArray(sourceEntries.personaLore),
+  }
+  const eventName = host.event_types?.WORLDINFO_ENTRIES_LOADED ?? 'worldinfo_entries_loaded'
+
+  try {
+    await host.eventSource?.emit?.(eventName, payload)
+    host.recordCompatDiagnostic?.(
+      'WORLDINFO_ENTRIES_LOADED',
+      'partial',
+      'Emitted a read-only ST-shaped world-info entries-loaded event from the public compatibility bridge; listener mutations do not affect the completed server-side scan.',
+    )
+  } catch (error) {
+    host.recordCompatDiagnostic?.(
+      'WORLDINFO_ENTRIES_LOADED',
+      'stub',
+      'World info entries-loaded event listener failed in the public compatibility bridge.',
+    )
+    console.warn('[ST Compat] Failed to emit world info entries-loaded event', error)
+  }
+}
+
+function createScanDoneEventData(event, result, activatedMap, activatedText) {
+  const currentState = normalizeScanState(event?.currentState)
+  const nextState = normalizeScanState(event?.nextState)
+  const budgetCurrent = finiteNumber(event?.budgetCurrent, finiteNumber(result?.budgetCurrent, 0))
+  const overflowed = typeof event?.overflowed === 'boolean'
+    ? event.overflowed
+    : Boolean(result?.overflowed)
+
+  return {
+    state: {
+      current: currentState.value,
+      next: nextState.value,
+      loopCount: Math.max(0, Math.floor(finiteNumber(event?.loopCount, 0))),
+      currentState: currentState.name,
+      nextState: nextState.name,
+    },
+    new: {
+      all: entryArray(event?.newAllEntries),
+      successful: entryArray(event?.newSuccessfulEntries),
+    },
+    activated: {
+      entries: new Map(activatedMap),
+      text: activatedText,
+    },
+    sortedEntries: entryArray(result?.sortedEntries),
+    recursionDelay: {
+      availableLevels: numberArray(event?.recursionDelayAvailableLevels),
+      currentLevel: Math.max(0, Math.floor(finiteNumber(event?.recursionDelayCurrentLevel, 0))),
+    },
+    budget: {
+      current: budgetCurrent,
+      overflowed,
+    },
+    timedEffects: createTimedEffectsFacade(
+      result?.timedEffects,
+      event?.timedEffectActiveEntryIds,
+      entryArray(result?.sortedEntries),
+    ),
+  }
+}
+
+function createTimedEffectsFacade(metadata, activeEntryIds, sortedEntries = []) {
+  const timedEffects = metadata && typeof metadata === 'object' ? metadata : {}
+  const sticky = recordValue(timedEffects.sticky)
+  const cooldown = recordValue(timedEffects.cooldown)
+  const activeRecord = recordValue(activeEntryIds)
+  const active = {
+    sticky: stringSet(activeRecord.sticky),
+    cooldown: stringSet(activeRecord.cooldown),
+    delay: stringSet(activeRecord.delay),
+  }
+  const hasActiveState = ['sticky', 'cooldown', 'delay'].some(type => Array.isArray(activeRecord[type]))
+
+  return {
+    metadata: {
+      sticky,
+      cooldown,
+    },
+    sticky,
+    cooldown,
+    delay: {},
+    isValidEffectType: isValidTimedEffectType,
+    isEffectActive(type, entry) {
+      if (!isValidTimedEffectType(type)) return false
+      const effectType = normalizeTimedEffectType(type)
+      if (hasActiveState) return isTimedEffectActive(active, sortedEntries, effectType, entry)
+      if (effectType === 'delay') return false
+      return Boolean(getTimedEffectMetadata(sticky, cooldown, type, entry))
+    },
+    getEffectMetadata(type, entry) {
+      if (!isValidTimedEffectType(type)) return null
+      return getTimedEffectMetadata(sticky, cooldown, type, entry)
+    },
+    setTimedEffect(type) {
+      host.recordCompatDiagnostic?.(
+        'WORLDINFO_SCAN_DONE.timedEffects.setTimedEffect',
+        'readonly',
+        `Ignored public scan-done timed effect mutation for "${String(type)}"; server-side scans are already complete.`,
+      )
+    },
+    setTimedEffects() {
+      host.recordCompatDiagnostic?.(
+        'WORLDINFO_SCAN_DONE.timedEffects.setTimedEffects',
+        'readonly',
+        'Ignored public scan-done timed effects mutation; server-side scans are already complete.',
+      )
+    },
+    cleanUp() {},
+  }
+}
+
+function isTimedEffectActive(active, sortedEntries, type, entry) {
+  const key = getEntryKey(entry)
+  if (key && active[type]?.has(key)) return true
+
+  const hash = finiteNumber(entry?.hash, Number.NaN)
+  if (!Number.isFinite(hash)) return false
+
+  return sortedEntries.some(sortedEntry => {
+    if (!sortedEntry || typeof sortedEntry !== 'object') return false
+    if (String(sortedEntry.hash) !== String(hash)) return false
+    const sortedKey = getEntryKey(sortedEntry)
+    return Boolean(sortedKey && active[type]?.has(sortedKey))
+  })
+}
+
+function isValidTimedEffectType(type) {
+  return ['sticky', 'cooldown', 'delay'].includes(normalizeTimedEffectType(type))
+}
+
+function normalizeTimedEffectType(type) {
+  return typeof type === 'string' ? type.trim().toLowerCase() : ''
+}
+
+function getTimedEffectMetadata(sticky, cooldown, type, entry) {
+  const effectType = normalizeTimedEffectType(type)
+  if (effectType === 'delay') return undefined
+  const store = effectType === 'sticky' ? sticky : cooldown
+  const key = getEntryKey(entry)
+  if (key && store[key]) return store[key]
+  const hash = finiteNumber(entry?.hash, Number.NaN)
+  if (!Number.isFinite(hash)) return undefined
+  return Object.values(store).find(effect => {
+    if (!effect || typeof effect !== 'object') return false
+    return String(effect.hash) === String(hash)
+  })
+}
+
+function getEntryKey(entry) {
+  if (!entry || typeof entry !== 'object') return ''
+  const world = typeof entry.world === 'string' ? entry.world.trim() : ''
+  const uid = entry.uid ?? entry.id
+  return world && uid !== undefined && uid !== null ? `${world}.${uid}` : ''
+}
+
+function normalizeScanState(value) {
+  switch (value) {
+    case 'initial':
+    case scan_state.INITIAL:
+      return { name: 'initial', value: scan_state.INITIAL }
+    case 'recursion':
+    case scan_state.RECURSION:
+      return { name: 'recursion', value: scan_state.RECURSION }
+    case 'min_activations':
+    case scan_state.MIN_ACTIVATIONS:
+      return { name: 'min_activations', value: scan_state.MIN_ACTIVATIONS }
+    case null:
+    case undefined:
+    case 'none':
+    case scan_state.NONE:
+    default:
+      return { name: null, value: scan_state.NONE }
+  }
+}
+
+function numberArray(value) {
+  if (!Array.isArray(value)) return []
+  return value
+    .map(item => finiteNumber(item, Number.NaN))
+    .filter(Number.isFinite)
+    .map(item => Math.max(0, Math.floor(item)))
+}
+
+function entryArray(value) {
+  return Array.isArray(value)
+    ? value.filter(item => item && typeof item === 'object')
+    : []
+}
+
+function recordValue(value) {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value : {}
+}
+
+function stringSet(value) {
+  return new Set(Array.isArray(value) ? value.filter(item => typeof item === 'string') : [])
+}
+
+function getWorldInfoActivatedEntries(result) {
+  return Array.isArray(result?.allActivatedEntries)
+    ? result.allActivatedEntries
+    : Array.isArray(result?.matchedEntries)
+      ? result.matchedEntries
+      : []
+}
+
+function createActivatedEntryMap(entries) {
+  const map = new Map()
+  entries.forEach((entry, index) => {
+    const world = typeof entry?.world === 'string' && entry.world.trim() ? entry.world.trim() : 'unknown'
+    const uid = entry?.uid ?? entry?.id ?? index
+    map.set(`${world}.${uid}`, entry)
+  })
+  return map
 }
 
 function normalizePromptChat(chat) {
@@ -199,6 +597,7 @@ function normalizePromptChat(chat) {
 function emptyWorldInfoPromptResult() {
   return {
     matchedEntries: [],
+    worldInfoString: '',
     worldInfoBefore: '',
     worldInfoAfter: '',
     worldInfoExamples: [],
@@ -211,6 +610,7 @@ function emptyWorldInfoPromptResult() {
     timedEffects: {},
     timedEffectsChanged: false,
     scanEvents: [],
+    sortedEntries: [],
     vectorizedSkipped: [],
     vectorizedActivated: [],
   }

@@ -10,7 +10,9 @@
     "preview": "vite preview",
     "test": "vitest run",
     "test:watch": "vitest",
-    "audit:st-shims": "node scripts/audit-st-public-shims.mjs"
+    "size:audit": "node scripts/size-audit.mjs",
+    "audit:st-shims": "node scripts/audit-st-public-shims.mjs",
+    "audit:st-plugins": "node scripts/audit-st-plugin-capabilities.mjs"
   },
   "devDependencies": {
     "@testing-library/jest-dom": "^6.9.1",
