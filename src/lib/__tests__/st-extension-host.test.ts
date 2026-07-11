@@ -10,6 +10,7 @@ import {
   getCharacter,
   getCharacters,
   getOneCharacter,
+  getExtensionPromptsSnapshot,
   getGlobalVariable,
   getLocalVariable,
   getExtensionManifest,
@@ -24,6 +25,7 @@ import {
   saveMetadataDebounced,
   saveSettings,
   saveWorldInfo,
+  setExtensionPrompt,
   setGlobalVariable,
   setLocalVariable,
   SlashCommandParser,
@@ -37,6 +39,7 @@ import {
   updateStExtensionContext,
   updateMessageBlock,
   reloadCurrentChat,
+  runGenerationInterceptors,
   activateSendButtons,
   deactivateSendButtons,
   isGenerating,
@@ -52,6 +55,8 @@ afterEach(() => {
   vi.useRealTimers()
   vi.unstubAllGlobals()
   SlashCommandParser.commands = {}
+  const extensionPrompts = getContext().extensionPrompts as Record<string, unknown>
+  for (const key of Object.keys(extensionPrompts)) delete extensionPrompts[key]
   activateSendButtons()
   updateStExtensionContext({
     activeCharacter: null,
@@ -117,6 +122,22 @@ describe('SillyTavern extension host compatibility', () => {
     expect(context.chatId).toBe('chat-a')
     expect(context.characterId).toBe(0)
     expect(context.chat).toEqual([expect.objectContaining({ name: 'You', is_user: true, mes: 'hello' })])
+  })
+
+  it('exports sanitized ST extension prompt snapshots for generation requests', () => {
+    setExtensionPrompt('plugin-system-note', 'Remember this rule.', '0', '2', true, '1')
+    setExtensionPrompt('empty-note', '', 0, 0, true, 0)
+
+    expect(getExtensionPromptsSnapshot()).toEqual([
+      {
+        key: 'plugin-system-note',
+        value: 'Remember this rule.',
+        position: 0,
+        depth: 2,
+        scan: true,
+        role: 1,
+      },
+    ])
   })
 
   it('mirrors ST send-button generation state without granting native send control', async () => {
@@ -836,6 +857,12 @@ describe('SillyTavern extension host compatibility', () => {
     window.$?.('#extensions_settings').append('<div id="plugin-panel">Panel</div>')
     await Promise.resolve()
 
+    expect(getContext()).toMatchObject({
+      name1: 'User',
+      userName: 'User',
+      user_name: 'User',
+      name2: 'Cora',
+    })
     expect(document.getElementById('crafttalker-st-compat-settings-panel')?.dataset.hasContent).toBe('true')
     expect(document.querySelector('#world_info option:nth-child(2)')?.textContent).toBe('GlobalLore')
     expect((document.getElementById('world_info') as HTMLSelectElement | null)?.multiple).toBe(true)
@@ -885,6 +912,49 @@ describe('SillyTavern extension host compatibility', () => {
     expect(getDiagnostics()).toEqual(expect.arrayContaining([
       expect.objectContaining({ id: 'updateMessageBlock', status: 'partial' }),
     ]))
+  })
+
+  it('does not re-emit the same render event when updateMessageBlock runs inside a render handler', async () => {
+    document.body.innerHTML = ''
+    updateStExtensionContext({
+      activeCharacter: {
+        id: 'char-render-loop',
+        name: 'RenderLoopBot',
+        avatar: null,
+        description: '',
+        model: 'default',
+        lastMessage: '',
+        pinned: false,
+        file_name: 'RenderLoopBot',
+        world: null,
+      },
+      activeChatId: 'chat-render-loop',
+      characters: [],
+      messages: [],
+      chatLines: [
+        { chat_metadata: { variables: {}, extensions: {} }, user_name: 'User', character_name: 'RenderLoopBot' },
+        { name: 'RenderLoopBot', is_user: false, is_system: false, mes: 'Initial', send_date: '2026-06-18T00:00:00.000Z', extra: {} },
+      ],
+    })
+
+    let calls = 0
+    const rendered = vi.fn((messageId: unknown) => {
+      const index = Number(messageId)
+      calls += 1
+      if (calls > 3) return
+      const message = (getContext().chat as Array<Record<string, unknown>>)[index]
+      message.mes = `Changed ${calls}`
+      updateMessageBlock(index, message, { rerenderMessage: true })
+    })
+
+    eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, rendered)
+    await eventSource.emit(event_types.CHARACTER_MESSAGE_RENDERED, 0)
+    await new Promise(resolve => setTimeout(resolve, 0))
+    eventSource.off(event_types.CHARACTER_MESSAGE_RENDERED, rendered)
+
+    expect(rendered).toHaveBeenCalledTimes(1)
+    const compatChat = document.getElementById('crafttalker-st-compat-root')?.querySelector('#chat')
+    expect(compatChat?.querySelector('.mes[mesid="0"] .mes_text')?.textContent).toContain('Changed 1')
   })
 
   it('reloads the current ST compatibility chat mirror without native message persistence', async () => {
@@ -1015,6 +1085,38 @@ describe('SillyTavern extension host compatibility', () => {
     ]))
   })
 
+  it('renders ST-compatible message media when rebuilding the compatibility chat mirror', () => {
+    document.body.innerHTML = ''
+    updateStExtensionContext({
+      activeCharacter: null,
+      activeChatId: 'chat-media-rebuild',
+      characters: [],
+      messages: [],
+      chatLines: [
+        { chat_metadata: { variables: {}, extensions: {} }, user_name: 'User', character_name: 'MediaBot' },
+        {
+          name: 'MediaBot',
+          is_user: false,
+          is_system: false,
+          mes: 'Media payload',
+          send_date: '2026-06-18T00:00:00.000Z',
+          extra: {
+            media: [
+              { type: 'image', url: '/user/files/scene.png', title: 'Scene' },
+              { type: 'image', url: 'javascript:alert(1)', title: 'Blocked' },
+            ],
+            files: [{ name: 'notes.txt', size: 1024, url: '/user/files/notes.txt' }],
+          },
+        },
+      ],
+    })
+
+    const element = document.getElementById('crafttalker-st-compat-root')?.querySelector('.mes[mesid="0"]')
+    expect(element?.querySelector('.mes_img')?.getAttribute('src')).toBe('/user/files/scene.png')
+    expect(element?.querySelector('.mes_file_name')?.textContent).toBe('notes.txt')
+    expect(element?.innerHTML).not.toContain('javascript:alert')
+  })
+
   it('refreshes existing forced addOneMessage entries without duplicating plugin-managed chat rows', () => {
     document.body.innerHTML = ''
     updateStExtensionContext({
@@ -1072,18 +1174,85 @@ describe('SillyTavern extension host compatibility', () => {
   it('keeps extension discovery arrays stable for public shim references', async () => {
     const namesReference = extensionNames
     const typesReference = extensionTypes
+    const interceptorCalls: string[] = []
+    const activateHook = vi.fn()
+    vi.doMock('/scripts/extensions/third-party/HookRef/index.js', () => ({
+      activateHook,
+    }))
+    vi.spyOn(document.body, 'appendChild').mockImplementation((node) => {
+      const result = Node.prototype.appendChild.call(document.body, node)
+      if (node instanceof HTMLScriptElement) {
+        queueMicrotask(() => {
+          node.onload?.call(node, new Event('load'))
+        })
+      }
+      return result
+    })
+    vi.stubGlobal('secondInterceptor', vi.fn(async (_chat, _contextSize, _abort, type) => {
+      interceptorCalls.push(`second:${type}`)
+    }))
+    vi.stubGlobal('stableInterceptor', vi.fn((_chat, contextSize, abort) => {
+      interceptorCalls.push(`stable:${contextSize}`)
+      abort(true)
+    }))
+    vi.stubGlobal('lateInterceptor', vi.fn(() => {
+      interceptorCalls.push('late')
+    }))
     const fetchMock = vi.fn(async (url: string, _init?: RequestInit) => {
       if (url === '/api/extensions/settings') {
         return new Response(JSON.stringify(extension_settings), { status: 200, headers: { 'Content-Type': 'application/json' } })
       }
       if (url === '/api/extensions/discover') {
-        return new Response(JSON.stringify([{ type: 'local', name: 'third-party/StableRef' }]), {
+        return new Response(JSON.stringify([
+          { type: 'local', name: 'third-party/StableRef' },
+          { type: 'local', name: 'third-party/SecondRef' },
+          { type: 'local', name: 'third-party/LateRef' },
+          { type: 'local', name: 'third-party/HookRef' },
+        ]), {
           status: 200,
           headers: { 'Content-Type': 'application/json' },
         })
       }
       if (url === '/scripts/extensions/third-party/StableRef/manifest.json') {
-        return new Response(JSON.stringify({ display_name: 'StableRef', js: '' }), {
+        return new Response(JSON.stringify({
+          display_name: 'StableRef',
+          loading_order: 20,
+          js: '',
+          generate_interceptor: 'stableInterceptor',
+        }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      if (url === '/scripts/extensions/third-party/SecondRef/manifest.json') {
+        return new Response(JSON.stringify({
+          display_name: 'SecondRef',
+          loading_order: 10,
+          js: '',
+          generate_interceptor: 'secondInterceptor',
+        }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      if (url === '/scripts/extensions/third-party/LateRef/manifest.json') {
+        return new Response(JSON.stringify({
+          display_name: 'LateRef',
+          loading_order: 30,
+          js: '',
+          generate_interceptor: 'lateInterceptor',
+        }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      if (url === '/scripts/extensions/third-party/HookRef/manifest.json') {
+        return new Response(JSON.stringify({
+          display_name: 'HookRef',
+          loading_order: 25,
+          js: 'index.js',
+          hooks: { activate: 'activateHook' },
+        }), {
           status: 200,
           headers: { 'Content-Type': 'application/json' },
         })
@@ -1099,6 +1268,9 @@ describe('SillyTavern extension host compatibility', () => {
     expect(namesReference).toContain('third-party/StableRef')
     expect(typesReference).toMatchObject({ 'third-party/StableRef': 'local' })
     expect(getExtensionManifest('StableRef')).toMatchObject({ display_name: 'StableRef' })
+    await expect(runGenerationInterceptors([{ mes: 'hello' }], 4096, 'normal')).resolves.toBe(true)
+    expect(interceptorCalls).toEqual(['second:normal', 'stable:4096'])
+    expect(activateHook).toHaveBeenCalledTimes(1)
   })
 
   it('keeps ST global and chat variable stores stable for direct plugin writes', () => {
@@ -1724,6 +1896,170 @@ describe('SillyTavern extension host compatibility', () => {
     expect(getContext().chat_metadata).toMatchObject({
       variables: { mood: 'fresh' },
       extensions: {},
+    })
+  })
+
+  it('bridges WORLDINFO_FORCE_ACTIVATE into one-shot world info buffer metadata', async () => {
+    vi.useFakeTimers()
+    const savedMetadata: Array<Record<string, unknown>> = []
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      if (url === '/api/chats/Alice/chat-force/metadata') {
+        const body = JSON.parse(String(init?.body ?? '{}')) as { chat_metadata: Record<string, unknown> }
+        savedMetadata.push(body.chat_metadata)
+        return new Response(JSON.stringify({ chat_metadata: body.chat_metadata }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return new Response('', { status: 404 })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    updateStExtensionContext({
+      activeCharacter: {
+        id: 'char-a',
+        name: 'Alice',
+        avatar: null,
+        description: '',
+        model: 'default',
+        lastMessage: '',
+        pinned: false,
+        file_name: 'Alice',
+        world: null,
+      },
+      activeChatId: 'chat-force',
+      characters: [],
+      messages: [],
+      chatLines: [{
+        chat_metadata: {
+          variables: {},
+          extensions: {},
+          worldInfoBuffer: {
+            externalActivations: {
+              'Lore.1': { world: 'Lore', uid: 1, content: 'Existing activation.' },
+            },
+          },
+        },
+        user_name: 'User',
+        character_name: 'Alice',
+      }],
+    })
+
+    await eventSource.emit(event_types.WORLDINFO_FORCE_ACTIVATE, new Set([
+      { world: 'Lore', uid: '3', content: 'First activation.' },
+      {
+        world: 'Lore',
+        uid: 3,
+        content: '\n  Replacement activation.\n',
+        position: '0',
+        depth: '2',
+        insertionOrder: '7',
+        role: '1',
+        score: '0.9',
+        source: ' plugin ',
+        hash: 'hash-3',
+      },
+      { world: '', uid: 4 },
+      { world: 'Lore', uid: -1 },
+      'not-an-entry',
+    ]))
+
+    const metadata = getContext().chat_metadata as Record<string, unknown>
+    const worldInfoBuffer = metadata.worldInfoBuffer as Record<string, unknown>
+    const externalActivations = worldInfoBuffer.externalActivations as Record<string, unknown>
+    expect(externalActivations['Lore.1']).toMatchObject({ world: 'Lore', uid: 1 })
+    expect(externalActivations['Lore.3']).toMatchObject({
+      world: 'Lore',
+      uid: 3,
+      content: '\n  Replacement activation.\n',
+      position: 0,
+      depth: 2,
+      insertion_order: 7,
+      role: 1,
+      score: 0.9,
+      source: 'plugin',
+      hash: 'hash-3',
+    })
+    expect(externalActivations).not.toHaveProperty('Lore.-1')
+
+    await vi.runAllTimersAsync()
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/chats/Alice/chat-force/metadata', expect.objectContaining({
+      method: 'PATCH',
+    }))
+    expect(savedMetadata[0]?.worldInfoBuffer).toMatchObject({
+      externalActivations: {
+        'Lore.3': {
+          world: 'Lore',
+          uid: 3,
+          content: '\n  Replacement activation.\n',
+        },
+      },
+    })
+    expect(getDiagnostics()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'WORLDINFO_FORCE_ACTIVATE', status: 'partial' }),
+      expect.objectContaining({ id: 'saveMetadataDebounced', status: 'partial' }),
+      expect.objectContaining({ id: 'saveMetadata', status: 'partial' }),
+    ]))
+  })
+
+  it('drops non-serializable fields from WORLDINFO_FORCE_ACTIVATE metadata', async () => {
+    vi.useFakeTimers()
+    const savedMetadata: Array<Record<string, unknown>> = []
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      if (url === '/api/chats/Alice/chat-force-safe/metadata') {
+        const body = JSON.parse(String(init?.body ?? '{}')) as { chat_metadata: Record<string, unknown> }
+        savedMetadata.push(body.chat_metadata)
+        return new Response(JSON.stringify({ chat_metadata: body.chat_metadata }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return new Response('', { status: 404 })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    updateStExtensionContext({
+      activeCharacter: {
+        id: 'char-a',
+        name: 'Alice',
+        avatar: null,
+        description: '',
+        model: 'default',
+        lastMessage: '',
+        pinned: false,
+        file_name: 'Alice',
+        world: null,
+      },
+      activeChatId: 'chat-force-safe',
+      characters: [],
+      messages: [],
+      chatLines: [{
+        chat_metadata: { variables: {}, extensions: {} },
+        user_name: 'User',
+        character_name: 'Alice',
+      }],
+    })
+
+    await expect(eventSource.emit(event_types.WORLDINFO_FORCE_ACTIVATE, {
+      world: 'Lore',
+      uid: 9,
+      content: 'Serializable activation.',
+      callback: () => 'not serializable',
+      nested: { callback: () => 'not serializable' },
+    })).resolves.toBeUndefined()
+
+    await vi.runAllTimersAsync()
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/chats/Alice/chat-force-safe/metadata', expect.objectContaining({
+      method: 'PATCH',
+    }))
+    expect(savedMetadata[0]?.worldInfoBuffer).toEqual({
+      externalActivations: {
+        'Lore.9': {
+          world: 'Lore',
+          uid: 9,
+          content: 'Serializable activation.',
+        },
+      },
     })
   })
 

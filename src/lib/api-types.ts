@@ -101,6 +101,41 @@ export interface GenerationOverrides {
   maxReplyLength?: number
 }
 
+export interface StCompatChatOverrideLine {
+  name?: string
+  is_user?: boolean
+  is_system?: boolean
+  mes: string
+}
+
+export interface StCompatExtensionPrompt {
+  key: string
+  value: string
+  position?: number
+  depth?: number
+  scan?: boolean
+  role?: number
+}
+
+export interface StCompatPromptMessage {
+  role: 'system' | 'user' | 'assistant'
+  content: string
+}
+
+export interface StCompatGenerationOptions {
+  chatOverride?: StCompatChatOverrideLine[]
+  extensionPrompts?: StCompatExtensionPrompt[]
+  promptMessages?: StCompatPromptMessage[]
+}
+
+export interface ChatGenerationRequestOptions {
+  presetType?: PresetType
+  presetName?: string
+  signal?: AbortSignal
+  genOverrides?: GenerationOverrides
+  stCompat?: StCompatGenerationOptions
+}
+
 export interface WorldBookEntry {
   uid: number
   id?: number | string
@@ -285,10 +320,21 @@ export interface PresetIndexEntry {
   extension: string
 }
 
+export interface StreamCompleteMetadata {
+  runId?: string
+  committedLineIndex?: number
+}
+
+export interface StGenerationFinalization {
+  runId: string
+  committedLineIndex: number
+  line: ChatLine
+}
+
 export interface StreamCallbacks {
   onChunk?: (chunk: string) => void
   onError?: (error: ApiError) => void
-  onComplete?: () => void
+  onComplete?: (metadata: StreamCompleteMetadata) => void
   signal?: AbortSignal
 }
 
@@ -314,6 +360,7 @@ export interface GenerationRunRecord {
   partialContent: string
   error?: string
   committedLineIndex?: number
+  stFinalizedAt?: string
 }
 
 export interface GenerationRunFilters {
@@ -351,6 +398,10 @@ export interface ExtensionManifest {
   css?: string
   loading_order?: number | string
   requires?: string[]
+  dependencies?: string[]
+  optional?: string[]
+  generate_interceptor?: string
+  hooks?: Record<string, string>
   [key: string]: unknown
 }
 
@@ -383,6 +434,7 @@ export interface ExtensionCompatibilityReportItem extends ExtensionDiscovery {
   homePage: string | null
   autoUpdate: boolean
   generateInterceptor: string | null
+  hooks: Record<string, string>
 }
 
 export interface ExtensionCompatibilityReport {

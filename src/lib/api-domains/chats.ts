@@ -1,28 +1,33 @@
 import { API_BASE, request } from '@/lib/api-client'
 import type {
   ChatDetail,
+  ChatGenerationRequestOptions,
   ChatInfo,
   ChatLine,
   ChatMetadataUpdateResponse,
   ChatMessageVariablesUpdate,
   ChatMessageVariablesUpdateResponse,
-  GenerationOverrides,
   LlmRequestConfig,
-  PresetType,
 } from '@/lib/api-types'
 
 function streamRequest(
   path: string,
   config: LlmRequestConfig,
-  presetType?: PresetType,
-  presetName?: string,
-  signal?: AbortSignal,
-  genOverrides?: GenerationOverrides,
+  options: ChatGenerationRequestOptions = {},
 ): Promise<Response> {
+  const { presetType, presetName, signal, genOverrides, stCompat } = options
   return fetch(`${API_BASE}${path}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ config, presetType, presetName, genOverrides }),
+    body: JSON.stringify({
+      config,
+      presetType,
+      presetName,
+      genOverrides,
+      stCompatChatOverride: stCompat?.chatOverride,
+      stCompatExtensionPrompts: stCompat?.extensionPrompts,
+      stCompatPromptMessages: stCompat?.promptMessages,
+    }),
     signal,
   })
 }
@@ -50,52 +55,34 @@ export const chatsApi = {
     characterName: string,
     chatId: string,
     config: LlmRequestConfig,
-    presetType?: PresetType,
-    presetName?: string,
-    signal?: AbortSignal,
-    genOverrides?: GenerationOverrides,
+    options?: ChatGenerationRequestOptions,
   ) =>
     streamRequest(
       `${chatPath(characterName, chatId)}/stream`,
       config,
-      presetType,
-      presetName,
-      signal,
-      genOverrides,
+      options,
     ),
   regenerate: (
     characterName: string,
     chatId: string,
     config: LlmRequestConfig,
-    presetType?: PresetType,
-    presetName?: string,
-    signal?: AbortSignal,
-    genOverrides?: GenerationOverrides,
+    options?: ChatGenerationRequestOptions,
   ) =>
     streamRequest(
       `${chatPath(characterName, chatId)}/regenerate`,
       config,
-      presetType,
-      presetName,
-      signal,
-      genOverrides,
+      options,
     ),
   continue: (
     characterName: string,
     chatId: string,
     config: LlmRequestConfig,
-    presetType?: PresetType,
-    presetName?: string,
-    signal?: AbortSignal,
-    genOverrides?: GenerationOverrides,
+    options?: ChatGenerationRequestOptions,
   ) =>
     streamRequest(
       `${chatPath(characterName, chatId)}/continue`,
       config,
-      presetType,
-      presetName,
-      signal,
-      genOverrides,
+      options,
     ),
   delete: (characterName: string, chatId: string) =>
     request<{ success: boolean }>(chatPath(characterName, chatId), {

@@ -1,4 +1,4 @@
-import { api, type CharacterDetail, type CharacterIndex, type ChatLine, type ExtensionDiscovery, type ExtensionManifest, type ExtensionSettings, type StWorldInfoSettings, type WorldBook } from '@/lib/api'
+import { api, type CharacterDetail, type CharacterIndex, type ChatLine, type ExtensionDiscovery, type ExtensionManifest, type ExtensionSettings, type StCompatExtensionPrompt, type StWorldInfoSettings, type WorldBook } from '@/lib/api'
 import { ensureStCompatDomAnchors, syncStCompatDomState, syncStCompatWorldSelects } from '@/lib/st-compat-dom'
 import type { Character, ChatMessage } from '@/types'
 import * as Popper from '@popperjs/core'
@@ -74,6 +74,10 @@ type TavernHelperGenerationRequest = {
 }
 type TavernHelperGenerationEntry = {
   controller: AbortController
+}
+type WorldInfoForceActivationBridgeEntry = Record<string, unknown> & {
+  world: string
+  uid: number
 }
 type CompatChatMessage = ChatLine & {
   variables?: unknown
@@ -185,6 +189,7 @@ interface StHostApi {
   saveWorldInfo: typeof saveWorldInfo
   updateWorldInfoList: typeof updateWorldInfoList
   initialize: typeof initializeStExtensionHost
+  runGenerationInterceptors: typeof runGenerationInterceptors
   ModuleWorkerWrapper: typeof SimpleMutex
   registerMacro: typeof registerMacro
   unregisterMacro: typeof unregisterMacro
@@ -222,6 +227,7 @@ interface StHostApi {
   saveSettingsDebounced: typeof saveSettingsDebounced
   setExtensionPrompt: typeof setExtensionPrompt
   getExtensionPromptByName: typeof getExtensionPromptByName
+  getExtensionPromptsSnapshot: typeof getExtensionPromptsSnapshot
   getGlobalVariable: typeof getGlobalVariable
   setGlobalVariable: typeof setGlobalVariable
   getLocalVariable: typeof getLocalVariable
@@ -410,6 +416,17 @@ export const event_types = {
   ITEMIZED_PROMPTS_DELETED: 'itemized_prompts_deleted',
 } as const
 
+const activeRenderEventKeys = new Set<string>()
+
+function getActiveRenderEventKey(event: string, messageId: unknown): string | null {
+  if (event !== event_types.USER_MESSAGE_RENDERED && event !== event_types.CHARACTER_MESSAGE_RENDERED) {
+    return null
+  }
+  const index = Number(messageId)
+  if (!Number.isInteger(index) || index < 0) return null
+  return `${event}:${index}`
+}
+
 export class StEventEmitter {
   private readonly events = new Map<string, Listener[]>()
   private readonly autoFireLastArgs = new Map<string, unknown[]>()
@@ -482,17 +499,23 @@ export class StEventEmitter {
   }
 
   async emit(event: string, ...args: unknown[]): Promise<void> {
+    const renderEventKey = getActiveRenderEventKey(event, args[0])
+    if (renderEventKey) activeRenderEventKeys.add(renderEventKey)
     const listeners = [...(this.events.get(event) ?? [])]
-    for (const listener of listeners) {
-      try {
-        await listener(...args)
-      } catch (error) {
-        console.error('[ST Compat] Event listener failed', event, error)
+    try {
+      for (const listener of listeners) {
+        try {
+          await listener(...args)
+        } catch (error) {
+          console.error('[ST Compat] Event listener failed', event, error)
+        }
       }
-    }
 
-    if (this.autoFireAfterEmit.has(event)) {
-      this.autoFireLastArgs.set(event, args)
+      if (this.autoFireAfterEmit.has(event)) {
+        this.autoFireLastArgs.set(event, args)
+      }
+    } finally {
+      if (renderEventKey) activeRenderEventKeys.delete(renderEventKey)
     }
   }
 
@@ -557,6 +580,7 @@ let initializePromise: Promise<void> | null = null
 let currentCharacterIndex = -1
 let compatIsSendPress = false
 let compatGenerationStateHooksInstalled = false
+let compatWorldInfoForceActivationHookInstalled = false
 let contextState: StHostContextState = {
   activeCharacter: null,
   activeChatId: null,
@@ -1044,8 +1068,10 @@ export function getContext(): Record<string, unknown> {
     chat,
     characters,
     groups: [],
-    name1: 'You',
-    name2: contextState.activeCharacter?.name ?? '',
+    name1: getCompatUserName(),
+    name2: getCompatCharacterName(),
+    userName: getCompatUserName(),
+    user_name: getCompatUserName(),
     characterId: currentCharacterIndex,
     this_chid: currentCharacterIndex,
     get is_send_press() {
@@ -1703,8 +1729,18 @@ export function updateMessageBlock(
   if (options.rerenderMessage !== false) {
     renderCompatMessageBlock(index, chat[index])
   }
-  void emitMessageRendered(index, chat[index])
-  recordCompatDiagnostic('updateMessageBlock', 'partial', 'Updated the ST compatibility chat mirror and emitted render events without writing native chat storage.')
+  const renderEvent = chat[index].is_user ? event_types.USER_MESSAGE_RENDERED : event_types.CHARACTER_MESSAGE_RENDERED
+  const isRenderEventActive = activeRenderEventKeys.has(`${renderEvent}:${index}`)
+  if (!isRenderEventActive) {
+    void emitMessageRendered(index, chat[index])
+  }
+  recordCompatDiagnostic(
+    'updateMessageBlock',
+    'partial',
+    isRenderEventActive
+      ? 'Updated the ST compatibility chat mirror without re-emitting the active render event or writing native chat storage.'
+      : 'Updated the ST compatibility chat mirror and emitted render events without writing native chat storage.',
+  )
 }
 
 export async function printMessages(): Promise<void> {
@@ -1876,6 +1912,12 @@ function normalizeCompatMessageMedia(message: unknown): CompatMessageMedia {
     hideMessageText: media.length > 0 && extra.inline_image === false,
     skipped,
   }
+}
+
+function hasCompatMessageMediaPayload(message: unknown): boolean {
+  const extra = asRecord(asRecord(message).extra)
+  return ['media', 'image', 'video', 'audio', 'files', 'file']
+    .some(key => toCompatArray(extra[key]).length > 0)
 }
 
 function normalizeCompatMediaAttachment(item: unknown, forcedType?: CompatMediaType): CompatMediaAttachment | null {
@@ -2166,6 +2208,36 @@ export function getExtensionPromptByName(name: string): ExtensionPrompt | undefi
   return extension_prompts[name]
 }
 
+function finiteNumber(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = Number(value)
+    if (Number.isFinite(parsed)) return parsed
+  }
+  return undefined
+}
+
+export function getExtensionPromptsSnapshot(): StCompatExtensionPrompt[] {
+  return Object.entries(extension_prompts).flatMap(([key, prompt]) => {
+    if (!key || typeof prompt.value !== 'string' || !prompt.value) return []
+
+    const snapshot: StCompatExtensionPrompt = {
+      key,
+      value: prompt.value,
+    }
+    const position = finiteNumber(prompt.position)
+    const depth = finiteNumber(prompt.depth)
+    const role = finiteNumber(prompt.role)
+
+    if (position !== undefined) snapshot.position = position
+    if (depth !== undefined) snapshot.depth = depth
+    if (prompt.scan === true) snapshot.scan = true
+    if (role !== undefined) snapshot.role = role
+
+    return [snapshot]
+  })
+}
+
 export function registerMacro(name: string, handler: unknown): void {
   if (!name) return
   macroRegistry.set(name, handler)
@@ -2181,6 +2253,51 @@ export function getExtensionManifest(name: string): ExtensionManifest | null {
   )
   if (!found) return null
   return structuredClone(manifests[found])
+}
+
+export async function runGenerationInterceptors(chatInput: unknown[] = chat, contextSize = 0, type = 'normal'): Promise<boolean> {
+  let aborted = false
+  let exitImmediately = false
+  const abort = (immediately?: boolean): void => {
+    aborted = true
+    if (immediately) exitImmediately = true
+  }
+
+  const entries = Object.entries(manifests)
+    .filter(([name, manifest]) =>
+      activeExtensions.has(name)
+      && !isExtensionDisabled(name)
+      && typeof manifest.generate_interceptor === 'string'
+      && manifest.generate_interceptor.trim(),
+    )
+    .sort(([, a], [, b]) => getLoadingOrder(a) - getLoadingOrder(b) || getDisplayName(a).localeCompare(getDisplayName(b)))
+
+  for (const [name, manifest] of entries) {
+    const interceptorKey = manifest.generate_interceptor?.trim()
+    if (!interceptorKey) continue
+
+    const interceptor = (globalThis as Record<string, unknown>)[interceptorKey]
+    if (typeof interceptor !== 'function') {
+      recordCompatDiagnostic('runGenerationInterceptors', 'stub', `Generation interceptor "${interceptorKey}" for "${name}" was not registered on globalThis.`)
+      continue
+    }
+
+    try {
+      await (interceptor as (chat: unknown[], contextSize: number, abort: (immediately?: boolean) => void, type: string) => unknown)(
+        chatInput,
+        contextSize,
+        abort,
+        type,
+      )
+    } catch (error) {
+      recordCompatDiagnostic('runGenerationInterceptors', 'stub', `Generation interceptor "${interceptorKey}" for "${name}" failed; generation continues unless another interceptor aborts.`)
+      console.error('[ST Compat] Failed running generation interceptor', name, error)
+    }
+
+    if (exitImmediately) break
+  }
+
+  return aborted
 }
 
 export function renderExtensionTemplate(
@@ -2238,6 +2355,7 @@ class SimpleMutex {
 
 const reloadChatMutex = new SimpleMutex()
 installCompatGenerationStateHooks()
+installWorldInfoForceActivationHook()
 
 async function initializeStExtensionHostOnce(): Promise<void> {
   publishGlobals()
@@ -2305,9 +2423,70 @@ async function activateExtensions(): Promise<void> {
       await addExtensionStyle(name, manifest)
       await addExtensionScript(name, manifest)
       activeExtensions.add(name)
+      await callExtensionHook(name, 'activate')
     } catch (error) {
       extensionLoadErrors.add(name)
       console.error('[ST Compat] Could not activate extension', name, error)
+    }
+  }
+}
+
+async function callExtensionHook(
+  name: string,
+  hookName: 'install' | 'update' | 'delete' | 'clean' | 'enable' | 'disable' | 'activate',
+): Promise<void> {
+  const manifest = manifests[name]
+  if (!manifest || !manifest.js || typeof manifest.js !== 'string') return
+
+  const hookFunctionName = getExtensionHookFunctionName(manifest, hookName)
+  if (!hookFunctionName) return
+
+  const moduleUrl = `/scripts/extensions/${encodeExtensionPath(name)}/${encodeExtensionPath(manifest.js)}`
+
+  try {
+    const module = await import(/* @vite-ignore */ moduleUrl) as Record<string, unknown>
+    const hookFunction = module[hookFunctionName]
+    if (typeof hookFunction !== 'function') {
+      recordCompatDiagnostic('callExtensionHook', 'stub', `Extension "${name}" hook "${hookName}" references "${hookFunctionName}", but the entry module does not export that function.`)
+      return
+    }
+
+    const result = hookFunction()
+    const timedOut = await promiseWithTimeout(Promise.resolve(result), 5000)
+    if (timedOut) {
+      recordCompatDiagnostic('callExtensionHook', 'partial', `Extension "${name}" hook "${hookName}" timed out after 5000ms.`)
+    }
+  } catch (error) {
+    recordCompatDiagnostic('callExtensionHook', 'stub', `Extension "${name}" hook "${hookName}" failed; extension activation continues.`)
+    console.error('[ST Compat] Failed calling extension hook', name, hookName, error)
+  }
+}
+
+function getExtensionHookFunctionName(
+  manifest: ExtensionManifest,
+  hookName: string,
+): string | null {
+  const hooks = isPlainRecord(manifest.hooks) ? manifest.hooks : null
+  const hookFunctionName = hooks?.[hookName]
+  return typeof hookFunctionName === 'string' && hookFunctionName.trim()
+    ? hookFunctionName.trim()
+    : null
+}
+
+async function promiseWithTimeout(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> {
+  let timeoutId: number | null = null
+  try {
+    const timeout = new Promise<'timeout'>(resolve => {
+      timeoutId = window.setTimeout(() => resolve('timeout'), timeoutMs)
+    })
+    const result = await Promise.race([
+      promise.then(() => 'ok' as const),
+      timeout,
+    ])
+    return result === 'timeout'
+  } finally {
+    if (timeoutId !== null) {
+      window.clearTimeout(timeoutId)
     }
   }
 }
@@ -4174,6 +4353,7 @@ const stHost: StHostApi = {
   saveWorldInfo,
   updateWorldInfoList,
   initialize: initializeStExtensionHost,
+  runGenerationInterceptors,
   ModuleWorkerWrapper: SimpleMutex,
   registerMacro,
   unregisterMacro,
@@ -4211,6 +4391,7 @@ const stHost: StHostApi = {
   saveSettingsDebounced,
   setExtensionPrompt,
   getExtensionPromptByName,
+  getExtensionPromptsSnapshot,
   getGlobalVariable,
   setGlobalVariable,
   getLocalVariable,
@@ -4235,6 +4416,7 @@ function publishGlobals(): void {
   installGlobalLibraries()
   ensureStCompatDomAnchors()
   syncCompatDomState()
+  chat.forEach((message, index) => renderCompatMessageBlock(index, message))
 
   stHost.extensionNames = extensionNames
   stHost.extensionTypes = extensionTypes
@@ -4296,6 +4478,149 @@ function syncCompatDomState(): void {
     selectedWorldInfo: selected_world_info,
     worldNames: world_names,
   })
+}
+
+function installWorldInfoForceActivationHook(): void {
+  if (compatWorldInfoForceActivationHookInstalled) return
+  compatWorldInfoForceActivationHookInstalled = true
+  eventSource.on(event_types.WORLDINFO_FORCE_ACTIVATE, handleWorldInfoForceActivate)
+}
+
+function handleWorldInfoForceActivate(entries: unknown): void {
+  const { activations, invalidCount } = normalizeWorldInfoForceActivations(entries)
+  if (!activations.length) {
+    recordCompatDiagnostic(
+      'WORLDINFO_FORCE_ACTIVATE',
+      'blocked',
+      invalidCount > 0
+        ? `Ignored ${invalidCount} invalid external world-info activation(s).`
+        : 'Ignored WORLDINFO_FORCE_ACTIVATE because no activation entries were provided.',
+    )
+    return
+  }
+
+  const worldInfoBuffer = ensureRecord(chat_metadata, 'worldInfoBuffer')
+  const externalActivations = ensureRecord(worldInfoBuffer, 'externalActivations')
+  for (const activation of activations) {
+    externalActivations[`${activation.world}.${activation.uid}`] = activation
+  }
+
+  saveMetadataDebounced()
+  recordCompatDiagnostic(
+    'WORLDINFO_FORCE_ACTIVATE',
+    'partial',
+    `Queued ${activations.length} external world-info activation(s) for the next CraftTalker world-info scan${invalidCount > 0 ? ` and ignored ${invalidCount} invalid entr${invalidCount === 1 ? 'y' : 'ies'}` : ''}.`,
+  )
+}
+
+function normalizeWorldInfoForceActivations(entries: unknown): {
+  activations: WorldInfoForceActivationBridgeEntry[]
+  invalidCount: number
+} {
+  const activations: WorldInfoForceActivationBridgeEntry[] = []
+  let invalidCount = 0
+
+  for (const candidate of collectWorldInfoForceActivationCandidates(entries)) {
+    const activation = normalizeWorldInfoForceActivation(candidate)
+    if (activation) activations.push(activation)
+    else invalidCount += 1
+  }
+
+  return { activations, invalidCount }
+}
+
+function collectWorldInfoForceActivationCandidates(entries: unknown): unknown[] {
+  if (!entries) return []
+  if (Array.isArray(entries)) return entries
+  if (entries instanceof Map) return [...entries.values()]
+  if (entries instanceof Set) return [...entries.values()]
+  if (typeof entries !== 'string' && typeof (entries as Iterable<unknown>)[Symbol.iterator] === 'function') {
+    try {
+      return [...(entries as Iterable<unknown>)]
+    } catch {
+      return []
+    }
+  }
+  if (!isPlainRecord(entries)) return []
+  if (Object.hasOwn(entries, 'world') || Object.hasOwn(entries, 'uid')) return [entries]
+  return Object.values(entries)
+}
+
+function normalizeWorldInfoForceActivation(candidate: unknown): WorldInfoForceActivationBridgeEntry | null {
+  if (!isPlainRecord(candidate)) return null
+
+  const world = worldInfoActivationString(candidate.world)
+  const uid = worldInfoActivationNumber(candidate.uid)
+  if (!world || uid === undefined || uid < 0) return null
+
+  const activation = {
+    world,
+    uid: Math.floor(uid),
+  } as WorldInfoForceActivationBridgeEntry
+
+  assignWorldInfoActivationContent(activation, candidate.content)
+  assignNormalizedWorldInfoActivationNumber(activation, 'position', candidate.position)
+  assignNormalizedWorldInfoActivationNumber(activation, 'depth', candidate.depth)
+  assignNormalizedWorldInfoActivationNumber(activation, 'insertion_order', candidate.insertion_order ?? candidate.insertionOrder)
+  assignNormalizedWorldInfoActivationNumber(activation, 'role', candidate.role)
+  assignNormalizedWorldInfoActivationNumber(activation, 'score', candidate.score)
+  assignNormalizedWorldInfoActivationString(activation, 'source', candidate.source)
+  assignNormalizedWorldInfoActivationScalar(activation, 'hash', candidate.hash)
+
+  return activation
+}
+
+function assignWorldInfoActivationContent(
+  target: WorldInfoForceActivationBridgeEntry,
+  value: unknown,
+): void {
+  if (typeof value === 'string') target.content = value
+}
+
+function assignNormalizedWorldInfoActivationString(
+  target: Record<string, unknown>,
+  key: 'source',
+  value: unknown,
+): void {
+  const normalized = worldInfoActivationString(value)
+  if (normalized) target[key] = normalized
+}
+
+function assignNormalizedWorldInfoActivationNumber(
+  target: Record<string, unknown>,
+  key: 'position' | 'depth' | 'insertion_order' | 'role' | 'score',
+  value: unknown,
+): void {
+  const numeric = worldInfoActivationNumber(value)
+  if (numeric === undefined) return
+  target[key] = key === 'score' ? numeric : Math.floor(numeric)
+}
+
+function assignNormalizedWorldInfoActivationScalar(
+  target: Record<string, unknown>,
+  key: 'hash',
+  value: unknown,
+): void {
+  if (typeof value === 'string' && value.trim()) {
+    target[key] = value.trim()
+    return
+  }
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    target[key] = value
+  }
+}
+
+function worldInfoActivationString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined
+}
+
+function worldInfoActivationNumber(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = Number(value)
+    if (Number.isFinite(parsed)) return parsed
+  }
+  return undefined
 }
 
 function installCompatGenerationStateHooks(): void {
@@ -4372,6 +4697,9 @@ function renderCompatMessageBlock(index: number, message: CompatChatMessage): vo
       Boolean(message.is_user),
       index,
     )
+  }
+  if (hasCompatMessageMediaPayload(message)) {
+    appendMediaToMessage(message, element)
   }
 }
 

@@ -1,5 +1,5 @@
 import { request } from '@/lib/api-client'
-import type { GenerationRunFilters, GenerationRunRecord } from '@/lib/api-types'
+import type { GenerationRunFilters, GenerationRunRecord, StGenerationFinalization } from '@/lib/api-types'
 
 export const runsApi = {
   list: (filters?: GenerationRunFilters) => {
@@ -19,5 +19,10 @@ export const runsApi = {
   discard: (runId: string) =>
     request<GenerationRunRecord>(`/runs/${encodeURIComponent(runId)}/discard`, {
       method: 'POST',
+    }),
+  finalizeStOutput: (runId: string, content: string) =>
+    request<StGenerationFinalization>(`/runs/${encodeURIComponent(runId)}/finalize-st-output`, {
+      method: 'POST',
+      body: JSON.stringify({ content }),
     }),
 }

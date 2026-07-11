@@ -31,6 +31,7 @@ interface TestGlobal {
       writeExtensionField?: (...args: unknown[]) => unknown
       writeExtensionFieldBulk?: (...args: unknown[]) => unknown
       updateContext?: (...args: unknown[]) => unknown
+      runGenerationInterceptors?: (...args: unknown[]) => Promise<boolean>
       registerMacro?: (...args: unknown[]) => unknown
       unregisterMacro?: (...args: unknown[]) => unknown
       registerMacroLike?: (...args: unknown[]) => unknown
@@ -1038,6 +1039,33 @@ describe('ST public compatibility shims', () => {
     expect(writeExtensionFieldBulk).toHaveBeenCalledWith(0, { regex_scripts: [] })
   })
 
+  it('forwards generation interceptors through the public extensions shim', async () => {
+    const runGenerationInterceptors = vi.fn().mockResolvedValue(true)
+    testGlobal().CraftTalker = {
+      stHost: {
+        getRequestHeaders: () => ({ 'Content-Type': 'application/json' }),
+        extension_settings: {},
+        extensionNames: [],
+        extensionTypes: {},
+        getContext: () => ({}),
+        getExtensionManifest: () => null,
+        ModuleWorkerWrapper: class {},
+        renderExtensionTemplate: () => '',
+        renderExtensionTemplateAsync: async () => '',
+        saveMetadataDebounced: vi.fn(),
+        runGenerationInterceptors,
+      } as never,
+    }
+
+    const extensionsShim = await importExtensionsShim()
+    const chat = [{ mes: 'hello' }]
+
+    await expect(extensionsShim.runGenerationInterceptors(chat, 2048, 'normal')).resolves.toBe(true)
+    await expect(extensionsShim.default.runGenerationInterceptors(chat, 1024, 'quiet')).resolves.toBe(true)
+    expect(runGenerationInterceptors).toHaveBeenNthCalledWith(1, chat, 2048, 'normal')
+    expect(runGenerationInterceptors).toHaveBeenNthCalledWith(2, chat, 1024, 'quiet')
+  })
+
   it('routes ChatCompletionService non-streaming requests through the ST backend bridge', async () => {
     testGlobal().CraftTalker = {
       stHost: {
@@ -1159,7 +1187,84 @@ describe('ST public compatibility shims', () => {
   it('routes public world info prompt scans through the read-only ST endpoint', async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
       matchedEntries: [{ content: 'Dragon lore' }],
+      worldInfoString: 'Dragon lore',
       worldInfoBefore: 'Dragon lore',
+      worldInfoAfter: '',
+      worldInfoExamples: [],
+      worldInfoDepth: [],
+      anBefore: [],
+      anAfter: [],
+      outletEntries: {},
+      allActivatedEntries: [],
+      overflowed: false,
+      timedEffects: {},
+      timedEffectsChanged: false,
+      scanEvents: [],
+      vectorizedSkipped: [],
+      vectorizedActivated: [],
+    }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }))
+    const emit = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    testGlobal().CraftTalker = {
+      stHost: {
+        getRequestHeaders: () => ({ 'Content-Type': 'application/json', 'X-Test': 'world-scan' }),
+        event_types: { WORLD_INFO_ACTIVATED: 'world_info_activated' },
+        eventSource: { on: vi.fn(), emit },
+        world_names: ['GlobalLore'],
+        selected_world_info: ['GlobalLore'],
+        world_info: { globalSelect: ['GlobalLore'], charLore: [], entries: {} },
+        world_info_settings: {},
+        getContext: () => ({
+          characterId: 0,
+          chatId: 'chat-1',
+          name1: 'Riley',
+          oai_settings: { model: 'gpt-4o-mini' },
+          characters: [{ avatar: 'Alice.png', file_name: 'Alice', name: 'Alice' }],
+          tagMap: { 'Alice.png': ['tag-hero'] },
+          tags: [{ id: 'tag-hero', name: 'Hero' }],
+        }),
+        loadWorldInfo: async () => null,
+        updateWorldInfoList: async () => {},
+      },
+    }
+
+    const worldInfoShim = await importWorldInfoShim()
+    const result = await worldInfoShim.getWorldInfoPrompt([{ name: 'You', mes: 'dragon' }], 8192, true, { trigger: 'normal' })
+    const aliasResult = await worldInfoShim.checkWorldInfo([{ name: 'You', mes: 'dragon' }], 8192, true, { trigger: 'normal' })
+
+    expect(result.worldInfoBefore).toBe('Dragon lore')
+    expect(result.worldInfoString).toBe('Dragon lore')
+    expect(aliasResult.allActivatedEntries).toEqual([])
+    expect(aliasResult.EMEntries).toEqual([])
+    expect(aliasResult.WIDepthEntries).toEqual([])
+    expect(fetchMock).toHaveBeenCalledWith('/api/worldinfo/check', expect.objectContaining({
+      method: 'POST',
+      headers: expect.objectContaining({ 'X-Test': 'world-scan' }),
+    }))
+    const body = JSON.parse(fetchMock.mock.calls[0]?.[1]?.body as string)
+    expect(body).toMatchObject({
+      maxContext: 8192,
+      isDryRun: true,
+      characterName: 'Alice',
+      chatId: 'chat-1',
+      userName: 'Riley',
+      model: 'gpt-4o-mini',
+      globalScanData: { trigger: 'normal' },
+      characterTags: ['tag-hero'],
+      characterTagNames: ['Hero'],
+      chat: [{ name: 'You', content: 'dragon' }],
+    })
+    expect(emit).not.toHaveBeenCalled()
+  })
+
+  it('derives world info prompt character tags from ST charactersData contexts', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      matchedEntries: [],
+      worldInfoString: '',
+      worldInfoBefore: '',
       worldInfoAfter: '',
       worldInfoExamples: [],
       worldInfoDepth: [],
@@ -1180,15 +1285,19 @@ describe('ST public compatibility shims', () => {
     vi.stubGlobal('fetch', fetchMock)
     testGlobal().CraftTalker = {
       stHost: {
-        getRequestHeaders: () => ({ 'Content-Type': 'application/json', 'X-Test': 'world-scan' }),
+        getRequestHeaders: () => ({ 'Content-Type': 'application/json' }),
+        event_types: {},
+        eventSource: { on: vi.fn(), emit: vi.fn() },
         world_names: ['GlobalLore'],
         selected_world_info: ['GlobalLore'],
         world_info: { globalSelect: ['GlobalLore'], charLore: [], entries: {} },
         world_info_settings: {},
         getContext: () => ({
-          characterId: 0,
-          chatId: 'chat-1',
-          characters: [{ file_name: 'Alice', name: 'Alice' }],
+          this_chid: 0,
+          chatId: 'chat-characters-data',
+          charactersData: [{ avatar: 'Alice.png', file_name: 'Alice', name: 'Alice' }],
+          tagMap: { 'Alice.png': ['tag-hero'] },
+          tags: [{ id: 'tag-hero', name: 'Hero' }],
         }),
         loadWorldInfo: async () => null,
         updateWorldInfoList: async () => {},
@@ -1196,26 +1305,206 @@ describe('ST public compatibility shims', () => {
     }
 
     const worldInfoShim = await importWorldInfoShim()
-    const result = await worldInfoShim.getWorldInfoPrompt([{ name: 'You', mes: 'dragon' }], 8192, true, { trigger: 'normal' })
-    const aliasResult = await worldInfoShim.checkWorldInfo([{ name: 'You', mes: 'dragon' }], 8192, true, { trigger: 'normal' })
+    await worldInfoShim.getWorldInfoPrompt(['dragon'], 4096, true)
 
-    expect(result.worldInfoBefore).toBe('Dragon lore')
-    expect(aliasResult.allActivatedEntries).toEqual([])
-    expect(aliasResult.EMEntries).toEqual([])
-    expect(aliasResult.WIDepthEntries).toEqual([])
-    expect(fetchMock).toHaveBeenCalledWith('/api/worldinfo/check', expect.objectContaining({
-      method: 'POST',
-      headers: expect.objectContaining({ 'X-Test': 'world-scan' }),
-    }))
     const body = JSON.parse(fetchMock.mock.calls[0]?.[1]?.body as string)
     expect(body).toMatchObject({
-      maxContext: 8192,
-      isDryRun: true,
       characterName: 'Alice',
-      chatId: 'chat-1',
-      globalScanData: { trigger: 'normal' },
-      chat: [{ name: 'You', content: 'dragon' }],
+      characterTags: ['tag-hero'],
+      characterTagNames: ['Hero'],
+      chatId: 'chat-characters-data',
     })
+  })
+
+  it('emits ST world info activation events for non-dry-run public prompt scans', async () => {
+    const activatedEntry = { world: 'GlobalLore', uid: 1, content: 'Dragon lore' }
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      matchedEntries: [{ content: 'Dragon lore' }],
+      worldInfoString: 'Dragon lore',
+      worldInfoBefore: 'Dragon lore',
+      worldInfoAfter: '',
+      worldInfoExamples: [],
+      worldInfoDepth: [],
+      anBefore: [],
+      anAfter: [],
+      outletEntries: {},
+      allActivatedEntries: [activatedEntry],
+      overflowed: false,
+      timedEffects: {},
+      timedEffectsChanged: false,
+      scanEvents: [],
+      vectorizedSkipped: [],
+      vectorizedActivated: [],
+    }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }))
+    const emit = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    testGlobal().CraftTalker = {
+      stHost: {
+        getRequestHeaders: () => ({ 'Content-Type': 'application/json' }),
+        event_types: { WORLD_INFO_ACTIVATED: 'world_info_activated' },
+        eventSource: { on: vi.fn(), emit },
+        world_names: ['GlobalLore'],
+        selected_world_info: ['GlobalLore'],
+        world_info: { globalSelect: ['GlobalLore'], charLore: [], entries: {} },
+        world_info_settings: {},
+        getContext: () => ({ this_chid: -1, name1: 'Riley' }),
+        loadWorldInfo: async () => null,
+        updateWorldInfoList: async () => {},
+      },
+    }
+
+    const worldInfoShim = await importWorldInfoShim()
+    await worldInfoShim.getWorldInfoPrompt(['dragon'], 4096, false, { trigger: 'normal' })
+
+    expect(emit).toHaveBeenCalledWith('world_info_activated', [activatedEntry])
+  })
+
+  it('emits ST-shaped world info scan-done events from public prompt scan metadata', async () => {
+    const activatedEntry = { world: 'GlobalLore', uid: 1, content: 'Dragon lore' }
+    const candidateEntry = { world: 'GlobalLore', uid: 2, content: 'Candidate lore' }
+    const sortedEntries = [
+      { world: 'GlobalLore', uid: 1, hash: 123, content: 'Dragon lore', order: 100 },
+      { world: 'GlobalLore', uid: 2, hash: 456, content: 'Candidate lore', order: 90 },
+    ]
+    const sourceEntries = {
+      globalLore: [sortedEntries[0]],
+      characterLore: [sortedEntries[1]],
+      chatLore: [],
+      personaLore: [],
+    }
+    const timedEffects = {
+      sticky: { 'GlobalLore.1': { hash: 123, start: 2, end: 4, protected: false } },
+      cooldown: {},
+    }
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      matchedEntries: [{ content: 'Dragon lore' }],
+      worldInfoString: 'Dragon lore',
+      worldInfoBefore: 'Dragon lore',
+      worldInfoAfter: '',
+      worldInfoExamples: [],
+      worldInfoDepth: [],
+      anBefore: [],
+      anAfter: [],
+      outletEntries: {},
+      allActivatedEntries: [activatedEntry],
+      overflowed: true,
+      timedEffects,
+      timedEffectsChanged: true,
+      sortedEntries,
+      sourceEntries,
+      scanEvents: [
+        {
+          type: 'scan_done',
+          loopCount: 1,
+          currentState: 'initial',
+          nextState: 'recursion',
+          activatedCount: 1,
+          overflowed: false,
+          budgetCurrent: 512,
+          recursionDelayAvailableLevels: [2],
+          recursionDelayCurrentLevel: 1,
+          newAllEntries: [candidateEntry, activatedEntry],
+          newSuccessfulEntries: [activatedEntry],
+          timedEffectActiveEntryIds: {
+            sticky: ['GlobalLore.1'],
+            cooldown: [],
+            delay: ['GlobalLore.2'],
+          },
+        },
+        { type: 'vectorized_skipped', world: 'GlobalLore', uid: 2 },
+        {
+          type: 'scan_done',
+          loopCount: 2,
+          currentState: 'recursion',
+          nextState: null,
+          activatedCount: 1,
+          overflowed: true,
+          budgetCurrent: 256,
+          recursionDelayAvailableLevels: [],
+          recursionDelayCurrentLevel: 2,
+        },
+      ],
+      vectorizedSkipped: [],
+      vectorizedActivated: [],
+    }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }))
+    const emit = vi.fn()
+    const diagnostics: Array<{ id: string; status: string; note: string }> = []
+    vi.stubGlobal('fetch', fetchMock)
+    testGlobal().CraftTalker = {
+      stHost: {
+        getRequestHeaders: () => ({ 'Content-Type': 'application/json' }),
+        event_types: {
+          WORLDINFO_SCAN_DONE: 'worldinfo_scan_done',
+          WORLD_INFO_ACTIVATED: 'world_info_activated',
+        },
+        eventSource: { on: vi.fn(), emit },
+        world_names: ['GlobalLore'],
+        selected_world_info: ['GlobalLore'],
+        world_info: { globalSelect: ['GlobalLore'], charLore: [], entries: {} },
+        world_info_settings: {},
+        getContext: () => ({ this_chid: -1, name1: 'Riley' }),
+        loadWorldInfo: async () => null,
+        updateWorldInfoList: async () => {},
+        recordCompatDiagnostic: (id, status, note) => diagnostics.push({ id, status, note }),
+      },
+    }
+
+    const worldInfoShim = await importWorldInfoShim()
+    await worldInfoShim.getWorldInfoPrompt(['dragon'], 4096, false, { trigger: 'normal' })
+
+    expect(emit).toHaveBeenNthCalledWith(1, 'worldinfo_entries_loaded', sourceEntries)
+    expect(emit).toHaveBeenNthCalledWith(2, 'worldinfo_scan_done', expect.objectContaining({
+      state: expect.objectContaining({
+        current: worldInfoShim.scan_state.INITIAL,
+        next: worldInfoShim.scan_state.RECURSION,
+        loopCount: 1,
+        currentState: 'initial',
+        nextState: 'recursion',
+      }),
+      budget: { current: 512, overflowed: false },
+      recursionDelay: { availableLevels: [2], currentLevel: 1 },
+    }))
+    const firstScanPayload = emit.mock.calls[1]?.[1]
+    expect(firstScanPayload.activated.entries).toBeInstanceOf(Map)
+    expect(firstScanPayload.activated.entries.get('GlobalLore.1')).toEqual(activatedEntry)
+    expect(firstScanPayload.activated.text).toBe('Dragon lore')
+    expect(firstScanPayload.new).toEqual({
+      all: [candidateEntry, activatedEntry],
+      successful: [activatedEntry],
+    })
+    expect(firstScanPayload.sortedEntries).toEqual(sortedEntries)
+    expect(firstScanPayload.timedEffects.metadata).toEqual(timedEffects)
+    expect(firstScanPayload.timedEffects.isValidEffectType('sticky')).toBe(true)
+    expect(firstScanPayload.timedEffects.isValidEffectType('delay')).toBe(true)
+    expect(firstScanPayload.timedEffects.isEffectActive('sticky', { world: 'GlobalLore', uid: 1 })).toBe(true)
+    expect(firstScanPayload.timedEffects.isEffectActive('cooldown', { world: 'GlobalLore', uid: 1 })).toBe(false)
+    expect(firstScanPayload.timedEffects.getEffectMetadata('sticky', { world: 'GlobalLore', uid: 1 })).toEqual(timedEffects.sticky['GlobalLore.1'])
+    expect(firstScanPayload.timedEffects.isEffectActive('sticky', { hash: 123 })).toBe(true)
+    expect(firstScanPayload.timedEffects.getEffectMetadata('sticky', { hash: 123 })).toEqual(timedEffects.sticky['GlobalLore.1'])
+    expect(firstScanPayload.timedEffects.isEffectActive('delay', { world: 'GlobalLore', uid: 2 })).toBe(true)
+    expect(firstScanPayload.timedEffects.isEffectActive('delay', { hash: 456 })).toBe(true)
+    expect(firstScanPayload.timedEffects.getEffectMetadata('delay', { world: 'GlobalLore', uid: 2 })).toBeUndefined()
+    firstScanPayload.timedEffects.setTimedEffect('sticky', { world: 'GlobalLore', uid: 1 }, false)
+    expect(emit).toHaveBeenNthCalledWith(3, 'worldinfo_scan_done', expect.objectContaining({
+      state: expect.objectContaining({
+        current: worldInfoShim.scan_state.RECURSION,
+        next: worldInfoShim.scan_state.NONE,
+        loopCount: 2,
+      }),
+      budget: { current: 256, overflowed: true },
+    }))
+    expect(emit).toHaveBeenNthCalledWith(4, 'world_info_activated', [activatedEntry])
+    expect(diagnostics.map(item => [item.id, item.status])).toEqual([
+      ['WORLDINFO_ENTRIES_LOADED', 'partial'],
+      ['WORLDINFO_SCAN_DONE', 'partial'],
+      ['WORLDINFO_SCAN_DONE.timedEffects.setTimedEffect', 'readonly'],
+    ])
   })
 
   it('matches SillyTavern world info position enum values used by third-party sorters', async () => {
@@ -1244,6 +1533,12 @@ describe('ST public compatibility shims', () => {
       outlet: 7,
     })
     expect(worldInfoShim.wi_anchor_position).toEqual({ before: 0, after: 1 })
+    expect(worldInfoShim.scan_state).toEqual({
+      NONE: 0,
+      INITIAL: 1,
+      RECURSION: 2,
+      MIN_ACTIVATIONS: 3,
+    })
   })
 
   it('routes public world info saves through the permissioned host bridge', async () => {

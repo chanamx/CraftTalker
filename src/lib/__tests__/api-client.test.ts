@@ -77,6 +77,19 @@ describe('api-client', () => {
     expect(onComplete).toHaveBeenCalledOnce()
   })
 
+  it('passes terminal SSE metadata to completion callbacks', async () => {
+    const onChunk = vi.fn()
+    const onComplete = vi.fn()
+    const response = new Response(streamFromText(
+      'data: {"content":"Hello"}\n\ndata: {"done":true,"runId":"run-123","committedLineIndex":3}\n\ndata: [DONE]\n\n'
+    ))
+
+    await consumeSSEStream(response, { onChunk, onComplete })
+
+    expect(onChunk).toHaveBeenCalledWith('Hello')
+    expect(onComplete).toHaveBeenCalledWith({ runId: 'run-123', committedLineIndex: 3 })
+  })
+
   it('reports structured SSE errors', async () => {
     const onError = vi.fn()
     const onComplete = vi.fn()

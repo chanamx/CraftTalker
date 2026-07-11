@@ -30,7 +30,10 @@ describe('api facade', () => {
     vi.stubGlobal('fetch', fetchMock)
     const config = { apiUrl: '', apiKey: '', model: '', type: 'openai' as const }
 
-    await api.chats.generate('Char Name', 'chat 1.jsonl', config, 'openai', 'default')
+    await api.chats.generate('Char Name', 'chat 1.jsonl', config, {
+      presetType: 'openai',
+      presetName: 'default',
+    })
     await api.chats.regenerate('Char Name', 'chat 1.jsonl', config)
     await api.chats.continue('Char Name', 'chat 1.jsonl', config)
     await api.chats.updateMetadata('Char Name', 'chat 1.jsonl', { variables: { mood: 'bright' } })

@@ -1,4 +1,4 @@
-import type { ApiError, StreamCallbacks } from '@/lib/api-types'
+import type { ApiError, StreamCallbacks, StreamCompleteMetadata } from '@/lib/api-types'
 
 export const API_BASE = '/api'
 
@@ -43,7 +43,7 @@ export function toApiError(value: unknown, fallback: ApiError): ApiError {
   }
 }
 
-function parseStreamPayload(value: unknown): { content?: string; error?: ApiError } {
+function parseStreamPayload(value: unknown): { content?: string; error?: ApiError; complete?: StreamCompleteMetadata } {
   if (!isRecord(value)) return {}
   if (isRecord(value.error) || typeof value.error === 'string') {
     return {
@@ -51,6 +51,18 @@ function parseStreamPayload(value: unknown): { content?: string; error?: ApiErro
         error: typeof value.error === 'string' ? value.error : 'Stream error',
         code: -1,
       }),
+    }
+  }
+  if (value.done === true) {
+    return {
+      complete: {
+        ...(typeof value.runId === 'string' && value.runId.length > 0
+          ? { runId: value.runId }
+          : {}),
+        ...(Number.isInteger(value.committedLineIndex) && Number(value.committedLineIndex) >= 0
+          ? { committedLineIndex: Number(value.committedLineIndex) }
+          : {}),
+      },
     }
   }
   return typeof value.content === 'string' ? { content: value.content } : {}
@@ -85,6 +97,7 @@ export async function consumeSSEStream(
 
   const decoder = new TextDecoder()
   let buffer = ''
+  let completeMetadata: StreamCompleteMetadata = {}
 
   try {
     while (true) {
@@ -101,7 +114,7 @@ export async function consumeSSEStream(
 
         const data = trimmed.slice(6)
         if (data === '[DONE]') {
-          callbacks.onComplete?.()
+          callbacks.onComplete?.(completeMetadata)
           return
         }
 
@@ -114,12 +127,15 @@ export async function consumeSSEStream(
           if (parsed.content) {
             callbacks.onChunk?.(parsed.content)
           }
+          if (parsed.complete) {
+            completeMetadata = { ...completeMetadata, ...parsed.complete }
+          }
         } catch {
           console.error('Failed to parse SSE data:', data)
         }
       }
     }
-    callbacks.onComplete?.()
+    callbacks.onComplete?.(completeMetadata)
   } catch (error) {
     callbacks.onError?.({ error: String(error), code: -1 })
   }
