@@ -264,17 +264,46 @@ export async function sendOpenAIRequest(type = 'normal', messages = [], signal =
   }
   return json
 }
+/**
+ * @typedef {{ signature?: string, toolSignatures: Record<string, string>, reasoning: string }} StreamingSignatureState
+ */
+
+function mergeToolSignatures(state, incoming) {
+  if (!state || typeof state !== 'object' || !incoming || typeof incoming !== 'object' || Array.isArray(incoming)) return
+  const merged = { ...(state.toolSignatures && typeof state.toolSignatures === 'object' ? state.toolSignatures : {}) }
+  for (const [key, value] of Object.entries(incoming)) {
+    if (typeof value === 'string' && value.length > 0) merged[String(key)] = value
+  }
+  state.toolSignatures = merged
+}
+
 export function getStreamingReply(data, state = {}) {
   const choice = Array.isArray(data?.choices) ? data.choices[0] : null
   const delta = choice?.delta ?? {}
   const text = delta.content ?? choice?.message?.content ?? choice?.text ?? data?.content ?? ''
   const reasoning = delta.reasoning ?? choice?.reasoning ?? data?.reasoning ?? ''
-  if (reasoning && state && typeof state === 'object') {
-    state.reasoning = `${state.reasoning ?? ''}${reasoning}`
+  const signature = delta.signature ?? choice?.signature ?? data?.signature
+  if (typeof signature === 'string' && signature.length > 0 && state && typeof state === 'object') state.signature = signature
+
+  const toolSignatures = delta.toolSignatures ?? choice?.toolSignatures ?? data?.toolSignatures
+  mergeToolSignatures(state, toolSignatures)
+
+  const toolCalls = delta.tool_calls ?? choice?.message?.tool_calls
+  if (Array.isArray(toolCalls) && state && typeof state === 'object') {
+    const next = {}
+    for (let index = 0; index < toolCalls.length; index += 1) {
+      const toolCall = toolCalls[index]
+      const toolSignature = toolCall?.signature
+      if (typeof toolSignature !== 'string' || toolSignature.length === 0) continue
+      const key = toolCall?.index ?? toolCall?.id ?? index
+      next[String(key)] = toolSignature
+    }
+    mergeToolSignatures(state, next)
   }
+
+  if (reasoning && state && typeof state === 'object') state.reasoning = `${state.reasoning ?? ''}${reasoning}`
   return String(text ?? '')
 }
-
 export default {
   chat_completion_sources,
   oai_settings,

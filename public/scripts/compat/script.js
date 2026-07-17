@@ -136,6 +136,7 @@ for (const eventName of new Set([
   host.event_types.CHAT_CHANGED,
   host.event_types.CHAT_LOADED,
   host.event_types.APP_READY,
+  host.event_types.PERSONA_CHANGED,
   host.event_types.CHARACTER_PAGE_LOADED,
   host.event_types.CHARACTER_EDITED,
 ].filter(Boolean))) {
@@ -413,7 +414,8 @@ export function countOccurrences(value, search) {
   return String(value ?? '').split(String(search)).length - 1
 }
 export function setUserName(value) {
-  name1 = String(value ?? 'You')
+  const normalized = host.setUserName?.(value)
+  name1 = String(normalized ?? value ?? '') || 'You'
 }
 export function Generate() {
   return Promise.resolve()
@@ -511,6 +513,7 @@ export const animation_duration = 0
 export const system_messages = {}
 export const system_message_types = {}
 export const extension_prompt_types = {
+  NONE: -1,
   IN_PROMPT: 0,
   IN_CHAT: 1,
   BEFORE_PROMPT: 2,

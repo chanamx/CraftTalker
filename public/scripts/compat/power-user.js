@@ -7,7 +7,7 @@ export const persona_description_positions = {
   NONE: 9,
 }
 
-export const power_user = {
+const defaultPowerUser = {
   personas: {},
   persona_descriptions: {},
   default_persona: null,
@@ -21,6 +21,25 @@ export const power_user = {
   custom_stopping_strings: '',
   custom_stopping_strings_macro: false,
   streaming_fps: 30,
+}
+
+const host = globalThis.CraftTalker?.stHost ?? globalThis.SillyTavern
+const extensionSettings = host?.extension_settings
+const storedPowerUser = extensionSettings?.power_user
+const persistedPowerUser = storedPowerUser && typeof storedPowerUser === 'object' && !Array.isArray(storedPowerUser)
+  ? storedPowerUser
+  : {}
+const persistedSnapshot = { ...persistedPowerUser }
+
+export const power_user = Object.assign(persistedPowerUser, defaultPowerUser, persistedSnapshot)
+if (!power_user.personas || typeof power_user.personas !== 'object' || Array.isArray(power_user.personas)) {
+  power_user.personas = {}
+}
+if (!power_user.persona_descriptions || typeof power_user.persona_descriptions !== 'object' || Array.isArray(power_user.persona_descriptions)) {
+  power_user.persona_descriptions = {}
+}
+if (extensionSettings && typeof extensionSettings === 'object') {
+  extensionSettings.power_user = power_user
 }
 
 const EPHEMERAL_STOPPING_STRINGS = []

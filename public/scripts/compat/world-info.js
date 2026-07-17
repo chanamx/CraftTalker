@@ -1,4 +1,10 @@
 import { getHost } from './host.js'
+import {
+  NOTE_MODULE_NAME,
+  metadata_keys,
+  refreshShouldWIAddPrompt,
+  shouldWIAddPrompt,
+} from './authors-note.js'
 
 const host = getHost()
 
@@ -81,25 +87,28 @@ export function updateWorldInfoList() {
 
 export async function getWorldInfoPrompt(chat = [], maxContext, isDryRun = false, globalScanData = {}) {
   const context = getCompatContext()
+  refreshShouldWIAddPrompt()
   const activeCharacter = getActiveCharacter(context)
   const activeCharacterTagPayload = getActiveCharacterTagPayload(context, activeCharacter)
-  const payload = {
-    chat: normalizePromptChat(chat),
-    maxContext,
-    isDryRun: Boolean(isDryRun),
-    globalScanData,
-    characterName: activeCharacter?.file_name ?? activeCharacter?.avatar ?? activeCharacter?.name,
-    ...activeCharacterTagPayload,
-    chatId: typeof context?.chatId === 'string'
-      ? context.chatId
-      : typeof context?.getCurrentChatId === 'function'
-        ? context.getCurrentChatId()
-        : undefined,
-    userName: getCompatUserName(context),
-    model: getCompatModel(context),
-  }
 
   try {
+    const scanInjects = await getWorldInfoScanInjects(context)
+    const payload = {
+      chat: normalizePromptChat(chat),
+      maxContext,
+      isDryRun: Boolean(isDryRun),
+      globalScanData,
+      ...(scanInjects.length > 0 ? { scanInjects } : {}),
+      characterName: activeCharacter?.file_name ?? activeCharacter?.avatar ?? activeCharacter?.name,
+      ...activeCharacterTagPayload,
+      chatId: typeof context?.chatId === 'string'
+        ? context.chatId
+        : typeof context?.getCurrentChatId === 'function'
+          ? context.getCurrentChatId()
+          : undefined,
+      userName: getCompatUserName(context),
+      model: getCompatModel(context),
+    }
     const response = await fetch('/api/worldinfo/check', {
       method: 'POST',
       headers: host.getRequestHeaders?.() ?? { 'Content-Type': 'application/json' },
@@ -110,6 +119,7 @@ export async function getWorldInfoPrompt(chat = [], maxContext, isDryRun = false
     await emitWorldInfoEntriesLoaded(result)
     await emitWorldInfoScanDone(result)
     await emitActivatedWorldInfo(result, Boolean(isDryRun))
+    applyWorldInfoAuthorNote(result, context)
     return result
   } catch (error) {
     host.recordCompatDiagnostic?.(
@@ -120,6 +130,34 @@ export async function getWorldInfoPrompt(chat = [], maxContext, isDryRun = false
     console.warn('[ST Compat] Failed to scan world info prompt', error)
     return emptyWorldInfoPromptResult()
   }
+}
+
+function applyWorldInfoAuthorNote(result, context) {
+  if (!shouldWIAddPrompt) return
+  const setExtensionPrompt = context?.setExtensionPrompt ?? host.setExtensionPrompt
+  if (typeof setExtensionPrompt !== 'function') return
+
+  const extensionPrompts = context?.extensionPrompts ?? context?.extension_prompts ?? host.extension_prompts ?? {}
+  const notePrompt = extensionPrompts?.[NOTE_MODULE_NAME]
+  const originalNote = typeof notePrompt === 'string'
+    ? notePrompt
+    : typeof notePrompt?.value === 'string'
+      ? notePrompt.value
+      : ''
+  const before = asRawStringList(result?.anBefore ?? result?.ANBeforeEntries).join('\n')
+  const after = asRawStringList(result?.anAfter ?? result?.ANAfterEntries).join('\n')
+  const mergedNote = `${before}\n${originalNote}\n${after}`.replace(/(^\n)|(\n$)/g, '')
+  const metadata = context?.chat_metadata ?? context?.chatMetadata ?? host.chat_metadata ?? {}
+  const allowWIScan = host.extension_settings?.note?.allowWIScan
+
+  setExtensionPrompt(
+    NOTE_MODULE_NAME,
+    mergedNote,
+    metadata?.[metadata_keys.position],
+    metadata?.[metadata_keys.depth],
+    allowWIScan,
+    metadata?.[metadata_keys.role],
+  )
 }
 
 export async function checkWorldInfo(chat = [], maxContext, isDryRun = false, globalScanData = {}) {
@@ -184,6 +222,33 @@ function getCompatContext() {
   } catch {
     return null
   }
+}
+
+async function getWorldInfoScanInjects(context) {
+  const prompts = recordValue(
+    context?.extensionPrompts
+      ?? context?.extension_prompts
+      ?? host.extension_prompts,
+  )
+  const resolvePrompt = context?.getExtensionPromptByName ?? host.getExtensionPromptByName
+  const scanInjects = []
+
+  for (const [name, value] of Object.entries(prompts)) {
+    const prompt = recordValue(value)
+    if (!prompt.scan) continue
+
+    const resolved = typeof resolvePrompt === 'function'
+      ? await resolvePrompt(name)
+      : prompt.value
+    const content = typeof resolved === 'string'
+      ? resolved
+      : typeof resolved?.value === 'string'
+        ? resolved.value
+        : ''
+    if (content) scanInjects.push(content)
+  }
+
+  return scanInjects
 }
 
 function getActiveCharacter(context) {
@@ -293,6 +358,10 @@ function asStringList(value) {
   return value.map(item => String(item ?? '').trim()).filter(Boolean)
 }
 
+function asRawStringList(value) {
+  return Array.isArray(value) ? value.filter(item => typeof item === 'string') : []
+}
+
 function uniqueStrings(values) {
   return [...new Set(values.map(value => String(value ?? '').trim()).filter(Boolean))]
 }
@@ -354,7 +423,8 @@ async function emitWorldInfoScanDone(result) {
 
 async function emitWorldInfoEntriesLoaded(result) {
   const sourceEntries = recordValue(result?.sourceEntries)
-  if (!Object.hasOwn(sourceEntries, 'globalLore')) return
+  const sourceKeys = ['globalLore', 'characterLore', 'chatLore', 'personaLore']
+  if (!sourceKeys.some(key => Object.hasOwn(sourceEntries, key))) return
 
   const payload = {
     globalLore: entryArray(sourceEntries.globalLore),
@@ -388,6 +458,17 @@ function createScanDoneEventData(event, result, activatedMap, activatedText) {
   const overflowed = typeof event?.overflowed === 'boolean'
     ? event.overflowed
     : Boolean(result?.overflowed)
+  const eventActivatedEntries = Array.isArray(event?.activatedEntries)
+    ? entryArray(event.activatedEntries)
+    : null
+  const eventActivatedMap = eventActivatedEntries
+    ? createActivatedEntryMap(eventActivatedEntries)
+    : activatedMap
+  const eventActivatedText = typeof event?.activatedText === 'string'
+    ? event.activatedText
+    : eventActivatedEntries
+      ? eventActivatedEntries.map(entry => typeof entry?.content === 'string' ? entry.content : '').filter(Boolean).join('\n')
+      : activatedText
 
   return {
     state: {
@@ -402,8 +483,8 @@ function createScanDoneEventData(event, result, activatedMap, activatedText) {
       successful: entryArray(event?.newSuccessfulEntries),
     },
     activated: {
-      entries: new Map(activatedMap),
-      text: activatedText,
+      entries: new Map(eventActivatedMap),
+      text: eventActivatedText,
     },
     sortedEntries: entryArray(result?.sortedEntries),
     recursionDelay: {
@@ -415,7 +496,7 @@ function createScanDoneEventData(event, result, activatedMap, activatedText) {
       overflowed,
     },
     timedEffects: createTimedEffectsFacade(
-      result?.timedEffects,
+      event?.timedEffectsMetadata ?? result?.timedEffects,
       event?.timedEffectActiveEntryIds,
       entryArray(result?.sortedEntries),
     ),
@@ -611,6 +692,12 @@ function emptyWorldInfoPromptResult() {
     timedEffectsChanged: false,
     scanEvents: [],
     sortedEntries: [],
+    sourceEntries: {
+      globalLore: [],
+      characterLore: [],
+      chatLore: [],
+      personaLore: [],
+    },
     vectorizedSkipped: [],
     vectorizedActivated: [],
   }

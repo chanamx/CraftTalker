@@ -1,33 +1,63 @@
 import { optionalHost } from '../../host.js'
 
 export const regex_placement = {
+  MD_DISPLAY: 0,
   USER_INPUT: 1,
   AI_OUTPUT: 2,
   SLASH_COMMAND: 3,
-  WORLD_INFO: 4,
+  WORLD_INFO: 5,
   REASONING: 6,
+}
+
+export const substitute_find_regex = {
+  NONE: 0,
+  RAW: 1,
+  ESCAPED: 2,
 }
 
 export function getRegexedString(value, placement = regex_placement.AI_OUTPUT, options = {}) {
   let output = String(value ?? '')
   const host = optionalHost()
+  const settings = host?.extension_settings ?? globalThis.extension_settings ?? {}
+  if (asArray(settings.disabledExtensions).includes('regex')) return output
   const scripts = getRegexScripts(host)
   if (!scripts.length) return output
 
-  for (const script of scripts.sort(compareRegexOrder)) {
+  for (const script of scripts) {
     if (!shouldRunRegex(script, placement, options)) continue
-    const regex = parseFindRegex(script.findRegex)
-    if (!regex) continue
-    const replacement = String(script.replaceString ?? '')
-    output = output.replace(regex, script.substituteRegex ? host?.replaceVariableMacros?.(replacement) ?? replacement : replacement)
+    output = runRegexScriptWithHost(script, output, host, options?.characterOverride)
   }
 
   host?.recordCompatDiagnostic?.(
     'getRegexedString',
     'partial',
-    'Applied basic ST regex scripts from extension/character settings; advanced trim, preset, and executable replacement behavior is not mirrored.',
+    'Applied ST regex placement, find-macro substitution, capture trimming, and replacement macros; preset identity and executable replacement behavior remain partial.',
   )
   return output
+}
+
+export function runRegexScript(script, value, { characterOverride } = {}) {
+  return runRegexScriptWithHost(script, value, optionalHost(), characterOverride)
+}
+
+function runRegexScriptWithHost(script, value, host, characterOverride) {
+  const rawString = String(value ?? '')
+  if (!script || script.disabled || !script.findRegex || !rawString) return rawString
+  const regex = parseFindRegex(resolveFindRegex(script.findRegex, script.substituteRegex, host))
+  if (!regex) return rawString
+
+  return rawString.replace(regex, (...args) => {
+    const groups = args.length > 0 && args[args.length - 1] && typeof args[args.length - 1] === 'object'
+      ? args[args.length - 1]
+      : undefined
+    const replacement = String(script.replaceString ?? '').replace(/{{match}}/gi, '$0')
+    const withGroups = replacement.replace(/\$(\d+)|\$<([^>]+)>/g, (_, number, groupName) => {
+      const captured = number ? args[Number(number)] : groups?.[groupName]
+      if (!captured) return ''
+      return filterString(String(captured), script.trimStrings, host, characterOverride)
+    })
+    return host?.replaceVariableMacros?.(withGroups) ?? withGroups
+  })
 }
 
 function getRegexScripts(host) {
@@ -36,39 +66,44 @@ function getRegexScripts(host) {
   const context = typeof host?.getContext === 'function' ? host.getContext() : {}
   const character = host?.characters?.[Number(context?.this_chid ?? context?.characterId ?? -1)]
   const characterScripts = character?.data?.extensions?.regex_scripts
-  if (Array.isArray(characterScripts) && isCharacterRegexAllowed(settings, character)) {
-    scripts.push(...characterScripts)
+  if (Array.isArray(characterScripts)) {
+    if (isCharacterRegexAllowed(settings, character)) scripts.push(...characterScripts)
+    else host?.recordCompatDiagnostic?.('getRegexedString', 'partial', 'Skipped character regex scripts because character_allowed_regex does not explicitly allow this character.')
   }
   return scripts.filter(script => script && typeof script === 'object')
 }
 
 function isCharacterRegexAllowed(settings, character) {
   const allowed = settings?.character_allowed_regex
-  if (!Array.isArray(allowed) || allowed.length === 0) return true
-  return allowed.includes(character?.avatar) || allowed.includes(character?.name)
+  return Array.isArray(allowed) && allowed.includes(character?.avatar)
 }
 
 function asArray(value) {
   return Array.isArray(value) ? value : []
 }
 
-function compareRegexOrder(a, b) {
-  return Number(a?.order ?? a?.sortOrder ?? 100) - Number(b?.order ?? b?.sortOrder ?? 100)
-}
-
 function shouldRunRegex(script, placement, options) {
   if (script.disabled) return false
-  const placements = asArray(script.placement).map(Number)
+  const placements = Array.isArray(script.placement)
+    ? script.placement.map(Number)
+    : Number.isFinite(Number(script.placement)) ? [Number(script.placement)] : []
   if (placements.length > 0 && !placements.includes(Number(placement))) return false
+
+  const isMarkdown = options?.isMarkdown === true
+  const isPrompt = options?.isPrompt === true
+  const appliesToContext = (script.markdownOnly === true && isMarkdown)
+    || (script.promptOnly === true && isPrompt)
+    || (script.markdownOnly !== true && script.promptOnly !== true && !isMarkdown && !isPrompt)
+  if (!appliesToContext) return false
 
   const depth = Number(options?.depth)
   const minDepth = Number(script.minDepth)
   const maxDepth = Number(script.maxDepth)
-  if (Number.isFinite(depth) && Number.isFinite(minDepth) && depth < minDepth) return false
-  if (Number.isFinite(depth) && Number.isFinite(maxDepth) && depth > maxDepth) return false
+  const hasMinDepth = script.minDepth !== null && script.minDepth !== undefined && Number.isFinite(minDepth) && minDepth >= -1
+  const hasMaxDepth = script.maxDepth !== null && script.maxDepth !== undefined && Number.isFinite(maxDepth) && maxDepth >= 0
+  if (Number.isFinite(depth) && hasMinDepth && depth < minDepth) return false
+  if (Number.isFinite(depth) && hasMaxDepth && depth > maxDepth) return false
 
-  if (options?.isMarkdown && script.promptOnly && !script.markdownOnly) return false
-  if (options?.isPrompt && script.markdownOnly && !script.promptOnly) return false
   return true
 }
 
@@ -84,7 +119,7 @@ function parseFindRegex(value) {
         return new RegExp(source, flags)
       }
     }
-    return new RegExp(text, 'gi')
+    return new RegExp(text)
   } catch (error) {
     optionalHost()?.recordCompatDiagnostic?.('getRegexedString', 'stub', `Skipped invalid regex script "${text}".`)
     console.warn('[ST Compat] Invalid regex script', text, error)
@@ -92,14 +127,49 @@ function parseFindRegex(value) {
   }
 }
 
+function resolveFindRegex(value, substituteRegex, host) {
+  const text = String(value ?? '')
+  const mode = Number(substituteRegex)
+  if (mode !== substitute_find_regex.RAW && mode !== substitute_find_regex.ESCAPED) return text
+  return text.replace(/\{\{([^}]+)\}\}/g, (match) => {
+    const resolved = host?.replaceVariableMacros?.(match) ?? match
+    if (resolved === match) return match
+    return mode === substitute_find_regex.ESCAPED ? escapeRegexMacro(resolved) : resolved
+  })
+}
+
+function escapeRegexMacro(value) {
+  return String(value ?? '').replace(/[\n\r\t\v\f\0.^$*+?{}[\]\\/|()]/gs, character => {
+    switch (character) {
+      case '\n': return '\\n'
+      case '\r': return '\\r'
+      case '\t': return '\\t'
+      case '\v': return '\\v'
+      case '\f': return '\\f'
+      case '\0': return '\\0'
+      default: return `\\${character}`
+    }
+  })
+}
+
+function filterString(value, trimStrings, host, characterOverride) {
+  let output = String(value ?? '')
+  for (const trimString of asArray(trimStrings)) {
+    const resolved = host?.replaceVariableMacros?.(String(trimString ?? ''), { name2Override: characterOverride }) ?? String(trimString ?? '')
+    output = output.replaceAll(resolved, '')
+  }
+  return output
+}
+
 function normalizeFlags(value) {
-  const flags = [...new Set(String(value || 'gi').split(''))]
+  return [...new Set(String(value || '').split(''))]
     .filter(flag => 'dgimsuvy'.includes(flag))
     .join('')
-  return flags.includes('g') ? flags : `${flags}g`
 }
 
 export default {
   regex_placement,
+  substitute_find_regex,
   getRegexedString,
+  runRegexScript,
 }
