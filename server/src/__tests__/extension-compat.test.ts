@@ -249,6 +249,11 @@ describe('SillyTavern extension compatibility routes', () => {
       body: JSON.stringify({
         disabledExtensions: ['third-party/TestExt'],
         samplePlugin: { enabled: true, nested: { value: 42 } },
+        power_user: {
+          personas: { 'Writer.png': 'Writer' },
+          persona_descriptions: { 'Writer.png': { description: 'Persistent persona' } },
+          default_persona: 'Writer.png',
+        },
       }),
     })
     const readRes = await app.request('/api/extensions/settings')
@@ -259,7 +264,56 @@ describe('SillyTavern extension compatibility routes', () => {
     expect(settings).toMatchObject({
       disabledExtensions: ['third-party/TestExt'],
       samplePlugin: { enabled: true, nested: { value: 42 } },
+      power_user: {
+        personas: { 'Writer.png': 'Writer' },
+        persona_descriptions: { 'Writer.png': { description: 'Persistent persona' } },
+        default_persona: 'Writer.png',
+      },
       quickReplyV2: { config: { setList: [] } },
+    })
+  })
+
+  it('serializes atomic extension settings mutations without losing concurrent fields', async () => {
+    const service = await import('../services/extension.service.js') as unknown as {
+      updateExtensionSettings?: (
+        mutate: (settings: Record<string, unknown>) => Promise<void> | void,
+      ) => Promise<Record<string, unknown>>
+    }
+    expect(service.updateExtensionSettings).toEqual(expect.any(Function))
+    if (!service.updateExtensionSettings) return
+
+    let releaseFirst!: () => void
+    let markFirstStarted!: () => void
+    const firstStarted = new Promise<void>(resolve => { markFirstStarted = resolve })
+    const firstBlocked = new Promise<void>(resolve => { releaseFirst = resolve })
+    const order: string[] = []
+
+    const first = service.updateExtensionSettings(async settings => {
+      order.push('first-start')
+      markFirstStarted()
+      await firstBlocked
+      settings.firstPlugin = { enabled: true }
+      order.push('first-end')
+    })
+    await firstStarted
+    const second = service.updateExtensionSettings(settings => {
+      order.push('second')
+      expect(settings.firstPlugin).toEqual({ enabled: true })
+      settings.secondPlugin = { enabled: true }
+    })
+
+    releaseFirst()
+    await Promise.all([first, second])
+
+    expect(order).toEqual(['first-start', 'first-end', 'second'])
+    await expect(service.updateExtensionSettings(settings => {
+      expect(settings).toMatchObject({
+        firstPlugin: { enabled: true },
+        secondPlugin: { enabled: true },
+      })
+    })).resolves.toMatchObject({
+      firstPlugin: { enabled: true },
+      secondPlugin: { enabled: true },
     })
   })
 

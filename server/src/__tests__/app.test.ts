@@ -3,10 +3,13 @@ import fs from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
 import { createApp } from '../app.js'
-import { cancelRun, completeRun, createGenerationRun, failRun, updateRunPartial } from '../services/run.service.js'
+import { cancelRun, clearRunJournalStoresForTest, completeRun, createGenerationRun, failRun, updateRunPartial } from '../services/run.service.js'
+import * as runService from '../services/run.service.js'
 import { addMessage, createChat, editMessage, getChat } from '../services/chat.service.js'
 import * as chatService from '../services/chat.service.js'
 import { clearGenerationLocksForTest, tryAcquireGenerationLock } from '../lib/generation-locks.js'
+import { withChatMutationLock } from '../lib/chat-mutation-locks.js'
+import { getWorldInfoPromptForContext } from '../services/world-info-runtime.service.js'
 import { clearLlmKeySessionsForTest } from '../services/llm-session.service.js'
 import { writeChatFile } from '../lib/jsonl.js'
 import { readCharacterCard, writeCharacterCard } from '../lib/png-parser.js'
@@ -79,13 +82,14 @@ afterEach(() => {
   vi.restoreAllMocks()
   vi.unstubAllGlobals()
   clearGenerationLocksForTest()
+  clearRunJournalStoresForTest()
   clearLlmKeySessionsForTest()
   delete process.env.LUKER_DATA_DIR
   delete process.env.CRAFTTALKER_ST_CORS_PROXY_ENABLED
   delete process.env.CRAFTTALKER_ST_CORS_PROXY_ALLOWLIST
   delete process.env.CRAFTTALKER_ST_IMAGE_BACKEND_PING_ENABLED
   delete process.env.CRAFTTALKER_ST_IMAGE_BACKEND_ALLOWLIST
-  fs.rmSync(testDataDir, { recursive: true, force: true })
+  fs.rmSync(testDataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 })
 })
 
 describe('API Routes', () => {
@@ -96,6 +100,27 @@ describe('API Routes', () => {
     const body = await res.json() as Json
     expect(body.status).toBe('ok')
     expect(body.timestamp).toBeTypeOf('number')
+  })
+
+  it('GET /api/worker/status returns a bounded generation scheduler summary', async () => {
+    process.env.CRAFTTALKER_GENERATION_CONCURRENCY = '3'
+    process.env.CRAFTTALKER_GENERATION_QUEUE_CAPACITY = '7'
+    const lock = tryAcquireGenerationLock('StatusBot', 'status-chat', 'generate')
+    const app = createApp()
+
+    const res = await app.request('/api/worker/status')
+
+    expect(res.status).toBe(200)
+    expect(await res.json()).toEqual({
+      accepting: true,
+      limits: { concurrency: 3, queueCapacity: 7, perOwnerProviderConcurrency: 2, queueWaitTimeoutMs: 30_000 },
+      activeCount: 1,
+      queuedCount: 0,
+      oldestQueuedAgeMs: null,
+    })
+    lock?.release()
+    delete process.env.CRAFTTALKER_GENERATION_CONCURRENCY
+    delete process.env.CRAFTTALKER_GENERATION_QUEUE_CAPACITY
   })
 
   it('GET /version returns an ST-compatible startup probe response', async () => {
@@ -806,7 +831,7 @@ describe('API Routes', () => {
     })
     await updateRunPartial(run.runId, 'half-written')
 
-    const res = await app.request('/api/runs?characterName=RunBot&chatId=chat-1')
+    const res = await app.request('/api/runs?view=legacy&characterName=RunBot&chatId=chat-1')
 
     expect(res.status).toBe(200)
     const body = await res.json() as Array<{ runId: string; status: string; partialContent: string }>
@@ -845,6 +870,30 @@ describe('API Routes', () => {
     expect(afterDuplicate.lines.filter(line => 'mes' in line)).toHaveLength(1)
   })
 
+  it('POST /api/runs/:runId/commit reuses a marked assistant line after the run event write fails', async () => {
+    const app = createApp()
+    const chat = await createChat('CommitCrashBot')
+    const run = await createGenerationRun({
+      characterName: 'CommitCrashBot',
+      chatId: chat.chatId,
+      operation: 'generate',
+    })
+    await failRun(run.runId, { error: 'network', partialContent: 'Recovered exactly once' })
+    vi.spyOn(runService, 'markRunCommitted').mockRejectedValueOnce(new Error('simulated run event crash'))
+
+    const failed = await app.request(`/api/runs/${run.runId}/commit`, { method: 'POST' })
+    expect(failed.status).toBe(500)
+
+    const retried = await app.request(`/api/runs/${run.runId}/commit`, { method: 'POST' })
+    expect(retried.status).toBe(200)
+    const stored = await getChat('CommitCrashBot', chat.chatId)
+    expect(stored.lines).toHaveLength(2)
+    expect(stored.lines[1]).toMatchObject({
+      mes: 'Recovered exactly once',
+      extra: { crafttalker: { run_ids: [run.runId] } },
+    })
+  })
+
   it('POST /api/runs/:runId/finalize-st-output commits plugin output for an empty completed generation', async () => {
     const app = createApp()
     const chat = await createChat('CompatEmptyBot')
@@ -869,6 +918,33 @@ describe('API Routes', () => {
     expect(stored.lines[1]).toMatchObject({ is_user: false, mes: 'Created entirely by before-end' })
   })
 
+  it('POST /api/runs/:runId/finalize-st-output reuses an empty-generation line after the run event write fails', async () => {
+    const app = createApp()
+    const chat = await createChat('CompatEmptyCrashBot')
+    const run = await createGenerationRun({
+      characterName: 'CompatEmptyCrashBot',
+      chatId: chat.chatId,
+      operation: 'generate',
+    })
+    await completeRun(run.runId, { partialContent: '' })
+    vi.spyOn(runService, 'finalizeStRunOutput').mockRejectedValueOnce(new Error('simulated ST finalization event crash'))
+
+    const request = () => app.request(`/api/runs/${run.runId}/finalize-st-output`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: 'Created exactly once' }),
+    })
+
+    expect((await request()).status).toBe(500)
+    expect((await request()).status).toBe(200)
+    const stored = await getChat('CompatEmptyCrashBot', chat.chatId)
+    expect(stored.lines).toHaveLength(2)
+    expect(stored.lines[1]).toMatchObject({
+      mes: 'Created exactly once',
+      extra: { crafttalker: { run_ids: [run.runId] } },
+    })
+  })
+
   it('POST /api/runs/:runId/finalize-st-output replaces only the assistant line committed by that run', async () => {
     const app = createApp()
     const chat = await createChat('CompatReplaceBot')
@@ -889,6 +965,37 @@ describe('API Routes', () => {
     expect(res.status).toBe(200)
     const stored = await getChat('CompatReplaceBot', chat.chatId)
     expect(stored.lines[1]).toMatchObject({ is_user: false, mes: 'Plugin-finalized reply' })
+  })
+
+  it('POST /api/runs/:runId/finalize-st-output reconciles a replaced line after the run event write fails', async () => {
+    const app = createApp()
+    const chat = await createChat('CompatReplaceCrashBot')
+    await addMessage('CompatReplaceCrashBot', chat.chatId, false, 'Raw provider reply', 'CompatReplaceCrashBot', false, {
+      plugin: { preserved: true },
+    })
+    const run = await createGenerationRun({
+      characterName: 'CompatReplaceCrashBot',
+      chatId: chat.chatId,
+      operation: 'generate',
+    })
+    await completeRun(run.runId, { partialContent: 'Raw provider reply', committedLineIndex: 1 })
+    vi.spyOn(runService, 'finalizeStRunOutput').mockRejectedValueOnce(new Error('simulated ST finalization event crash'))
+
+    const request = () => app.request(`/api/runs/${run.runId}/finalize-st-output`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: 'Plugin-finalized reply' }),
+    })
+
+    expect((await request()).status).toBe(500)
+    expect((await request()).status).toBe(200)
+    expect((await getChat('CompatReplaceCrashBot', chat.chatId)).lines[1]).toMatchObject({
+      mes: 'Plugin-finalized reply',
+      extra: {
+        plugin: { preserved: true },
+        crafttalker: { run_ids: [run.runId] },
+      },
+    })
   })
 
   it('POST /api/runs/:runId/finalize-st-output rejects a stale or user-edited target line', async () => {
@@ -2093,6 +2200,46 @@ describe('API Routes', () => {
     expect(body.allActivatedEntries[0]).not.toHaveProperty('raw')
   })
 
+  it('scans request-scoped ST extension prompts without trimming their content', async () => {
+    const app = createApp()
+    fs.writeFileSync(
+      path.join(testDataDir, 'worlds', 'ExtensionPromptLore.json'),
+      JSON.stringify({
+        name: 'ExtensionPromptLore',
+        enabled: true,
+        global_enabled: true,
+        entries: {
+          1: {
+            uid: 1,
+            key: ['/  hidden archive  /'],
+            content: 'The extension prompt opened the hidden archive.',
+            enabled: true,
+            position: 0,
+            insertion_order: 10,
+          },
+        },
+      }),
+      'utf8',
+    )
+
+    const res = await app.request('/api/worldinfo/check', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat: ['plain chat'],
+        scanInjects: ['  hidden archive  '],
+        maxContext: 4096,
+        isDryRun: true,
+      }),
+    })
+
+    expect(res.status).toBe(200)
+    const body = await res.json() as Json & { matchedEntries: Array<Json & { content: string }> }
+    expect(body.matchedEntries.map(entry => entry.content)).toEqual([
+      'The extension prompt opened the hidden archive.',
+    ])
+  })
+
   it('does not treat missing character context as an empty ST tag map for worldinfo checks', async () => {
     const app = createApp()
     fs.writeFileSync(
@@ -2337,6 +2484,121 @@ describe('API Routes', () => {
     })
   })
 
+  it('matches ST global worldinfo Regex depth and disabled-extension gating without changing activation events', async () => {
+    const app = createApp()
+    fs.mkdirSync(path.join(testDataDir, 'extensions'), { recursive: true })
+    const extensionSettingsPath = path.join(testDataDir, 'extensions', 'extension-settings.json')
+    const regexSettings = {
+      regex: [
+        { findRegex: 'sealed', replaceString: 'opened', placement: [5], promptOnly: true, maxDepth: null },
+        { findRegex: 'guards', replaceString: 'watches', placement: [5], promptOnly: true, minDepth: 100 },
+        {
+          findRegex: '{{user}}',
+          replaceString: '{{char}} greets {{match}}',
+          substituteRegex: 2,
+          placement: [5],
+          promptOnly: true,
+        },
+      ],
+      character_allowed_regex: [],
+    }
+    fs.writeFileSync(
+      extensionSettingsPath,
+      JSON.stringify(regexSettings),
+      'utf8',
+    )
+    const charDir = path.join(testDataDir, 'characters', 'RegexWorldBot')
+    fs.mkdirSync(charDir, { recursive: true })
+    fs.writeFileSync(
+      path.join(charDir, 'character.json'),
+      JSON.stringify({
+        name: 'RegexWorldBot',
+        extensions: { world: 'RegexWorld' },
+      }),
+      'utf8',
+    )
+    fs.writeFileSync(
+      path.join(testDataDir, 'worlds', 'RegexWorld.json'),
+      JSON.stringify({
+        name: 'RegexWorld',
+        enabled: true,
+        global_enabled: false,
+        entries: {
+          1: {
+            uid: 1,
+            key: ['sealed gate'],
+            content: 'Riley+ guards the sealed gate.',
+            enabled: true,
+            position: 0,
+            insertion_order: 10,
+          },
+          2: {
+            uid: 2,
+            key: ['sealed gate'],
+            content: 'A sealed depth marker.',
+            enabled: true,
+            position: 4,
+            depth: 4,
+            insertion_order: 5,
+          },
+        },
+      }),
+      'utf8',
+    )
+
+    const createChatRes = await app.request('/api/chats/RegexWorldBot', { method: 'POST' })
+    expect(createChatRes.status).toBe(201)
+    const createdChat = await createChatRes.json() as Json & { chatId: string }
+    const res = await app.request('/api/worldinfo/check', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        characterName: 'RegexWorldBot',
+        chatId: createdChat.chatId,
+        chat: ['The sealed gate is here.'],
+        userName: 'Riley+',
+        isDryRun: true,
+      }),
+    })
+
+    expect(res.status).toBe(200)
+    const body = await res.json() as Json & {
+      matchedEntries: Array<Json & { content: string }>
+      allActivatedEntries: Array<Json & { content: string }>
+    }
+    expect(body.matchedEntries.map(entry => entry.content)).toEqual(expect.arrayContaining([
+      'RegexWorldBot greets Riley+ watches the opened gate.',
+      'A opened depth marker.',
+    ]))
+    expect(body.allActivatedEntries.map(entry => entry.content)).toEqual(expect.arrayContaining([
+      'Riley+ guards the sealed gate.',
+      'A sealed depth marker.',
+    ]))
+
+    fs.writeFileSync(
+      extensionSettingsPath,
+      JSON.stringify({ ...regexSettings, disabledExtensions: ['regex'] }),
+      'utf8',
+    )
+    const disabledRes = await app.request('/api/worldinfo/check', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        characterName: 'RegexWorldBot',
+        chatId: createdChat.chatId,
+        chat: ['The sealed gate is here.'],
+        userName: 'Riley+',
+        isDryRun: true,
+      }),
+    })
+    expect(disabledRes.status).toBe(200)
+    const disabledBody = await disabledRes.json() as Json & { matchedEntries: Array<Json & { content: string }> }
+    expect(disabledBody.matchedEntries.map(entry => entry.content)).toEqual(expect.arrayContaining([
+      'Riley+ guards the sealed gate.',
+      'A sealed depth marker.',
+    ]))
+  })
+
   it('persists non-dry-run worldinfo timed metadata and clears consumed vector activations', async () => {
     const app = createApp()
     const charDir = path.join(testDataDir, 'characters', 'TimedBot')
@@ -2358,6 +2620,7 @@ describe('API Routes', () => {
         name: 'TimedLore',
         enabled: true,
         global_enabled: false,
+        token_budget: 200_000,
         entries: {
           3: {
             uid: 3,
@@ -2404,6 +2667,28 @@ describe('API Routes', () => {
       }),
     })
     expect(metadataRes.status).toBe(200)
+
+    const defaultDryRunRes = await app.request('/api/worldinfo/check', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        characterName: 'TimedBot',
+        chatId: createdChat.chatId,
+        chat: [{ name: 'You', content: 'A dragon is nearby.' }],
+        maxContext: 4096,
+      }),
+    })
+    expect(defaultDryRunRes.status).toBe(200)
+
+    const afterDefaultDryRunRes = await app.request(`/api/chats/TimedBot/${createdChat.chatId}`)
+    expect(afterDefaultDryRunRes.status).toBe(200)
+    const afterDefaultDryRun = await afterDefaultDryRunRes.json() as Json & { lines: Json[] }
+    const afterDefaultDryRunMetadata = afterDefaultDryRun.lines[0]?.chat_metadata as Json
+    expect(afterDefaultDryRunMetadata.worldInfoBuffer).toEqual({
+      externalActivations: [
+        { world: 'TimedLore', uid: 4, source: 'route-test-vector', score: 0.73 },
+      ],
+    })
 
     const dryRunRes = await app.request('/api/worldinfo/check', {
       method: 'POST',
@@ -2466,6 +2751,229 @@ describe('API Routes', () => {
     const sticky = timedWorldInfo.sticky as Record<string, Json>
     expect(sticky['TimedLore.3']).toMatchObject({ start: 1, end: 3 })
     expect(metadata.worldInfoBuffer).toEqual({})
+
+    const concurrentActivation = {
+      world: 'TimedLore',
+      uid: 4,
+      source: 'concurrent-route-test',
+      score: 0.91,
+    }
+    await chatService.updateChatMetadata('TimedBot', createdChat.chatId, {
+      ...metadata,
+      worldInfoBuffer: { externalActivations: [concurrentActivation] },
+    })
+
+    const originalUpdateChatMetadata = chatService.updateChatMetadata
+    let releaseFirstSave!: () => void
+    let notifyFirstSave!: () => void
+    const firstSaveStarted = new Promise<void>(resolve => { notifyFirstSave = resolve })
+    const firstSaveBlocked = new Promise<void>(resolve => { releaseFirstSave = resolve })
+    vi.spyOn(chatService, 'updateChatMetadata').mockImplementationOnce(async (...args) => {
+      notifyFirstSave()
+      await firstSaveBlocked
+      return originalUpdateChatMetadata(...args)
+    })
+
+    const concurrentCheck = () => app.request('/api/worldinfo/check', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        characterName: 'TimedBot',
+        chatId: createdChat.chatId,
+        chat: ['plain message'],
+        isDryRun: false,
+      }),
+    })
+
+    const firstConcurrentCheck = concurrentCheck()
+    await firstSaveStarted
+    const secondConcurrentCheck = concurrentCheck()
+    await new Promise(resolve => setTimeout(resolve, 100))
+    releaseFirstSave()
+
+    const concurrentResponses = await Promise.all([firstConcurrentCheck, secondConcurrentCheck])
+    expect(concurrentResponses.every(response => response.status === 200)).toBe(true)
+    const concurrentBodies = await Promise.all(concurrentResponses.map(response => response.json())) as Array<{
+      vectorizedActivated: Array<{ world: string; uid: number }>
+    }>
+    const consumedCount = concurrentBodies.reduce(
+      (count, item) => count + item.vectorizedActivated.filter(entry => entry.world === 'TimedLore' && entry.uid === 4).length,
+      0,
+    )
+    expect(consumedCount).toBe(1)
+
+    await chatService.updateChatMetadata('TimedBot', createdChat.chatId, {
+      ...metadata,
+      worldInfoBuffer: { externalActivations: [concurrentActivation] },
+    })
+    let notifyOwnerStarted!: () => void
+    let releaseOwner!: () => void
+    const ownerStarted = new Promise<void>(resolve => { notifyOwnerStarted = resolve })
+    const ownerBlocked = new Promise<void>(resolve => { releaseOwner = resolve })
+    const owner = withChatMutationLock('TimedBot', createdChat.chatId, async () => {
+      notifyOwnerStarted()
+      await ownerBlocked
+    })
+    await ownerStarted
+
+    const abortController = new AbortController()
+    const canceledScan = getWorldInfoPromptForContext({
+      characterName: 'TimedBot',
+      chatId: createdChat.chatId,
+      chat: ['plain message'],
+      dryRun: false,
+      signal: abortController.signal,
+    })
+    await new Promise(resolve => setTimeout(resolve, 50))
+    abortController.abort('request disconnected')
+    await expect(canceledScan).rejects.toMatchObject({ name: 'AbortError' })
+    releaseOwner()
+    await owner
+
+    const afterCanceledScan = await chatService.getChat('TimedBot', createdChat.chatId)
+    const afterCanceledMetadata = afterCanceledScan.lines[0] as { chat_metadata?: Json }
+    expect((afterCanceledMetadata.chat_metadata?.worldInfoBuffer as Json).externalActivations).toEqual([concurrentActivation])
+
+    const slowActivation = {
+      ...concurrentActivation,
+      content: `${'a'.repeat(30_000)}!`,
+    }
+    await chatService.updateChatMetadata('TimedBot', createdChat.chatId, {
+      ...(afterCanceledMetadata.chat_metadata ?? {}),
+      worldInfoBuffer: { externalActivations: [slowActivation] },
+    })
+    fs.mkdirSync(path.join(testDataDir, 'extensions'), { recursive: true })
+    fs.writeFileSync(
+      path.join(testDataDir, 'extensions', 'extension-settings.json'),
+      JSON.stringify({
+        regex: [{
+          findRegex: '/(a+)+$/g',
+          replaceString: 'blocked',
+          placement: [5],
+          promptOnly: true,
+        }],
+        character_allowed_regex: [],
+      }),
+      'utf8',
+    )
+
+    const inFlightController = new AbortController()
+    const inFlightScan = getWorldInfoPromptForContext({
+      characterName: 'TimedBot',
+      chatId: createdChat.chatId,
+      chat: ['plain message'],
+      maxContext: 200_000,
+      dryRun: false,
+      signal: inFlightController.signal,
+    })
+    setTimeout(() => inFlightController.abort('request disconnected'), 50)
+    await expect(inFlightScan).rejects.toMatchObject({ name: 'AbortError' })
+
+    const afterInFlightCancel = await chatService.getChat('TimedBot', createdChat.chatId)
+    const afterInFlightMetadata = afterInFlightCancel.lines[0] as { chat_metadata?: Json }
+    expect((afterInFlightMetadata.chat_metadata?.worldInfoBuffer as Json).externalActivations).toEqual([slowActivation])
+    await expect(chatService.updateChatMetadata(
+      'TimedBot',
+      createdChat.chatId,
+      afterInFlightMetadata.chat_metadata ?? {},
+    )).resolves.toBe(true)
+  })
+
+  it('consumes ST-Prompt-Template force activations for non-vectorized entries with safe overrides', async () => {
+    const app = createApp()
+    const charDir = path.join(testDataDir, 'characters', 'PluginForceBot')
+    fs.mkdirSync(charDir, { recursive: true })
+    fs.writeFileSync(
+      path.join(charDir, 'character.json'),
+      JSON.stringify({
+        name: 'PluginForceBot',
+        extensions: { world: 'PluginForceLore' },
+      }),
+      'utf8',
+    )
+    fs.writeFileSync(
+      path.join(testDataDir, 'worlds', 'PluginForceLore.json'),
+      JSON.stringify({
+        name: 'PluginForceLore',
+        enabled: true,
+        global_enabled: false,
+        token_budget: 1,
+        entries: {
+          1: {
+            uid: 1,
+            key: ['missing-plugin-key'],
+            content: 'Original grouped lore.',
+            enabled: true,
+            position: 0,
+            insertion_order: 10,
+            group: 'plugin-group',
+          },
+          2: {
+            uid: 2,
+            key: ['plain message'],
+            content: 'Normal group override lore.',
+            enabled: true,
+            position: 0,
+            insertion_order: 20,
+            group: 'plugin-group',
+            group_override: true,
+            ignoreBudget: true,
+          },
+        },
+      }),
+      'utf8',
+    )
+
+    const createChatRes = await app.request('/api/chats/PluginForceBot', { method: 'POST' })
+    expect(createChatRes.status).toBe(201)
+    const createdChat = await createChatRes.json() as Json & { chatId: string }
+    const pluginActivation = {
+      world: 'PluginForceLore',
+      uid: 1,
+      content: 'Plugin forced lore that exceeds the normal budget.',
+      ignoreBudget: true,
+      group: '',
+      hash: 'st-prompt-template-force',
+    }
+    const chat = await chatService.getChat('PluginForceBot', createdChat.chatId)
+    const metadata = (chat.lines[0] as { chat_metadata?: Json }).chat_metadata ?? {}
+    await chatService.updateChatMetadata('PluginForceBot', createdChat.chatId, {
+      ...metadata,
+      worldInfoBuffer: {
+        externalActivations: { 'PluginForceLore.1': pluginActivation },
+      },
+    })
+
+    const res = await app.request('/api/worldinfo/check', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        characterName: 'PluginForceBot',
+        chatId: createdChat.chatId,
+        chat: ['plain message'],
+        maxContext: 4096,
+        isDryRun: false,
+      }),
+    })
+
+    expect(res.status).toBe(200)
+    const body = await res.json() as Json & {
+      matchedEntries: Array<Json & { content: string; ignoreBudget: boolean; group: string }>
+      vectorizedActivated: Json[]
+    }
+    expect(body.matchedEntries).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        content: pluginActivation.content,
+        ignoreBudget: true,
+        group: '',
+      }),
+      expect.objectContaining({ content: 'Normal group override lore.' }),
+    ]))
+    expect(body.vectorizedActivated).toEqual([])
+
+    const stored = await chatService.getChat('PluginForceBot', createdChat.chatId)
+    const storedMetadata = (stored.lines[0] as { chat_metadata?: Json }).chat_metadata ?? {}
+    expect(storedMetadata.worldInfoBuffer).toEqual({})
   })
 
   it('fails closed when consuming external worldinfo activations cannot be persisted', async () => {

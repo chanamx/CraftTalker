@@ -1,10 +1,17 @@
 import * as chatService from './chat.service.js'
 import * as characterService from './character.service.js'
 import * as worldService from './world.service.js'
+import { readExtensionSettings } from './extension.service.js'
 import { resolveMacros } from '../lib/macros.js'
 import { createTokenCounter } from '../lib/tokenizer.js'
 import { createError, ErrorCode } from '../lib/errors.js'
+import { throwIfAborted } from '../lib/abort.js'
+import { isStPresetRegexAllowed } from '../lib/st-preset-compat.js'
 import type { GenerationOperation } from '../lib/generation-locks.js'
+import {
+  transformWorldInfoEntriesWithRegex,
+  type WorldInfoRegexScriptInput,
+} from '../lib/regex-transform.js'
 import {
   checkWorldInfo,
   WORLD_INFO_INSERTION_STRATEGY,
@@ -27,12 +34,14 @@ export interface CheckWorldInfoPromptInput {
   maxContext?: number
   dryRun?: boolean
   globalScanData?: WorldInfoGlobalScanData
+  scanInjects?: string[]
   characterName?: string
   characterTags?: string[]
   characterTagNames?: string[]
   chatId?: string
   model?: string
   userName?: string
+  signal?: AbortSignal
 }
 
 export async function loadWorldEntriesForGeneration(
@@ -43,23 +52,30 @@ export async function loadWorldEntriesForGeneration(
   model?: string,
   userName?: string,
   operation: GenerationOperation = 'generate',
+  preset?: { type?: string; name?: string; regexScripts?: unknown[] },
+  scanInjects?: string[],
 ): Promise<MatchedEntry[] | undefined> {
   const scanChatMessages = messages.map(({ name, content }) => ({ name, content })).reverse()
-  const result = await scanWorldInfoForContext({
-    character,
-    chatRecord: chat,
-    chat: scanChatMessages,
-    maxContext,
-    model,
-    userName,
-    dryRun: false,
-    globalScanData: { trigger: worldInfoTriggerForOperation(operation) },
-    persistRuntimeMetadata: true,
-  })
+  const result = await chatService.withChatTransaction(chat.characterName, chat.chatId, latestChat =>
+    scanWorldInfoForContext({
+      character,
+      chatRecord: latestChat,
+      chat: scanChatMessages,
+      maxContext,
+      model,
+      userName,
+      dryRun: false,
+      globalScanData: { trigger: worldInfoTriggerForOperation(operation) },
+      persistRuntimeMetadata: true,
+      preset,
+      scanInjects,
+    }),
+  )
   return result.matchedEntries.length > 0 ? result.matchedEntries : undefined
 }
 
 export async function getWorldInfoPromptForContext(input: CheckWorldInfoPromptInput): Promise<WorldInfoPromptResult> {
+  const dryRun = input.dryRun ?? true
   const character = input.characterName
     ? await characterService.getCharacter(input.characterName).catch(() => undefined)
     : undefined
@@ -67,19 +83,31 @@ export async function getWorldInfoPromptForContext(input: CheckWorldInfoPromptIn
     ? await chatService.getChat(input.characterName, input.chatId).catch(() => undefined)
     : undefined
 
-  return scanWorldInfoForContext({
+  const scan = (currentChat: Chat | undefined, persistRuntimeMetadata: boolean) => scanWorldInfoForContext({
     character,
-    chatRecord,
+    chatRecord: currentChat,
     chat: normalizePromptChat(input.chat),
     maxContext: input.maxContext,
     model: input.model,
     userName: input.userName,
-    dryRun: input.dryRun ?? true,
+    dryRun,
     globalScanData: input.globalScanData,
+    scanInjects: input.scanInjects,
     characterTags: input.characterTags,
     characterTagNames: input.characterTagNames,
-    persistRuntimeMetadata: input.dryRun !== true,
+    signal: input.signal,
+    persistRuntimeMetadata,
   })
+
+  if (!dryRun && chatRecord) {
+    return chatService.withChatTransaction(
+      chatRecord.characterName,
+      chatRecord.chatId,
+      latestChat => scan(latestChat, true),
+      { signal: input.signal },
+    )
+  }
+  return scan(chatRecord, false)
 }
 
 async function scanWorldInfoForContext(input: {
@@ -91,11 +119,16 @@ async function scanWorldInfoForContext(input: {
   userName?: string
   dryRun: boolean
   globalScanData?: WorldInfoGlobalScanData
+  scanInjects?: string[]
   characterTags?: string[]
   characterTagNames?: string[]
+  signal?: AbortSignal
   persistRuntimeMetadata: boolean
+  preset?: { type?: string; name?: string; regexScripts?: unknown[] }
 }): Promise<WorldInfoPromptResult> {
+  throwIfAborted(input.signal, 'World-info scan aborted')
   const sources = await collectWorldInfoSources(input.character, input.chatRecord)
+  throwIfAborted(input.signal, 'World-info scan aborted')
   const settings = buildWorldInfoSettings(
     sources,
     input.character,
@@ -106,14 +139,31 @@ async function scanWorldInfoForContext(input: {
   )
   settings.dryRun = input.dryRun
   settings.tokenCounter = createTokenCounter(input.model)
-  settings.macroResolver = text => resolveMacros(text, {
+  const macroResolver = (text: string) => resolveMacros(text, {
     user: input.userName || 'User',
     char: input.character?.name ?? '',
   })
+  settings.macroResolver = macroResolver
+
+  const regexScripts = await collectWorldInfoRegexScripts(input.character, input.preset)
+  throwIfAborted(input.signal, 'World-info scan aborted')
+  if (regexScripts.length > 0) {
+    settings.promptContentTransformer = async (entries, signal) => {
+      const transformed = await transformWorldInfoEntriesWithRegex(entries, regexScripts, { macroResolver, signal })
+      if (transformed.diagnostic) {
+        console.warn(`[WI] World-info Regex transform fallback (${transformed.diagnostic.code}); using original content`)
+      }
+      return transformed.contents
+    }
+  }
+
+  settings.scanInjects = mergeScanInjects(
+    input.chatRecord ? getWorldInfoScanInjects(input.chatRecord) : undefined,
+    input.scanInjects,
+  )
 
   if (input.chatRecord) {
     settings.timedEffects = getTimedWorldInfo(input.chatRecord)
-    settings.scanInjects = getWorldInfoScanInjects(input.chatRecord)
     settings.forceActivations = getWorldInfoForceActivations(input.chatRecord)
     settings.vectorActivations = getWorldInfoVectorActivations(input.chatRecord)
   }
@@ -126,6 +176,7 @@ async function scanWorldInfoForContext(input: {
     settings,
   })
 
+  throwIfAborted(input.signal, 'World-info scan aborted')
   const shouldClearExternalActivations = input.chatRecord ? hasWorldInfoExternalActivations(input.chatRecord) : false
   if (input.persistRuntimeMetadata && input.chatRecord && (result.timedEffectsChanged || shouldClearExternalActivations)) {
     await saveWorldInfoRuntimeMetadata(
@@ -138,6 +189,37 @@ async function scanWorldInfoForContext(input: {
   }
 
   return result
+}
+
+async function collectWorldInfoRegexScripts(
+  character: Character | undefined,
+  preset: { type?: string; name?: string; regexScripts?: unknown[] } | undefined,
+): Promise<WorldInfoRegexScriptInput[]> {
+  const extensionSettings = await readExtensionSettings().catch(() => ({} as Record<string, unknown>))
+  if (Array.isArray(extensionSettings.disabledExtensions) && extensionSettings.disabledExtensions.includes('regex')) {
+    return []
+  }
+  const scripts: WorldInfoRegexScriptInput[] = []
+  const globalScripts = extensionSettings.regex
+  if (Array.isArray(globalScripts)) scripts.push(...globalScripts as WorldInfoRegexScriptInput[])
+
+  const allowedPresets = recordValue(extensionSettings.preset_allowed_regex)
+  if (preset?.name
+    && isStPresetRegexAllowed({ preset_allowed_regex: allowedPresets }, preset.type, preset.name)
+    && Array.isArray(preset.regexScripts)) {
+    scripts.push(...preset.regexScripts as WorldInfoRegexScriptInput[])
+  }
+
+  const allowedCharacters = extensionSettings.character_allowed_regex
+  const characterExtensions = recordValue(character?.extensions)
+  if (Array.isArray(allowedCharacters)
+    && typeof character?.avatar === 'string'
+    && allowedCharacters.includes(character.avatar)
+    && Array.isArray(characterExtensions?.regex_scripts)) {
+    scripts.push(...characterExtensions.regex_scripts as WorldInfoRegexScriptInput[])
+  }
+
+  return scripts
 }
 
 async function collectWorldInfoSources(
@@ -331,6 +413,13 @@ function mergeStringArrays(...values: Array<string[] | undefined>): string[] | u
   return [...new Set(merged)]
 }
 
+function mergeScanInjects(...values: Array<string[] | undefined>): string[] {
+  const merged = values
+    .flatMap(value => value ?? [])
+    .filter(value => value.trim().length > 0)
+  return [...new Set(merged)]
+}
+
 function normalizePromptChat(chat: Array<string | WorldInfoChatMessage>): WorldInfoChatMessage[] {
   return chat
     .map((message) => {
@@ -390,18 +479,20 @@ function getWorldInfoScanInjects(chat: Chat): string[] {
     ...extensionPromptScanValues(chatMetadata.extension_prompts),
   ]
 
-  return [...new Set(scanInjects.map(item => item.trim()).filter(Boolean))]
+  return [...new Set(scanInjects.filter(item => item.trim().length > 0))]
 }
 
 function getWorldInfoForceActivations(chat: Chat): WorldInfoForceActivation[] {
   const chatMetadata = getChatMetadata(chat)
   if (!chatMetadata) return []
 
+  const worldInfoBuffer = recordValue(chatMetadata.worldInfoBuffer) ?? recordValue(chatMetadata.world_info_buffer)
   return [
     ...forceActivationValues(chatMetadata.worldinfo_force_activate),
     ...forceActivationValues(chatMetadata.worldInfoForceActivate),
     ...forceActivationValues(chatMetadata.world_info_force_activations),
     ...forceActivationValues(chatMetadata.worldInfoForceActivations),
+    ...forceActivationValues(worldInfoBuffer?.externalActivations),
   ]
 }
 
@@ -546,6 +637,8 @@ function forceActivationValue(item: Record<string, unknown>): WorldInfoForceActi
   assignOptionalNumber(activation, 'depth', item.depth)
   assignOptionalNumber(activation, 'insertion_order', item.insertion_order ?? item.insertionOrder)
   assignOptionalNumber(activation, 'role', item.role)
+  if (typeof item.ignoreBudget === 'boolean') activation.ignoreBudget = item.ignoreBudget
+  if (typeof item.group === 'string') activation.group = item.group
   return activation
 }
 

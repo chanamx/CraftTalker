@@ -4,7 +4,7 @@ import type { Dirent } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createError, ErrorCode } from '../lib/errors.js'
-import { validatePathInBase } from '../lib/path-utils.js'
+import { validatePathInBase, writeAtomicFile } from '../lib/path-utils.js'
 import { getStCorsProxyPolicy, getStImageBackendPolicy } from '../lib/st-proxy-policy.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -13,6 +13,7 @@ const PUBLIC_DIR = path.resolve(__dirname, '../../../public')
 const PUBLIC_SCRIPTS_DIR = path.resolve(__dirname, '../../../public/scripts')
 const PUBLIC_EXTENSIONS_DIR = path.join(PUBLIC_SCRIPTS_DIR, 'extensions')
 const SETTINGS_FILE_NAME = 'extension-settings.json'
+let extensionSettingsTail = Promise.resolve()
 
 export type ExtensionType = 'system' | 'local' | 'global'
 
@@ -391,11 +392,42 @@ export async function readExtensionSettings(): Promise<Record<string, unknown>> 
 }
 
 export async function saveExtensionSettings(settings: Record<string, unknown>): Promise<Record<string, unknown>> {
-  const merged = { ...getDefaultExtensionSettings(), ...settings }
-  const filePath = getExtensionSettingsPath()
-  await fs.mkdir(path.dirname(filePath), { recursive: true })
-  await fs.writeFile(filePath, JSON.stringify(merged, null, 2), 'utf8')
-  return merged
+  return withExtensionSettingsLock(async () => {
+    const merged = { ...getDefaultExtensionSettings(), ...settings }
+    await writeExtensionSettingsFile(merged)
+    return merged
+  })
+}
+
+export async function updateExtensionSettings(
+  mutate: (settings: Record<string, unknown>) => Promise<void> | void,
+): Promise<Record<string, unknown>> {
+  return withExtensionSettingsLock(async () => {
+    const settings = await readExtensionSettings()
+    await mutate(settings)
+    const merged = { ...getDefaultExtensionSettings(), ...settings }
+    await writeExtensionSettingsFile(merged)
+    return merged
+  })
+}
+
+async function withExtensionSettingsLock<T>(operation: () => Promise<T>): Promise<T> {
+  const previous = extensionSettingsTail
+  let release!: () => void
+  const current = new Promise<void>(resolve => { release = resolve })
+  extensionSettingsTail = current
+
+  await previous
+  try {
+    return await operation()
+  } finally {
+    release()
+  }
+}
+
+async function writeExtensionSettingsFile(settings: Record<string, unknown>): Promise<void> {
+  const body = Buffer.from(JSON.stringify(settings, null, 2), 'utf8')
+  await writeAtomicFile(getExtensionSettingsPath(), body)
 }
 
 export async function getExtensionCompatibilityReport(): Promise<ExtensionCompatibilityReport> {
@@ -484,6 +516,21 @@ export function getDefaultExtensionSettings(): Record<string, unknown> {
       config: {
         setList: [],
       },
+    },
+    power_user: {
+      personas: {},
+      persona_descriptions: {},
+      default_persona: null,
+      persona_description: '',
+      persona_description_position: 0,
+      persona_description_depth: 2,
+      persona_description_role: 0,
+      persona_description_lorebook: '',
+      persona_show_notifications: false,
+      persona_sort_order: 'asc',
+      custom_stopping_strings: '',
+      custom_stopping_strings_macro: false,
+      streaming_fps: 30,
     },
     randomizer: {
       controls: [],
@@ -689,7 +736,7 @@ function getExtensionRuntimeCapabilities(): ExtensionRuntimeCapability[] {
     {
       id: 'settings',
       status: 'supported',
-      note: 'Persists extension settings while preserving unknown plugin keys.',
+      note: 'Persists extension settings with serialized same-process mutations and atomic file replacement while preserving unknown plugin keys.',
     },
     {
       id: 'st-public-shims',
@@ -704,7 +751,7 @@ function getExtensionRuntimeCapabilities(): ExtensionRuntimeCapability[] {
     {
       id: 'metadata-persistence',
       status: 'partial',
-      note: 'Active chat metadata can write through CraftTalker chat persistence; message-variable and broader ST field writes still need typed bridges.',
+      note: 'Active chat metadata and message variables can write through typed CraftTalker persistence bridges; broader ST field writes still need explicit contracts. Extension settings also persist the ST-compatible power_user persona maps without granting arbitrary file access.',
     },
     {
       id: 'user-file-storage',

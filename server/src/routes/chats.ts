@@ -8,6 +8,7 @@ import { handleGenerate, type StCompatChatOverrideLine, type StCompatExtensionPr
 import type { GenerationOperation } from '../lib/generation-locks.js'
 import { loadWorldEntriesForGeneration } from '../services/world-info-runtime.service.js'
 import { createError, ErrorCode } from '../lib/errors.js'
+import { inspectJsonComplexity } from '../lib/bounded-json.js'
 
 const chatsRoute = new Hono()
 const MAX_IMPORTED_CHAT_BYTES = 20 * 1024 * 1024
@@ -101,7 +102,17 @@ chatsRoute.get('/:characterName', async (c) => {
 chatsRoute.get('/:characterName/:chatId', async (c) => {
   const characterName = decodeURIComponent(c.req.param('characterName'))
   const chatId = c.req.param('chatId')
-  const chat = await chatService.getChat(characterName, chatId)
+  const query = c.req.query()
+  const tail = query.tail === undefined ? undefined : Number(query.tail)
+  const offset = query.offset === undefined ? undefined : Number(query.offset)
+  const limit = query.limit === undefined ? undefined : Number(query.limit)
+  const hasWindow = tail !== undefined || offset !== undefined || limit !== undefined
+  if (hasWindow && [tail, offset, limit].some(value => value !== undefined && (!Number.isInteger(value) || value < 0))) {
+    throw createError(ErrorCode.VALIDATION_ERROR, 'Invalid chat window parameters')
+  }
+  const chat = hasWindow
+    ? await chatService.getChatWindow(characterName, chatId, { tail, offset, limit })
+    : await chatService.getChat(characterName, chatId)
   return c.json(chat)
 })
 
@@ -117,14 +128,28 @@ chatsRoute.post('/:characterName', zValidator('json', createSchema), async (c) =
 })
 
 const messageSchema = z.object({
-  content: z.string().min(1),
-  name: z.string().optional(),
+  content: z.string().min(1).max(250_000),
+  name: z.string().max(200).optional(),
   is_system: z.boolean().optional(),
-  extra: z.record(z.unknown()).optional(),
+  extra: z.record(z.unknown()).superRefine((value, ctx) => {
+    if (Object.keys(value).length > 128 || JSON.stringify(value).length > 256 * 1024) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Message extra fields are too large' })
+    }
+    if (!inspectJsonComplexity(value, { maxDepth: 12, maxNodes: 5_000, maxArrayLength: 1_000 }).ok) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Message extra fields are too complex' })
+    }
+  }).optional(),
 })
 
 const metadataSchema = z.object({
-  chat_metadata: z.record(z.unknown()),
+  chat_metadata: z.record(z.unknown()).superRefine((value, ctx) => {
+    if (Object.keys(value).length > 256 || JSON.stringify(value).length > 256 * 1024) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Chat metadata is too large' })
+    }
+    if (!inspectJsonComplexity(value, { maxDepth: 12, maxNodes: 10_000, maxArrayLength: 1_000 }).ok) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Chat metadata is too complex' })
+    }
+  }),
 })
 
 const messageVariablesSchema = z.object({
@@ -132,7 +157,14 @@ const messageVariablesSchema = z.object({
     lineIndex: z.number().int().min(0),
     variables: z.unknown().optional(),
     variables_initialized: z.unknown().optional(),
-  })).max(1000),
+  })).max(1000).superRefine((updates, ctx) => {
+    if (JSON.stringify(updates).length > 512 * 1024) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Message variables are too large' })
+    }
+    if (!inspectJsonComplexity(updates, { maxDepth: 12, maxNodes: 20_000, maxArrayLength: 2_000 }).ok) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Message variables are too complex' })
+    }
+  }),
 })
 
 chatsRoute.patch('/:characterName/:chatId/metadata', zValidator('json', metadataSchema), async (c) => {
@@ -194,7 +226,7 @@ const generateSchema = z.object({
   stCompatExtensionPrompts: z.array(z.object({
     key: z.string().min(1).max(200),
     value: z.string().max(MAX_ST_COMPAT_EXTENSION_PROMPT_CHARS),
-    position: z.number().int().min(0).max(3).optional(),
+    position: z.number().int().min(-1).max(3).optional(),
     depth: z.number().int().min(0).max(1000).optional(),
     scan: z.boolean().optional(),
     role: z.number().int().min(0).max(2).optional(),

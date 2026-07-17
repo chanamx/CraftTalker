@@ -18,6 +18,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const DEFAULT_DATA_DIR = path.resolve(__dirname, '../../data')
 const MAX_CHARACTER_AVATAR_BYTES = 10 * 1024 * 1024
 const LEGACY_CHARACTER_AVATAR_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif'])
+const characterIndexCache = new Map<string, { fingerprint: string; entry: CharacterIndexEntry }>()
 
 function getDataDir() { return process.env.LUKER_DATA_DIR ?? DEFAULT_DATA_DIR }
 function getCharactersDir() { return path.join(getDataDir(), 'characters') }
@@ -59,6 +60,32 @@ function getPngPath(name: string): string {
 
 function getAvatarPath(name: string): string {
   return path.join(getCharDir(name), 'avatar.png')
+}
+
+async function fileFingerprint(filePath: string): Promise<string> {
+  try {
+    const stat = await fs.stat(filePath)
+    return `1:${stat.mtimeMs}:${stat.size}`
+  } catch (error) {
+    if (isMissingFileError(error)) return '0'
+    throw error
+  }
+}
+
+async function getCharacterIndexFingerprint(name: string): Promise<string> {
+  return (await Promise.all([
+    fileFingerprint(getJsonPath(name)),
+    fileFingerprint(getAvatarPath(name)),
+    fileFingerprint(getPngPath(name)),
+  ])).join('|')
+}
+
+function invalidateCharacterIndex(name: string): void {
+  characterIndexCache.delete(getJsonPath(name))
+}
+
+function isMissingFileError(error: unknown): boolean {
+  return error instanceof Error && 'code' in error && error.code === 'ENOENT'
 }
 
 function normalizeLegacyCharacterAvatarFileName(fileName: string): string | null {
@@ -107,40 +134,32 @@ async function extractAndSaveWorldBook(rawJson: string, worldName: string): Prom
 export async function listCharacters(): Promise<CharacterIndexEntry[]> {
   const charsDir = getCharactersDir()
   if (!existsSync(charsDir)) return []
-
   const entries = await fs.readdir(charsDir, { withFileTypes: true })
-  const results = await Promise.all(
-    entries
-      .filter(d => d.isDirectory())
-      .map(async (d) => {
-        const jsonPath = getJsonPath(d.name)
-        if (!existsSync(jsonPath)) return null
-        try {
-          const card = await readCharacterJsonFile(jsonPath)
-          const stat = await fs.stat(jsonPath)
-          const hasAvatar = existsSync(getAvatarPath(d.name)) || existsSync(getPngPath(d.name))
-          return {
-            name: card.name,
-            description: card.description,
-            tags: card.tags ?? [],
-            creator: card.creator,
-            spec: card.spec,
-            spec_version: card.spec_version,
-            avatar: hasAvatar ? `/api/characters/${encodeURIComponent(d.name)}/avatar` : null,
-            file_name: d.name,
-            created_at: stat.birthtimeMs,
-            updated_at: stat.mtimeMs,
-            world: (card.extensions?.world as string) || null,
-          } as CharacterIndexEntry
-        } catch { return null }
-      })
-  )
-
-  return results
-    .filter((r): r is CharacterIndexEntry => r !== null)
-    .sort((a, b) => b.updated_at - a.updated_at)
+  const results = await Promise.all(entries.filter(d => d.isDirectory()).map(async (d) => {
+    const jsonPath = getJsonPath(d.name)
+    if (!existsSync(jsonPath)) return null
+    try {
+      const [stat, fingerprint] = await Promise.all([
+        fs.stat(jsonPath),
+        getCharacterIndexFingerprint(d.name),
+      ])
+      const cached = characterIndexCache.get(jsonPath)
+      if (cached?.fingerprint === fingerprint) return cached.entry
+      const card = await readCharacterJsonFile(jsonPath)
+      const hasAvatar = existsSync(getAvatarPath(d.name)) || existsSync(getPngPath(d.name))
+      const entry = {
+        name: card.name, description: card.description, tags: card.tags ?? [], creator: card.creator,
+        spec: card.spec, spec_version: card.spec_version,
+        avatar: hasAvatar ? `/api/characters/${encodeURIComponent(d.name)}/avatar` : null,
+        file_name: d.name, created_at: stat.birthtimeMs, updated_at: stat.mtimeMs,
+        world: (card.extensions?.world as string) || null,
+      } as CharacterIndexEntry
+      characterIndexCache.set(jsonPath, { fingerprint, entry })
+      return entry
+    } catch { return null }
+  }))
+  return results.filter((r): r is CharacterIndexEntry => r !== null).sort((a, b) => b.updated_at - a.updated_at)
 }
-
 export async function getCharacter(name: string): Promise<CharacterDetail> {
   const jsonPath = getJsonPath(name)
   if (!existsSync(jsonPath)) {
@@ -190,6 +209,7 @@ export async function createCharacter(data: Partial<CharacterCard>): Promise<Cha
 
   const jsonPath = getJsonPath(safeName)
   await fs.writeFile(jsonPath, serializeCharacterJson(card), 'utf8')
+  invalidateCharacterIndex(safeName)
 
   return getCharacter(safeName)
 }
@@ -201,6 +221,7 @@ export async function updateCharacter(name: string, data: Partial<CharacterCard>
 
   const jsonPath = getJsonPath(name)
   await fs.writeFile(jsonPath, serializeCharacterJson(card), 'utf8')
+  invalidateCharacterIndex(name)
 
   return getCharacter(name)
 }
@@ -219,6 +240,7 @@ export async function importCharacterFromPng(filePath: string): Promise<Characte
   const pngBuffer = await fs.readFile(filePath)
   const pngPath = getPngPath(safeName)
   await fs.writeFile(pngPath, pngBuffer)
+  invalidateCharacterIndex(safeName)
 
   const worldName = (card.extensions?.world as string) || safeName
   try {
@@ -231,6 +253,7 @@ export async function importCharacterFromPng(filePath: string): Promise<Characte
     if (charData.character_book?.entries && Object.keys(charData.character_book.entries).length > 0) {
       card.extensions = { ...card.extensions, world: worldName }
       await fs.writeFile(jsonPath, serializeCharacterJson(card), 'utf8')
+      invalidateCharacterIndex(safeName)
     }
   }
 
@@ -261,6 +284,7 @@ export async function importCharacterJson(jsonStr: string, fileName: string): Pr
   }
 
   await fs.writeFile(jsonPath, serializeCharacterJson(card), 'utf8')
+  invalidateCharacterIndex(safeName)
   return getCharacter(safeName)
 }
 
@@ -273,12 +297,14 @@ export async function duplicateCharacter(name: string, newName: string): Promise
   const jsonPath = getJsonPath(safeName)
   await fs.mkdir(path.dirname(jsonPath), { recursive: true })
   await fs.writeFile(jsonPath, serializeCharacterJson(card), 'utf8')
+  invalidateCharacterIndex(safeName)
 
   const avPath = getAvatarPath(name)
   if (existsSync(avPath)) {
     const newAvPath = getAvatarPath(safeName)
     await fs.mkdir(path.dirname(newAvPath), { recursive: true })
     await fs.copyFile(avPath, newAvPath)
+    invalidateCharacterIndex(safeName)
   }
 
   return getCharacter(safeName)
@@ -321,6 +347,7 @@ export async function saveCharacterAvatar(name: string, body: Buffer): Promise<v
     maxBytes: MAX_CHARACTER_AVATAR_BYTES,
   })
   await writeAtomicFile(getAvatarPath(name), body)
+  invalidateCharacterIndex(name)
 }
 
 export async function deleteCharacter(name: string): Promise<boolean> {
@@ -329,6 +356,7 @@ export async function deleteCharacter(name: string): Promise<boolean> {
     throw createError(ErrorCode.CHARACTER_NOT_FOUND, `角色 "${name}" 不存在`, { characterName: name })
   }
   await fs.rm(charDir, { recursive: true, force: true })
+  invalidateCharacterIndex(name)
   return true
 }
 
