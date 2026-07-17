@@ -17,6 +17,9 @@ export enum ErrorCode {
   PRESET_NOT_FOUND = 4003,
 
   GENERATION_IN_PROGRESS = 5000,
+  CONFLICT = 5001,
+  SERVICE_UNAVAILABLE = 5002,
+  GENERATION_QUEUE_FULL = 5003,
 }
 
 export class AppError extends Error {
@@ -52,7 +55,14 @@ export function getStatusCode(code: ErrorCode): number {
       return 400
 
     case ErrorCode.GENERATION_IN_PROGRESS:
+    case ErrorCode.CONFLICT:
       return 409
+
+    case ErrorCode.GENERATION_QUEUE_FULL:
+      return 429
+
+    case ErrorCode.SERVICE_UNAVAILABLE:
+      return 503
 
     case ErrorCode.LLM_API_ERROR:
     case ErrorCode.LLM_CONNECTION_ERROR:

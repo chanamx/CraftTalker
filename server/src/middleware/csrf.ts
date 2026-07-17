@@ -29,10 +29,11 @@ export const unsafeOriginMiddleware: MiddlewareHandler = async (c, next) => {
 
 /**
  * Apply CSRF protection to routes that need it.
- * Test and development builds skip this middleware so local tooling stays simple.
+ * Tests skip this middleware. Development keeps origin protection enabled so a
+ * LAN-exposed dev server does not silently become a cross-site write target.
  */
 export function applyCsrf(app: Hono) {
-  if (process.env.NODE_ENV === 'test' || process.env.NODE_ENV === 'development') {
+  if (process.env.NODE_ENV === 'test') {
     return
   }
 

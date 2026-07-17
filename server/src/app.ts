@@ -7,6 +7,7 @@ import { worldsRoute } from './routes/worlds.js'
 import { presetsRoute } from './routes/presets.js'
 import { engineRoute } from './routes/engine.js'
 import { runsRoute } from './routes/runs.js'
+import { workerRoute } from './routes/worker.js'
 import { llmSessionsRoute } from './routes/llm-sessions.js'
 import { llmRoutes } from './routes/llm.routes.js'
 import { extensionsRoute } from './routes/extensions.js'
@@ -22,6 +23,10 @@ import { stCorsRoute } from './routes/st-cors.js'
 import { appErrorHandler } from './middleware/errorHandler.js'
 import { applyCsrf } from './middleware/csrf.js'
 import { corsOrigin } from './config/origins.js'
+import { resolveRuntimeConfig } from './config/runtime.js'
+import { createRemoteAuthRoute, remoteAccessMiddleware } from './middleware/remote-auth.js'
+import { requestBodyLimitMiddleware } from './middleware/request-limits.js'
+import { createRateLimitMiddleware } from './middleware/rate-limit.js'
 import {
   readExtensionResource,
   readPublicRootScriptResource,
@@ -95,15 +100,19 @@ function reExportCompat(compatPath: string): string {
 
 export function createApp() {
   const app = new Hono()
+  const runtimeConfig = resolveRuntimeConfig()
 
   app.use(logger())
 
-  app.use('/*', cors({
+  const corsMiddleware = cors({
     origin: corsOrigin,
     allowMethods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
     allowHeaders: ['Content-Type', 'Authorization'],
     credentials: true,
-  }))
+  })
+  for (const route of ['/api/*', '/user/files/*', '/User Avatars/*', '/characters/*', '/thumbnail/*', '/cors/*']) {
+    app.use(route, corsMiddleware)
+  }
 
   app.get('/version', (c) => {
     c.header('Cache-Control', 'no-cache')
@@ -115,6 +124,33 @@ export function createApp() {
       isLatest: true,
     })
   })
+
+  const authApp = new Hono()
+  applyCsrf(authApp)
+  authApp.use('*', requestBodyLimitMiddleware)
+  if (runtimeConfig.requiresAuthentication) {
+    authApp.use('*', createRateLimitMiddleware({ limit: 10, windowMs: 60_000 }))
+  }
+  authApp.route('/', createRemoteAuthRoute(runtimeConfig))
+  app.route('/api/auth', authApp)
+  app.get('/api/health', (c) => c.json({ status: 'ok', timestamp: Date.now() }))
+
+  const requireRemoteAccess = remoteAccessMiddleware(runtimeConfig)
+  app.use('/api/*', async (c, next) => {
+    if (c.req.path === '/api/health' || c.req.path.startsWith('/api/auth/')) {
+      await next()
+      return
+    }
+    return requireRemoteAccess(c, next)
+  })
+  if (runtimeConfig.requiresAuthentication) {
+    app.use('/api/*', createRateLimitMiddleware({ limit: 120, windowMs: 60_000 }))
+  }
+  app.use('/user/files/*', requireRemoteAccess)
+  app.use('/User Avatars/*', requireRemoteAccess)
+  app.use('/characters/*', requireRemoteAccess)
+  app.use('/thumbnail/*', requireRemoteAccess)
+  app.use('/cors/*', requireRemoteAccess)
 
   app.get('/scripts/extensions/*', async (c) => {
     const resourcePath = c.req.path.replace(/^\/scripts\/extensions\//, '')
@@ -163,6 +199,7 @@ export function createApp() {
   // CSRF protection applies to this routed API app in production.
   const protectedApp = new Hono()
   applyCsrf(protectedApp)
+  protectedApp.use('*', requestBodyLimitMiddleware)
   protectedApp.route('/api', stWorldInfoWriteRoute)
   protectedApp.route('/api/characters', charactersRoute)
   protectedApp.route('/api/chats', chatsRoute)
@@ -170,6 +207,7 @@ export function createApp() {
   protectedApp.route('/api/presets', presetsRoute)
   protectedApp.route('/api/engine', engineRoute)
   protectedApp.route('/api/runs', runsRoute)
+  protectedApp.route('/api/worker', workerRoute)
   protectedApp.route('/api/llm-sessions', llmSessionsRoute)
   protectedApp.route('/api/llm', llmRoutes)
   protectedApp.route('/api/extensions', extensionsRoute)
@@ -181,8 +219,6 @@ export function createApp() {
   protectedApp.route('/api/avatars', avatarsRoute)
 
   app.route('/', protectedApp)
-
-  app.get('/api/health', (c) => c.json({ status: 'ok', timestamp: Date.now() }))
 
   app.onError(appErrorHandler)
 
