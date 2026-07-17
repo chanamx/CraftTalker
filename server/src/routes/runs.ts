@@ -1,7 +1,7 @@
 import { Hono } from 'hono'
 import { z } from 'zod'
 import * as runService from '../services/run.service.js'
-import * as chatService from '../services/chat.service.js'
+import { commitGenerationOutput, finalizeGenerationOutput } from '../services/generation-committer.js'
 import { getGenerationLockInfo } from '../lib/generation-locks.js'
 
 const runsRoute = new Hono()
@@ -10,6 +10,13 @@ const activeRunActions = new Set<string>()
 const staleRunError = 'Server restarted or previous generation was abandoned before completion.'
 const finalizeStOutputSchema = z.object({
   content: z.string().max(200_000),
+})
+const projectionSummaryQuerySchema = z.object({
+  characterName: z.string().min(1).max(255).optional(),
+  chatId: z.string().min(1).max(255).optional(),
+  status: z.enum(['running', 'completed', 'failed', 'canceled', 'interrupted', 'committed', 'discarded']).optional(),
+  limit: z.coerce.number().int().min(1).max(100).default(50),
+  cursor: z.string().min(1).max(1024).optional(),
 })
 
 function tryAcquireRunAction(runId: string): (() => void) | null {
@@ -47,6 +54,41 @@ runsRoute.get('/', async (c) => {
   const characterName = c.req.query('characterName')
   const chatId = c.req.query('chatId')
   const status = c.req.query('status')
+  const view = c.req.query('view')
+
+  if (view !== undefined && view !== 'summary' && view !== 'legacy') {
+    return c.json({ error: 'Invalid run list view' }, 400)
+  }
+
+  if (view !== 'legacy') {
+    const readiness = runService.getRunProjectionReadiness()
+    if (!readiness.ready) {
+      return c.json({
+        error: 'Run projection view is not ready',
+        invalidLegacyCount: readiness.invalidLegacyCount,
+        missingLegacyCount: readiness.missingLegacyCount,
+      }, 503)
+    }
+    const parsed = projectionSummaryQuerySchema.safeParse({
+      characterName,
+      chatId,
+      status,
+      limit: c.req.query('limit'),
+      cursor: c.req.query('cursor'),
+    })
+    if (!parsed.success) return c.json({ error: 'Invalid run summary query' }, 400)
+    try {
+      return c.json(await runService.listGenerationRunProjectionSummaries(parsed.data))
+    } catch (error) {
+      if (error instanceof Error && error.message === 'Invalid run projection cursor') {
+        return c.json({ error: error.message }, 400)
+      }
+      if (error instanceof Error && error.message === 'Run projection summary requires repair') {
+        return c.json({ error: error.message }, 503)
+      }
+      throw error
+    }
+  }
 
   const runs = await interruptStaleRunningRuns(await runService.listGenerationRuns())
   const filtered = runs.filter(run =>
@@ -59,6 +101,32 @@ runsRoute.get('/', async (c) => {
 })
 
 runsRoute.get('/:runId', async (c) => {
+  const view = c.req.query('view')
+  if (view !== undefined && view !== 'projection' && view !== 'legacy') {
+    return c.json({ error: 'Invalid run detail view' }, 400)
+  }
+
+  if (view !== 'legacy') {
+    const readiness = runService.getRunProjectionReadiness()
+    if (!readiness.ready) {
+      return c.json({
+        error: 'Run projection view is not ready',
+        invalidLegacyCount: readiness.invalidLegacyCount,
+        missingLegacyCount: readiness.missingLegacyCount,
+      }, 503)
+    }
+    try {
+      const projected = await runService.getGenerationRunProjectionDetail(c.req.param('runId'))
+      if (!projected) return c.json({ error: 'Run not found' }, 404)
+      return c.json(projected)
+    } catch (error) {
+      if (error instanceof Error && error.message === 'Run projection detail requires repair') {
+        return c.json({ error: error.message }, 503)
+      }
+      throw error
+    }
+  }
+
   const run = await getGenerationRunForDisplay(c.req.param('runId'))
   if (!run) return c.json({ error: 'Run not found' }, 404)
   return c.json(run)
@@ -79,10 +147,18 @@ runsRoute.post('/:runId/commit', async (c) => {
       return c.json({ error: 'Run is not recoverable' }, 409)
     }
 
-    await chatService.addMessage(run.characterName, run.chatId, false, run.partialContent)
-    const chat = await chatService.getChat(run.characterName, run.chatId)
+    const committed = await commitGenerationOutput({
+      runId: run.runId,
+      characterName: run.characterName,
+      chatId: run.chatId,
+      content: run.partialContent,
+      isContinue: false,
+    })
+    if (committed.lineIndex === undefined) {
+      return c.json({ error: 'Unable to commit run output' }, 409)
+    }
     const updated = await runService.markRunCommitted(run.runId, {
-      committedLineIndex: chat.lines.length - 1,
+      committedLineIndex: committed.lineIndex,
     })
 
     return c.json(updated)
@@ -105,57 +181,25 @@ runsRoute.post('/:runId/finalize-st-output', async (c) => {
     if (run.status !== 'completed') return c.json({ error: 'Only completed runs can be finalized' }, 409)
     if (run.stFinalizedAt) return c.json({ error: 'Run output was already finalized' }, 409)
 
-    const chat = await chatService.getChat(run.characterName, run.chatId)
-    let committedLineIndex = run.committedLineIndex
-    let line
-
-    if (committedLineIndex !== undefined) {
-      const current = chat.lines[committedLineIndex]
-      if (!current || !('mes' in current) || typeof current.mes !== 'string' || current.is_user || current.is_system) {
-        return c.json({ error: 'Run target is no longer an assistant message' }, 409)
-      }
-
-      const expectedSuffix = run.partialContent
-      if (run.operation === 'continue') {
-        if (!current.mes.endsWith(expectedSuffix)) {
-          return c.json({ error: 'Run target changed after generation completed' }, 409)
-        }
-        const prefix = current.mes.slice(0, current.mes.length - expectedSuffix.length)
-        line = await chatService.editMessage(run.characterName, run.chatId, committedLineIndex, prefix + parsed.data.content)
-      } else {
-        if (current.mes !== expectedSuffix) {
-          return c.json({ error: 'Run target changed after generation completed' }, 409)
-        }
-        line = await chatService.editMessage(run.characterName, run.chatId, committedLineIndex, parsed.data.content)
-      }
-    } else if (run.operation === 'continue') {
-      committedLineIndex = chat.lines.length - 1
-      const current = chat.lines[committedLineIndex]
-      if (committedLineIndex <= 0 || !current || !('mes' in current) || typeof current.mes !== 'string' || current.is_user || current.is_system) {
-        return c.json({ error: 'Continue run has no assistant message to finalize' }, 409)
-      }
-      line = await chatService.editMessage(
-        run.characterName,
-        run.chatId,
-        committedLineIndex,
-        current.mes + parsed.data.content,
-      )
-    } else {
-      line = await chatService.addMessage(run.characterName, run.chatId, false, parsed.data.content)
-      committedLineIndex = chat.lines.length
-    }
-
-    if (!line) return c.json({ error: 'Unable to finalize run output' }, 409)
+    const committed = await finalizeGenerationOutput({
+      runId: run.runId,
+      characterName: run.characterName,
+      chatId: run.chatId,
+      operation: run.operation,
+      generatedContent: run.partialContent,
+      finalizedContent: parsed.data.content,
+      committedLineIndex: run.committedLineIndex,
+    })
     const updated = await runService.finalizeStRunOutput(run.runId, {
       partialContent: parsed.data.content,
-      committedLineIndex,
+      committedLineIndex: committed.lineIndex,
     })
     if (!updated) return c.json({ error: 'Run disappeared during finalization' }, 409)
 
     return c.json({
       runId: updated.runId,
-      committedLineIndex,
-      line,
+      committedLineIndex: committed.lineIndex,
+      line: committed.line,
     })
   } finally {
     release()
