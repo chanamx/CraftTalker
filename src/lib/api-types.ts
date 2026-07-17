@@ -78,6 +78,8 @@ export interface ChatDetail {
   chatId: string
   characterName: string
   lines: ChatLine[]
+  offset?: number
+  totalLines?: number
 }
 
 export interface ChatMetadataUpdateResponse {
@@ -369,12 +371,40 @@ export interface GenerationRunFilters {
   status?: GenerationRunStatus
 }
 
+export interface GenerationRunSummary {
+  runId: string
+  characterName: string
+  chatId: string
+  operation: 'generate' | 'regenerate' | 'continue'
+  status: GenerationRunStatus
+  createdAt: string
+  updatedAt: string
+  finishedAt?: string
+  committedLineIndex?: number
+  stFinalizedAt?: string
+  partialBytes: number
+  hasPartialContent: boolean
+  lastJournalSeq: number
+}
+
+export interface GenerationRunSummaryPage {
+  items: GenerationRunSummary[]
+  nextCursor: string | null
+}
+
+export interface GenerationRunSummaryFilters extends GenerationRunFilters {
+  limit?: number
+  cursor?: string
+}
+
 export interface LlmKeySession {
   sessionId: string
   label?: string
   createdAt: string
   updatedAt: string
   lastUsedAt?: string
+  expiresAt?: string
+  usageCount?: number
   hasApiKey: boolean
 }
 

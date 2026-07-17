@@ -12,7 +12,7 @@ const stBridge = vi.hoisted(() => ({
   emitStExtensionEvent: vi.fn(),
   emitStExtensionEventAsync: vi.fn(),
   getStExtensionPromptsBridge: vi.fn(),
-  runStGenerateAfterDataBridge: vi.fn(),
+  runStPromptLifecycleBridge: vi.fn(),
   runStGenerationBeforeEndBridge: vi.fn(),
   runStGenerationInterceptorsBridge: vi.fn(),
   syncStExtensionContextBridge: vi.fn(),
@@ -61,6 +61,8 @@ vi.mock('@/lib/api', async () => {
       },
       runs: {
         list: vi.fn(),
+        listLegacy: vi.fn(),
+        get: vi.fn(),
         commit: vi.fn(),
         discard: vi.fn(),
         finalizeStOutput: vi.fn(),
@@ -158,17 +160,19 @@ describe('useChatActions ST generation compatibility', () => {
       streams: {},
       pendingCharName: null,
     })
-    useSettingsStore.setState({
+    useSettingsStore.setState(state => ({
+      llmConfig: { ...state.llmConfig, customApiFormat: 'openai_chat' },
       genConfig: {
         temperature: 0.7,
         topP: 0.9,
         contextLength: 4096,
         maxReplyLength: 512,
       },
-    })
-    vi.mocked(api.runs.list).mockResolvedValue([])
+    }))
+    vi.mocked(api.runs.list).mockResolvedValue({ items: [], nextCursor: null })
+    vi.mocked(api.runs.listLegacy).mockResolvedValue([])
     stBridge.runStGenerationInterceptorsBridge.mockResolvedValue(false)
-    stBridge.runStGenerateAfterDataBridge.mockImplementation(async (prompt: unknown[]) => prompt)
+    stBridge.runStPromptLifecycleBridge.mockImplementation(async (prompt: unknown[]) => prompt)
     stBridge.runStGenerationBeforeEndBridge.mockImplementation(async (message: string) => message)
     stBridge.getStExtensionPromptsBridge.mockResolvedValue([])
     stBridge.syncStExtensionContextBridge.mockResolvedValue(undefined)
@@ -296,10 +300,6 @@ describe('useChatActions ST generation compatibility', () => {
             { name: 'System Note', is_user: false, is_system: true, mes: 'cleaned by plugin' },
           ],
           extensionPrompts: [],
-          promptMessages: [
-            { role: 'user', content: 'hello without draw artifacts' },
-            { role: 'system', content: 'cleaned by plugin' },
-          ],
         },
       }),
     )
@@ -341,13 +341,87 @@ describe('useChatActions ST generation compatibility', () => {
               role: 0,
             },
           ],
-          promptMessages: [
-            { role: 'system', content: 'Remember the plugin-provided rule.' },
-            { role: 'user', content: 'hello' },
+        },
+      }),
+    )
+  })
+
+  it('keeps ST NONE prompts available for scanning but out of final prompt messages', async () => {
+    stBridge.getStExtensionPromptsBridge.mockResolvedValue([
+      {
+        key: 'scan-only-note',
+        value: 'Only world info should scan this.',
+        position: -1,
+        scan: true,
+        role: 0,
+      },
+      {
+        key: 'visible-note',
+        value: 'Visible extension note.',
+        position: 0,
+        role: 0,
+      },
+    ])
+    vi.mocked(api.chats.regenerate).mockResolvedValue(new Response('', { status: 200 }))
+
+    const { result } = renderHook(() => useChatActions(messages), { wrapper: createWrapper() })
+
+    await act(async () => {
+      await result.current.handleRegenerate(1)
+    })
+
+    expect(api.chats.regenerate).toHaveBeenCalledWith(
+      'compat-char.json',
+      'chat-1',
+      expect.any(Object),
+      expect.objectContaining({
+        stCompat: {
+          chatOverride: [
+            { name: 'User', is_user: true, is_system: false, mes: 'hello' },
+          ],
+          extensionPrompts: [
+            {
+              key: 'scan-only-note',
+              value: 'Only world info should scan this.',
+              position: -1,
+              scan: true,
+              role: 0,
+            },
+            {
+              key: 'visible-note',
+              value: 'Visible extension note.',
+              position: 0,
+              role: 0,
+            },
           ],
         },
       }),
     )
+  })
+
+  it('sorts and groups ST in-chat prompts by key, depth, and role', async () => {
+    stBridge.getStExtensionPromptsBridge.mockResolvedValue([
+      { key: 'z-system', value: '  Z system  ', position: 1, depth: 0, role: 0 },
+      { key: 'a-system', value: 'A system', position: 1, depth: 0, role: 0 },
+      { key: 'm-user', value: 'User note', position: 1, depth: 0, role: 1 },
+      { key: 'b-assistant', value: 'Assistant note', position: 1, depth: 0, role: 2 },
+      { key: 'deep-system', value: 'Deep note', position: 1, depth: 1, role: 0 },
+    ])
+    vi.mocked(api.chats.regenerate).mockResolvedValue(new Response('', { status: 200 }))
+
+    const { result } = renderHook(() => useChatActions(messages), { wrapper: createWrapper() })
+
+    await act(async () => {
+      await result.current.handleRegenerate(1)
+    })
+
+    expect(stBridge.runStPromptLifecycleBridge).toHaveBeenCalledWith([
+      { role: 'system', content: 'Deep note' },
+      { role: 'user', content: 'hello' },
+      { role: 'assistant', content: 'Assistant note' },
+      { role: 'user', content: 'User note' },
+      { role: 'system', content: 'A system\nZ system' },
+    ], 'normal', 'chat_completion')
   })
 
   it('passes ST generate-after-data prompt mutations to regeneration requests', async () => {
@@ -359,7 +433,7 @@ describe('useChatActions ST generation compatibility', () => {
         role: 0,
       },
     ])
-    stBridge.runStGenerateAfterDataBridge.mockResolvedValue([
+    stBridge.runStPromptLifecycleBridge.mockResolvedValue([
       { role: 'system', content: 'Remember the plugin-provided rule.' },
       { role: 'user', content: 'hello after plugin macro replacement' },
       { role: 'assistant', content: 'assistant-side plugin note' },
@@ -372,12 +446,13 @@ describe('useChatActions ST generation compatibility', () => {
       await result.current.handleRegenerate(1)
     })
 
-    expect(stBridge.runStGenerateAfterDataBridge).toHaveBeenCalledWith(
+    expect(stBridge.runStPromptLifecycleBridge).toHaveBeenCalledWith(
       [
         { role: 'system', content: 'Remember the plugin-provided rule.' },
         { role: 'user', content: 'hello' },
       ],
       'normal',
+      'chat_completion',
     )
     expect(api.chats.regenerate).toHaveBeenCalledWith(
       'compat-char.json',
@@ -405,6 +480,25 @@ describe('useChatActions ST generation compatibility', () => {
           ],
         },
       }),
+    )
+  })
+
+  it('uses the text-completion prompt lifecycle for legacy completion format', async () => {
+    useSettingsStore.setState(state => ({
+      llmConfig: { ...state.llmConfig, customApiFormat: 'openai_completion' },
+    }))
+    vi.mocked(api.chats.regenerate).mockResolvedValue(new Response('', { status: 200 }))
+
+    const { result } = renderHook(() => useChatActions(messages), { wrapper: createWrapper() })
+
+    await act(async () => {
+      await result.current.handleRegenerate(1)
+    })
+
+    expect(stBridge.runStPromptLifecycleBridge).toHaveBeenCalledWith(
+      [{ role: 'user', content: 'hello' }],
+      'normal',
+      'text_completion',
     )
   })
 

@@ -10,6 +10,7 @@ import {
   getCharacter,
   getCharacters,
   getOneCharacter,
+  getExtensionPromptByName,
   getExtensionPromptsSnapshot,
   getGlobalVariable,
   getLocalVariable,
@@ -36,6 +37,7 @@ import {
   setWorldInfoSelection,
   updateWorldInfoList,
   saveChatConditional,
+  setCompatUserName,
   updateStExtensionContext,
   updateMessageBlock,
   reloadCurrentChat,
@@ -69,6 +71,30 @@ afterEach(() => {
 })
 
 describe('SillyTavern extension host compatibility', () => {
+  it('keeps persona user-name overrides consistent across context and macros', () => {
+    updateStExtensionContext({
+      activeChatId: 'persona-name-chat',
+      chatLines: [{ chat_metadata: {}, user_name: 'Original', character_name: 'Cora' }],
+    })
+
+    setCompatUserName('Writer')
+
+    expect(getContext()).toMatchObject({
+      name1: 'Writer',
+      userName: 'Writer',
+      user_name: 'Writer',
+    })
+    expect(replaceVariableMacros('{{user}}')).toBe('Writer')
+
+    setCompatUserName('')
+    expect(getContext().name1).toBe('You')
+    setCompatUserName('   ')
+    expect(getContext().name1).toBe('   ')
+
+    updateStExtensionContext({ activeChatId: 'next-chat' })
+    expect(getContext().name1).toBe('Original')
+  })
+
   it('auto-fires APP_READY for listeners registered after the event', async () => {
     const listener = vi.fn()
 
@@ -124,20 +150,59 @@ describe('SillyTavern extension host compatibility', () => {
     expect(context.chat).toEqual([expect.objectContaining({ name: 'You', is_user: true, mes: 'hello' })])
   })
 
-  it('exports sanitized ST extension prompt snapshots for generation requests', () => {
-    setExtensionPrompt('plugin-system-note', 'Remember this rule.', '0', '2', true, '1')
+  it('exports filtered and macro-resolved ST extension prompt snapshots for generation requests', async () => {
+    updateStExtensionContext({
+      activeCharacter: {
+        id: 'char-a',
+        name: 'Alice',
+        avatar: null,
+        description: '',
+        model: 'default',
+        lastMessage: '',
+        pinned: false,
+        file_name: 'Alice',
+        world: null,
+      },
+    })
+    setExtensionPrompt('plugin-system-note', 'Remember {{char}}.', '0', '2', true, '1', null)
+    setExtensionPrompt('filtered-note', 'Hidden note.', 0, 0, true, 0, () => false)
     setExtensionPrompt('empty-note', '', 0, 0, true, 0)
 
-    expect(getExtensionPromptsSnapshot()).toEqual([
+    await expect(getExtensionPromptsSnapshot()).resolves.toEqual([
       {
         key: 'plugin-system-note',
-        value: 'Remember this rule.',
+        value: 'Remember Alice.',
         position: 0,
         depth: 2,
         scan: true,
         role: 1,
       },
     ])
+  })
+
+  it('resolves ST extension prompts through filters and macro substitution', async () => {
+    updateStExtensionContext({
+      activeCharacter: {
+        id: 'char-a',
+        name: 'Alice',
+        avatar: null,
+        description: '',
+        model: 'default',
+        lastMessage: '',
+        pinned: false,
+        file_name: 'Alice',
+        world: null,
+      },
+    })
+    setCompatUserName('Riley')
+    setExtensionPrompt('visible-note', '{{user}} meets {{char}}.', 0, 0, true, 0)
+    const filter = vi.fn().mockResolvedValue(false)
+    setExtensionPrompt('filtered-note', 'Hidden note.', 0, 0, true, 0, filter)
+
+    await expect(getExtensionPromptByName('visible-note')).resolves.toBe('Riley meets Alice.')
+    await expect(getExtensionPromptByName('filtered-note')).resolves.toBe('')
+    await expect(getExtensionPromptByName('missing-note')).resolves.toBe('')
+    expect(filter).toHaveBeenCalledOnce()
   })
 
   it('mirrors ST send-button generation state without granting native send control', async () => {
@@ -1957,6 +2022,8 @@ describe('SillyTavern extension host compatibility', () => {
         score: '0.9',
         source: ' plugin ',
         hash: 'hash-3',
+        ignoreBudget: true,
+        group: '',
       },
       { world: '', uid: 4 },
       { world: 'Lore', uid: -1 },
@@ -1978,6 +2045,8 @@ describe('SillyTavern extension host compatibility', () => {
       score: 0.9,
       source: 'plugin',
       hash: 'hash-3',
+      ignoreBudget: true,
+      group: '',
     })
     expect(externalActivations).not.toHaveProperty('Lore.-1')
 
@@ -1992,6 +2061,8 @@ describe('SillyTavern extension host compatibility', () => {
           world: 'Lore',
           uid: 3,
           content: '\n  Replacement activation.\n',
+          ignoreBudget: true,
+          group: '',
         },
       },
     })

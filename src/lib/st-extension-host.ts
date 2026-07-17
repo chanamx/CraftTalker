@@ -115,6 +115,7 @@ interface ExtensionPrompt {
   depth?: unknown
   scan?: unknown
   role?: unknown
+  filter?: (() => unknown | Promise<unknown>) | null
 }
 
 type WorldInfoCharLoreEntry = {
@@ -225,6 +226,7 @@ interface StHostApi {
   saveMetadataDebounced: typeof saveMetadataDebounced
   saveSettings: typeof saveSettings
   saveSettingsDebounced: typeof saveSettingsDebounced
+  setUserName: typeof setCompatUserName
   setExtensionPrompt: typeof setExtensionPrompt
   getExtensionPromptByName: typeof getExtensionPromptByName
   getExtensionPromptsSnapshot: typeof getExtensionPromptsSnapshot
@@ -579,6 +581,7 @@ let saveChatTimer: number | null = null
 let initializePromise: Promise<void> | null = null
 let currentCharacterIndex = -1
 let compatIsSendPress = false
+let compatUserNameOverride: string | null = null
 let compatGenerationStateHooksInstalled = false
 let compatWorldInfoForceActivationHookInstalled = false
 let contextState: StHostContextState = {
@@ -835,9 +838,19 @@ function parseSlashBoolean(value: unknown, fallback: boolean): boolean {
   return fallback
 }
 
-function getCompatUserName(): string {
+function getChatHeaderUserName(): string {
   const header = contextState.chatLines.find(line => line.user_name)
   return String(header?.user_name ?? 'You')
+}
+
+function getCompatUserName(): string {
+  return compatUserNameOverride ?? getChatHeaderUserName()
+}
+
+export function setCompatUserName(value: unknown): string {
+  const name = String(value ?? '') || 'You'
+  compatUserNameOverride = name === getChatHeaderUserName() ? null : name
+  return name
 }
 
 function getCompatCharacterName(): string {
@@ -1086,6 +1099,7 @@ export function getContext(): Record<string, unknown> {
     reloadCurrentChat,
     renameChat: async () => recordCompatDiagnostic('renameChat', 'stub', 'Chat rename through the ST compatibility context is not implemented yet.'),
     saveSettingsDebounced,
+    setUserName: setCompatUserName,
     onlineStatus: 'no_connection',
     maxContext: 0,
     chatMetadata: chat_metadata,
@@ -1179,6 +1193,9 @@ export function getContext(): Record<string, unknown> {
 
 export function updateStExtensionContext(next: Partial<StHostContextState>): void {
   const previousChatId = contextState.activeChatId
+  if (next.activeChatId !== undefined && next.activeChatId !== previousChatId) {
+    compatUserNameOverride = null
+  }
   contextState = { ...contextState, ...next }
   rebuildCompatState()
   publishGlobals()
@@ -2199,13 +2216,18 @@ export function setExtensionPrompt(
   depth?: unknown,
   scan?: unknown,
   role?: unknown,
+  filter?: (() => unknown | Promise<unknown>) | null,
 ): void {
   if (!name) return
-  extension_prompts[name] = { value, position, depth, scan, role }
+  extension_prompts[name] = { value, position, depth, scan, role, filter }
 }
 
-export function getExtensionPromptByName(name: string): ExtensionPrompt | undefined {
-  return extension_prompts[name]
+export async function getExtensionPromptByName(name: string): Promise<string> {
+  if (!name) return ''
+  const prompt = extension_prompts[name]
+  if (!prompt) return ''
+  if (typeof prompt.filter === 'function' && !await prompt.filter()) return ''
+  return replaceVariableMacros(prompt.value)
 }
 
 function finiteNumber(value: unknown): number | undefined {
@@ -2217,13 +2239,15 @@ function finiteNumber(value: unknown): number | undefined {
   return undefined
 }
 
-export function getExtensionPromptsSnapshot(): StCompatExtensionPrompt[] {
-  return Object.entries(extension_prompts).flatMap(([key, prompt]) => {
-    if (!key || typeof prompt.value !== 'string' || !prompt.value) return []
+export async function getExtensionPromptsSnapshot(): Promise<StCompatExtensionPrompt[]> {
+  const snapshots = await Promise.all(Object.entries(extension_prompts).map(async ([key, prompt]) => {
+    if (!key || typeof prompt.value !== 'string' || !prompt.value) return null
+    const value = await getExtensionPromptByName(key)
+    if (!value) return null
 
     const snapshot: StCompatExtensionPrompt = {
       key,
-      value: prompt.value,
+      value,
     }
     const position = finiteNumber(prompt.position)
     const depth = finiteNumber(prompt.depth)
@@ -2231,11 +2255,13 @@ export function getExtensionPromptsSnapshot(): StCompatExtensionPrompt[] {
 
     if (position !== undefined) snapshot.position = position
     if (depth !== undefined) snapshot.depth = depth
-    if (prompt.scan === true) snapshot.scan = true
+    if (prompt.scan) snapshot.scan = true
     if (role !== undefined) snapshot.role = role
 
-    return [snapshot]
-  })
+    return snapshot
+  }))
+
+  return snapshots.filter((snapshot): snapshot is StCompatExtensionPrompt => snapshot !== null)
 }
 
 export function registerMacro(name: string, handler: unknown): void {
@@ -2567,6 +2593,21 @@ function createDefaultExtensionSettings(): ExtensionSettings {
     objective: {},
     quickReply: {},
     quickReplyV2: { config: { setList: [] } },
+    power_user: {
+      personas: {},
+      persona_descriptions: {},
+      default_persona: null,
+      persona_description: '',
+      persona_description_position: 0,
+      persona_description_depth: 2,
+      persona_description_role: 0,
+      persona_description_lorebook: '',
+      persona_show_notifications: false,
+      persona_sort_order: 'asc',
+      custom_stopping_strings: '',
+      custom_stopping_strings_macro: false,
+      streaming_fps: 30,
+    },
     randomizer: { controls: [], fluctuation: 0.1, enabled: false },
     speech_recognition: {},
     rvc: {},
@@ -4389,6 +4430,7 @@ const stHost: StHostApi = {
   saveMetadataDebounced,
   saveSettings,
   saveSettingsDebounced,
+  setUserName: setCompatUserName,
   setExtensionPrompt,
   getExtensionPromptByName,
   getExtensionPromptsSnapshot,
@@ -4566,6 +4608,8 @@ function normalizeWorldInfoForceActivation(candidate: unknown): WorldInfoForceAc
   assignNormalizedWorldInfoActivationNumber(activation, 'score', candidate.score)
   assignNormalizedWorldInfoActivationString(activation, 'source', candidate.source)
   assignNormalizedWorldInfoActivationScalar(activation, 'hash', candidate.hash)
+  if (typeof candidate.ignoreBudget === 'boolean') activation.ignoreBudget = candidate.ignoreBudget
+  if (typeof candidate.group === 'string') activation.group = candidate.group
 
   return activation
 }

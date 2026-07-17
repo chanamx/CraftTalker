@@ -5,7 +5,7 @@ import { useSettingsStore } from '@/stores/settings-store'
 import { useSendMessage, useGenerateStream } from '@/hooks/use-chats'
 import { useCommitRun, useDiscardRun, useRecoverableRuns } from '@/hooks/use-runs'
 import { ApiRequestError, api, consumeSSEStream, type ChatDetail, type ChatLine, type StCompatChatOverrideLine, type StCompatExtensionPrompt, type StCompatGenerationOptions, type StCompatPromptMessage } from '@/lib/api'
-import { emitStExtensionEvent, emitStExtensionEventAsync, getStExtensionPromptsBridge, runStGenerateAfterDataBridge, runStGenerationBeforeEndBridge, runStGenerationInterceptorsBridge, stEventTypes, syncStExtensionContextBridge } from '@/lib/st-extension-bridge'
+import { emitStExtensionEvent, emitStExtensionEventAsync, getStExtensionPromptsBridge, runStGenerationBeforeEndBridge, runStGenerationInterceptorsBridge, runStPromptLifecycleBridge, stEventTypes, syncStExtensionContextBridge } from '@/lib/st-extension-bridge'
 import { useToast } from '@/lib/toast'
 import { mapChatLineToMessage, type ChatMessage } from '@/types'
 
@@ -188,19 +188,20 @@ function resolveNativeGeneratedLineIndex(
 }
 
 const EXTENSION_PROMPT_POSITION = {
+  NONE: -1,
   IN_CHAT: 1,
   AFTER_PROMPT: 3,
 } as const
 
-function extensionPromptRole(prompt: StCompatExtensionPrompt): StCompatPromptMessage['role'] {
-  if (prompt.role === 1) return 'user'
-  if (prompt.role === 2) return 'assistant'
+function extensionPromptRole(role: StCompatExtensionPrompt['role']): StCompatPromptMessage['role'] {
+  if (role === 1) return 'user'
+  if (role === 2) return 'assistant'
   return 'system'
 }
 
 function extensionPromptToMessage(prompt: StCompatExtensionPrompt): StCompatPromptMessage {
   return {
-    role: extensionPromptRole(prompt),
+    role: extensionPromptRole(prompt.role),
     content: prompt.value,
   }
 }
@@ -214,29 +215,61 @@ function buildStGeneratePromptMessages(
 
   const before: StCompatPromptMessage[] = []
   const after: StCompatPromptMessage[] = []
+  const inChat: StCompatExtensionPrompt[] = []
 
   for (const prompt of extensionPrompts) {
     if (!prompt.value) continue
-    const message = extensionPromptToMessage(prompt)
+    if (prompt.position === EXTENSION_PROMPT_POSITION.NONE) continue
 
-    if (prompt.position === EXTENSION_PROMPT_POSITION.AFTER_PROMPT) {
-      after.push(message)
+    if (prompt.position === EXTENSION_PROMPT_POSITION.IN_CHAT) {
+      inChat.push(prompt)
       continue
     }
 
-    if (prompt.position === EXTENSION_PROMPT_POSITION.IN_CHAT) {
-      const depth = typeof prompt.depth === 'number' && Number.isFinite(prompt.depth)
-        ? Math.max(0, Math.floor(prompt.depth))
-        : 0
-      const insertIdx = Math.max(0, result.length - depth)
-      result.splice(insertIdx, 0, message)
+    const message = extensionPromptToMessage(prompt)
+    if (prompt.position === EXTENSION_PROMPT_POSITION.AFTER_PROMPT) {
+      after.push(message)
       continue
     }
 
     before.push(message)
   }
 
+  const originalMessageCount = result.length
+  const grouped = new Map<number, Map<number, string[]>>()
+  for (const prompt of inChat.sort((left, right) => left.key < right.key ? -1 : left.key > right.key ? 1 : 0)) {
+    const content = prompt.value.trim()
+    if (!content) continue
+    const depth = typeof prompt.depth === 'number' && Number.isFinite(prompt.depth)
+      ? Math.max(0, Math.floor(prompt.depth))
+      : 0
+    const role = prompt.role === 1 || prompt.role === 2 ? prompt.role : 0
+    const byRole = grouped.get(depth) ?? new Map<number, string[]>()
+    const contents = byRole.get(role) ?? []
+    contents.push(content)
+    byRole.set(role, contents)
+    grouped.set(depth, byRole)
+  }
+
+  for (const depth of [...grouped.keys()].sort((left, right) => left - right)) {
+    const insertIdx = Math.max(0, originalMessageCount - depth)
+    const byRole = grouped.get(depth)
+    for (const role of [0, 1, 2]) {
+      const contents = byRole?.get(role)
+      if (!contents?.length) continue
+      result.splice(insertIdx, 0, {
+        role: extensionPromptRole(role),
+        content: contents.join('\n'),
+      })
+    }
+  }
+
   return [...before, ...result, ...after]
+}
+
+function equalStPromptMessages(left: StCompatPromptMessage[], right: StCompatPromptMessage[]): boolean {
+  return left.length === right.length
+    && left.every((message, index) => message.role === right[index]?.role && message.content === right[index]?.content)
 }
 
 export function useChatActions(messages: ChatMessage[]) {
@@ -292,10 +325,18 @@ export function useChatActions(messages: ChatMessage[]) {
 
     const stCompatChatOverride = sanitizeStGenerationChatSnapshot(stChatSnapshot, charDisplayName)
     const stCompatExtensionPrompts = await getStExtensionPromptsBridge()
-    const stCompatPromptMessages = await runStGenerateAfterDataBridge(
-      buildStGeneratePromptMessages(stCompatChatOverride, stCompatExtensionPrompts),
+    const basePromptMessages = buildStGeneratePromptMessages(stCompatChatOverride, stCompatExtensionPrompts)
+    const promptLifecycle = llmConfig.customApiFormat === 'openai_completion'
+      ? 'text_completion'
+      : 'chat_completion'
+    const hookPromptMessages = await runStPromptLifecycleBridge(
+      basePromptMessages,
       generationType,
+      promptLifecycle,
     )
+    const stCompatPromptMessages = equalStPromptMessages(basePromptMessages, hookPromptMessages)
+      ? undefined
+      : hookPromptMessages
     const abortController = new AbortController()
     startStreamEntry(key, abortController, mode)
     emitStExtensionEvent(stEventTypes.GENERATION_STARTED, mode)
@@ -308,7 +349,7 @@ export function useChatActions(messages: ChatMessage[]) {
       const response = await fetchResponse(abortController.signal, {
         chatOverride: stCompatChatOverride,
         extensionPrompts: stCompatExtensionPrompts,
-        promptMessages: stCompatPromptMessages,
+        ...(stCompatPromptMessages ? { promptMessages: stCompatPromptMessages } : {}),
       })
 
       if (!response.ok) {

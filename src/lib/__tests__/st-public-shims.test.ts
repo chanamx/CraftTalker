@@ -14,8 +14,10 @@ interface TestGlobal {
         emit?: (...args: unknown[]) => unknown
       }
       extension_settings?: Record<string, unknown>
+      extension_prompts?: Record<string, unknown>
       characters?: Array<Record<string, unknown>>
       getContext?: () => Record<string, unknown>
+      getExtensionPromptByName?: (name: string) => unknown | Promise<unknown>
       getCharacters?: () => Promise<Array<Record<string, unknown>>>
       getOneCharacter?: (id: unknown) => Promise<Record<string, unknown> | null>
       unshallowCharacter?: (id: unknown) => Promise<Record<string, unknown> | null>
@@ -36,6 +38,8 @@ interface TestGlobal {
       unregisterMacro?: (...args: unknown[]) => unknown
       registerMacroLike?: (...args: unknown[]) => unknown
       unregisterMacroLike?: (...args: unknown[]) => unknown
+      saveSettingsDebounced?: () => void
+      setUserName?: (value: unknown) => unknown
     }
   }
   SillyTavern?: unknown
@@ -63,6 +67,11 @@ async function importCustomRequestShim() {
 async function importWorldInfoShim() {
   // @ts-expect-error Public compatibility shims are served as plain browser JS.
   return await import('../../../public/scripts/compat/world-info.js')
+}
+
+async function importAuthorsNoteShim() {
+  // @ts-expect-error Public compatibility shims are served as plain browser JS.
+  return await import('../../../public/scripts/compat/authors-note.js')
 }
 
 async function importScriptShim() {
@@ -466,6 +475,27 @@ describe('ST public compatibility shims', () => {
     expect(makeHtml).toHaveBeenCalledWith('help')
   })
 
+  it('exports the ST NONE extension prompt position while retaining the legacy host extension', async () => {
+    testGlobal().CraftTalker = {
+      stHost: {
+        getRequestHeaders: () => ({ 'Content-Type': 'application/json' }),
+        getContext: () => ({ this_chid: -1 }),
+        event_types: {},
+        eventSource: { on: vi.fn() },
+      },
+    }
+
+    const scriptShim = await importScriptShim()
+
+    expect(scriptShim.extension_prompt_types).toEqual({
+      NONE: -1,
+      IN_PROMPT: 0,
+      IN_CHAT: 1,
+      BEFORE_PROMPT: 2,
+      AFTER_PROMPT: 3,
+    })
+  })
+
   it('forwards legacy public UI helpers to the active ST context when available', async () => {
     const reloadCurrentChat = vi.fn()
     let sendPressed = false
@@ -853,8 +883,9 @@ describe('ST public compatibility shims', () => {
       stHost: {
         getRequestHeaders: () => ({ 'X-Test': 'avatars' }),
         getContext: () => ({ this_chid: -1 }),
-        event_types: { CHAT_CHANGED: 'chat_changed', APP_READY: 'app_ready' },
-        eventSource: { on: vi.fn() },
+        event_types: { CHAT_CHANGED: 'chat_changed', APP_READY: 'app_ready', PERSONA_CHANGED: 'persona_changed' },
+        eventSource: { on: vi.fn(), emit: vi.fn() },
+        saveSettingsDebounced: vi.fn(),
       },
     }
 
@@ -871,6 +902,11 @@ describe('ST public compatibility shims', () => {
     }))
     expect(personasShim.getUserAvatar('Alt Avatar.png')).toBe('/User%20Avatars/Alt%20Avatar.png')
     expect(scriptShim.user_avatar).toBe('Alt Avatar.png')
+    expect(testGlobal().CraftTalker?.stHost.eventSource?.emit).toHaveBeenCalledWith(
+      'persona_changed',
+      'Alt Avatar.png',
+    )
+    expect(testGlobal().CraftTalker?.stHost.saveSettingsDebounced).toHaveBeenCalledTimes(1)
     expect(scriptShim.getThumbnailUrl('persona', 'Alt Avatar.png')).toBe('/User%20Avatars/Alt%20Avatar.png')
     expect(scriptShim.getThumbnailUrl('avatar', '/api/characters/Detail%20Bot/avatar')).toBe('/thumbnail?type=avatar&file=Detail%20Bot.png')
     expect(scriptShim.getThumbnailUrl('avatar', 'DetailBot.png')).toBe('/thumbnail?type=avatar&file=DetailBot.png')
@@ -886,6 +922,370 @@ describe('ST public compatibility shims', () => {
       persona_description_depth: 2,
       streaming_fps: 30,
     })
+  })
+
+  it('synchronizes the selected persona prompt view and user name before PERSONA_CHANGED', async () => {
+    const calls: string[] = []
+    let contextName = 'Original'
+    const listeners = new Map<string, Array<(...args: unknown[]) => unknown>>()
+    const saveSettingsDebounced = vi.fn(() => calls.push('save'))
+    const setUserName = vi.fn((value: unknown) => {
+      contextName = String(value)
+      calls.push(`name:${contextName}`)
+    })
+    const on = vi.fn((event: unknown, listener: unknown) => {
+      const key = String(event)
+      const entries = listeners.get(key) ?? []
+      entries.push(listener as (...args: unknown[]) => unknown)
+      listeners.set(key, entries)
+    })
+    const emit = vi.fn(async (event: unknown, avatarId: unknown) => {
+      calls.push(`event:${String(event)}:${String(avatarId)}`)
+      for (const listener of listeners.get(String(event)) ?? []) {
+        await listener(avatarId)
+      }
+    })
+    const powerUser = {
+      personas: { 'Writer.png': 'Writer' },
+      persona_descriptions: {
+        'Writer.png': {
+          description: 'Write with precision.',
+          position: 4,
+          depth: 7,
+          role: 2,
+          lorebook: 'WriterLore',
+          extensionField: { preserved: true },
+        },
+      },
+      persona_description: 'Old persona',
+      persona_description_position: 0,
+      persona_description_depth: 2,
+      persona_description_role: 0,
+      persona_description_lorebook: '',
+    }
+    testGlobal().CraftTalker = {
+      stHost: {
+        getRequestHeaders: () => ({ 'Content-Type': 'application/json' }),
+        getContext: () => ({ name1: contextName }),
+        extension_settings: { power_user: powerUser },
+        event_types: { PERSONA_CHANGED: 'persona_changed' },
+        eventSource: { on, emit },
+        saveSettingsDebounced,
+        setUserName,
+      },
+    }
+
+    const script = await importScriptShim()
+    const personas = await importPersonasShim()
+    await personas.setUserAvatar('Writer.png')
+
+    expect(powerUser).toMatchObject({
+      persona_description: 'Write with precision.',
+      persona_description_position: 4,
+      persona_description_depth: 7,
+      persona_description_role: 2,
+      persona_description_lorebook: 'WriterLore',
+    })
+    expect(powerUser.persona_descriptions['Writer.png'].extensionField).toEqual({ preserved: true })
+    expect(setUserName).toHaveBeenCalledWith('Writer')
+    expect(script.name1).toBe('Writer')
+    expect(calls).toEqual(['name:Writer', 'save', 'event:persona_changed:Writer.png'])
+  })
+
+  it('resets stale prompt-time persona state when the selected persona has no descriptor', async () => {
+    const powerUser = {
+      personas: { 'Blank.png': 'Blank' },
+      persona_descriptions: {} as Record<string, Record<string, unknown>>,
+      persona_description: 'Previous persona content',
+      persona_description_position: 4,
+      persona_description_depth: 9,
+      persona_description_role: 2,
+      persona_description_lorebook: 'PreviousLore',
+    }
+    testGlobal().CraftTalker = {
+      stHost: {
+        getRequestHeaders: () => ({ 'Content-Type': 'application/json' }),
+        extension_settings: { power_user: powerUser },
+        event_types: { PERSONA_CHANGED: 'persona_changed' },
+        eventSource: { on: vi.fn(), emit: vi.fn() },
+        saveSettingsDebounced: vi.fn(),
+        setUserName: vi.fn(),
+      },
+    }
+
+    const personas = await importPersonasShim()
+    await personas.setUserAvatar('Blank.png')
+
+    expect(powerUser).toMatchObject({
+      persona_description: '',
+      persona_description_position: 0,
+      persona_description_depth: 2,
+      persona_description_role: 0,
+      persona_description_lorebook: '',
+    })
+    expect(powerUser.persona_descriptions['Blank.png']).toMatchObject({
+      description: '',
+      position: 0,
+      depth: 2,
+      role: 0,
+      lorebook: '',
+      title: '',
+    })
+  })
+  it('does not apply an orphan persona descriptor without a registered persona name', async () => {
+    const powerUser = {
+      personas: {},
+      persona_descriptions: {
+        'Orphan.png': {
+          description: 'Orphan content',
+          position: 4,
+          depth: 9,
+          role: 2,
+          lorebook: 'OrphanLore',
+        },
+      },
+      persona_description: 'Current content',
+      persona_description_position: 0,
+      persona_description_depth: 2,
+      persona_description_role: 0,
+      persona_description_lorebook: '',
+    }
+    testGlobal().CraftTalker = {
+      stHost: {
+        getRequestHeaders: () => ({ 'Content-Type': 'application/json' }),
+        extension_settings: { power_user: powerUser },
+        event_types: { PERSONA_CHANGED: 'persona_changed' },
+        eventSource: { on: vi.fn(), emit: vi.fn() },
+        saveSettingsDebounced: vi.fn(),
+        setUserName: vi.fn(),
+      },
+    }
+
+    const personas = await importPersonasShim()
+    await personas.setUserAvatar('Orphan.png')
+
+    expect(powerUser).toMatchObject({
+      persona_description: 'Current content',
+      persona_description_position: 0,
+      persona_description_depth: 2,
+      persona_description_role: 0,
+      persona_description_lorebook: '',
+    })
+    expect(testGlobal().CraftTalker?.stHost.setUserName).not.toHaveBeenCalled()
+  })
+  it('forwards public setUserName updates into the shared ST host context', async () => {
+    const setUserName = vi.fn((value: unknown) => String(value || 'You'))
+    testGlobal().CraftTalker = {
+      stHost: {
+        getRequestHeaders: () => ({ 'Content-Type': 'application/json' }),
+        getContext: () => ({ name1: 'Original' }),
+        event_types: {},
+        eventSource: { on: vi.fn(), emit: vi.fn() },
+        setUserName,
+      },
+    }
+
+    const script = await importScriptShim()
+    script.setUserName('Writer')
+
+    expect(script.name1).toBe('Writer')
+    expect(setUserName).toHaveBeenCalledWith('Writer')
+
+    script.setUserName('')
+    expect(script.name1).toBe('You')
+    expect(setUserName).toHaveBeenLastCalledWith('')
+  })
+
+  it('backs ST power_user persona state with persisted extension settings', async () => {
+    const persistedPowerUser = {
+      personas: { 'Writer.png': 'Writer' },
+      persona_descriptions: { 'Writer.png': { description: 'Persistent persona' } },
+      default_persona: 'Writer.png',
+      persona_description_depth: 4,
+    }
+    testGlobal().CraftTalker = {
+      stHost: {
+        getRequestHeaders: () => ({ 'Content-Type': 'application/json' }),
+        extension_settings: { power_user: persistedPowerUser },
+      },
+    }
+
+    const { power_user } = await importPowerUserShim()
+
+    expect(power_user).toBe(persistedPowerUser)
+    expect(power_user).toMatchObject({
+      personas: { 'Writer.png': 'Writer' },
+      persona_descriptions: { 'Writer.png': { description: 'Persistent persona' } },
+      default_persona: 'Writer.png',
+      persona_description_depth: 4,
+      streaming_fps: 30,
+    })
+    power_user.personas['Editor.png'] = 'Editor'
+    expect(persistedPowerUser.personas).toEqual({
+      'Writer.png': 'Writer',
+      'Editor.png': 'Editor',
+    })
+  })
+
+  it('creates personas with the exact ST 1.18 lifecycle payload and silent option', async () => {
+    const emit = vi.fn()
+    const saveSettingsDebounced = vi.fn()
+    const powerUser = { personas: {}, persona_descriptions: {} }
+    testGlobal().CraftTalker = {
+      stHost: {
+        getRequestHeaders: () => ({ 'Content-Type': 'application/json' }),
+        extension_settings: { power_user: powerUser },
+        event_types: { PERSONA_CREATED: 'persona_created' },
+        eventSource: { on: vi.fn(), emit },
+        saveSettingsDebounced,
+      },
+    }
+
+    const personas = await importPersonasShim()
+    await personas.initPersona('Writer.png', 'Writer', 'Persistent persona', 'Author', {
+      position: 4,
+      depth: 7,
+      role: 2,
+      lorebook: 'PersonaLore',
+    })
+
+    expect(powerUser).toMatchObject({
+      personas: { 'Writer.png': 'Writer' },
+      persona_descriptions: {
+        'Writer.png': {
+          description: 'Persistent persona',
+          title: 'Author',
+          position: 4,
+          depth: 7,
+          role: 2,
+          lorebook: 'PersonaLore',
+        },
+      },
+    })
+    expect(saveSettingsDebounced).toHaveBeenCalledTimes(1)
+    expect(emit).toHaveBeenCalledWith('persona_created', {
+      avatarId: 'Writer.png',
+      name: 'Writer',
+      description: 'Persistent persona',
+      title: 'Author',
+    })
+
+    await personas.initPersona('Silent.png', 'Silent', '', '', { silent: true })
+    expect(saveSettingsDebounced).toHaveBeenCalledTimes(2)
+    expect(emit).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps persona descriptors as shared ST state and creates missing descriptors from power_user defaults', async () => {
+    const existingDescriptor = {
+      description: 'Existing description',
+      position: 4,
+      depth: 6,
+      role: 2,
+      lorebook: 'ExistingLore',
+      title: 'Existing title',
+      extensionField: { preserved: true },
+    }
+    const personaDescriptions: Record<string, {
+      description: string
+      position: number
+      depth: number
+      role: number
+      lorebook: string
+      title: string
+      connections?: unknown[]
+      extensionField?: { preserved: boolean }
+    }> = { 'Existing.png': existingDescriptor }
+    const powerUser = {
+      personas: { 'Existing.png': 'Existing' },
+      persona_descriptions: personaDescriptions,
+      persona_description: 'Default description',
+      persona_description_position: 3,
+      persona_description_depth: 8,
+      persona_description_role: 1,
+      persona_description_lorebook: 'DefaultLore',
+    }
+    testGlobal().CraftTalker = {
+      stHost: {
+        getRequestHeaders: () => ({ 'Content-Type': 'application/json' }),
+        extension_settings: { power_user: powerUser },
+        saveSettingsDebounced: vi.fn(),
+      },
+    }
+
+    const personas = await importPersonasShim()
+    await personas.setUserAvatar('Existing.png')
+    const sharedDescriptor = personas.getOrCreatePersonaDescriptor()
+    expect(sharedDescriptor).toBe(existingDescriptor)
+    sharedDescriptor.depth = 9
+    expect(powerUser.persona_descriptions['Existing.png'].depth).toBe(9)
+
+    personas.setPersonaDescription()
+    expect(powerUser).toMatchObject({
+      persona_description: 'Existing description',
+      persona_description_position: 4,
+      persona_description_depth: 9,
+      persona_description_role: 2,
+      persona_description_lorebook: 'ExistingLore',
+    })
+    expect(existingDescriptor.extensionField).toEqual({ preserved: true })
+
+    await personas.setUserAvatar('Missing.png')
+    powerUser.persona_description = 'New description'
+    powerUser.persona_description_position = 3
+    powerUser.persona_description_depth = 8
+    powerUser.persona_description_role = 1
+    powerUser.persona_description_lorebook = 'DefaultLore'
+    const createdDescriptor = personas.getOrCreatePersonaDescriptor()
+    expect(createdDescriptor).toBe(powerUser.persona_descriptions['Missing.png'])
+    expect(createdDescriptor).toEqual({
+      description: 'New description',
+      position: 3,
+      depth: 8,
+      role: 1,
+      lorebook: 'DefaultLore',
+      connections: [],
+      title: '',
+    })
+  })
+  it('preserves ST 1.18 streaming signatures and tool signatures', async () => {
+    testGlobal().CraftTalker = {
+      stHost: {
+        getRequestHeaders: () => ({ 'Content-Type': 'application/json' }),
+      },
+    }
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(sseResponse([
+      'data: {"choices":[{"delta":{"content":"Hi","signature":"sig-1","tool_calls":[{"index":0,"signature":"tool-1"}]}}]}\n\n',
+      'data: {"choices":[{"delta":{"toolSignatures":{"1":"tool-2"},"signature":"sig-2"}}]}\n\n',
+      'data: [DONE]\n\n',
+    ])))
+
+    const { ChatCompletionService } = await importCustomRequestShim()
+    const streamFactory = await ChatCompletionService.sendRequest({ stream: true }, false)
+    const states = []
+    for await (const state of streamFactory()) states.push(state)
+
+    expect(states.at(-1)).toMatchObject({
+      text: 'Hi',
+      state: {
+        signature: 'sig-2',
+        toolSignatures: { '0': 'tool-1', '1': 'tool-2' },
+      },
+    })
+  })
+
+  it('ignores empty signatures and merges tool signatures by stable index/id keys', async () => {
+    testGlobal().CraftTalker = { stHost: { getRequestHeaders: () => ({ 'Content-Type': 'application/json' }) } }
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(sseResponse([
+      'data: {"choices":[{"delta":{"signature":"","tool_calls":[{"id":"call-a","signature":"sig-a"},{"signature":"sig-fallback"}]}}]}\n\n',
+      'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"signature":"sig-a-2"}]}}]}\n\n',
+      'data: [DONE]\n\n',
+    ])))
+    const { ChatCompletionService } = await importCustomRequestShim()
+    const streamFactory = await ChatCompletionService.sendRequest({ stream: true }, false)
+    const states = []
+    for await (const state of streamFactory()) states.push(state)
+    expect(states.at(-1)?.state).toMatchObject({ toolSignatures: { '0': 'sig-a-2', '1': 'sig-fallback' } })
+    expect(states.at(-1)?.state.signature).toBe('')
   })
 
   it('forwards ST character refresh helpers to the active compatibility host', async () => {
@@ -990,6 +1390,8 @@ describe('ST public compatibility shims', () => {
         extension_settings: {
           regex: [
             { id: 'ai', findRegex: 'foo', replaceString: 'bar', placement: [2], promptOnly: true, markdownOnly: false, disabled: false, order: 2 },
+            { id: 'wi', findRegex: 'sealed', replaceString: 'opened', placement: [5], promptOnly: true, markdownOnly: false, disabled: false, order: 2 },
+            { id: 'wi-unscoped', findRegex: 'raw', replaceString: 'changed', placement: [5], promptOnly: false, markdownOnly: false, disabled: false, order: 2 },
             { id: 'display', findRegex: '/bar/g', replaceString: 'shown', placement: [2], promptOnly: false, markdownOnly: true, disabled: false, order: 3 },
             { id: 'disabled', findRegex: 'shown', replaceString: 'hidden', placement: [2], disabled: true, order: 4 },
           ],
@@ -1002,13 +1404,150 @@ describe('ST public compatibility shims', () => {
 
     const regexEngine = await importRegexEngineShim()
 
+    expect(regexEngine.regex_placement.MD_DISPLAY).toBe(0)
     expect(regexEngine.regex_placement.REASONING).toBe(6)
+    expect(regexEngine.regex_placement.WORLD_INFO).toBe(5)
     expect(regexEngine.getRegexedString('foo', regexEngine.regex_placement.AI_OUTPUT, { isPrompt: true })).toBe('bar')
+    expect(regexEngine.getRegexedString('sealed', regexEngine.regex_placement.WORLD_INFO, { isPrompt: true })).toBe('opened')
+    expect(regexEngine.getRegexedString('raw', regexEngine.regex_placement.WORLD_INFO, { isPrompt: true })).toBe('raw')
+    expect(regexEngine.getRegexedString('raw', regexEngine.regex_placement.WORLD_INFO)).toBe('changed')
     expect(regexEngine.getRegexedString('foo', regexEngine.regex_placement.USER_INPUT, { isPrompt: true })).toBe('foo')
     expect(regexEngine.getRegexedString('bar', regexEngine.regex_placement.AI_OUTPUT, { isMarkdown: true })).toBe('shown')
     expect(diagnostics).toEqual(expect.arrayContaining([
       expect.objectContaining({ id: 'getRegexedString', status: 'partial' }),
     ]))
+  })
+
+  it('requires the ST character regex allowlist to match the character avatar', async () => {
+    const character = {
+      name: 'Regex Bot',
+      avatar: 'Regex Bot.png',
+      data: {
+        extensions: {
+          regex_scripts: [
+            { findRegex: 'sealed', replaceString: 'opened', placement: [5], promptOnly: true },
+          ],
+        },
+      },
+    }
+    const extensionSettings: { regex: unknown[]; character_allowed_regex: string[] } = {
+      regex: [],
+      character_allowed_regex: [],
+    }
+    testGlobal().CraftTalker = {
+      stHost: {
+        getRequestHeaders: () => ({ 'Content-Type': 'application/json' }),
+        extension_settings: extensionSettings,
+        characters: [character],
+        getContext: () => ({ this_chid: 0 }),
+      },
+    }
+
+    const regexEngine = await importRegexEngineShim()
+    expect(regexEngine.getRegexedString('sealed', regexEngine.regex_placement.WORLD_INFO, { isPrompt: true })).toBe('sealed')
+
+    extensionSettings.character_allowed_regex.push('Regex Bot.png')
+    expect(regexEngine.getRegexedString('sealed', regexEngine.regex_placement.WORLD_INFO, { isPrompt: true })).toBe('opened')
+  })
+
+  it('keeps ST regex array order instead of sorting by legacy order fields', async () => {
+    testGlobal().CraftTalker = {
+      stHost: {
+        getRequestHeaders: () => ({ 'Content-Type': 'application/json' }),
+        extension_settings: {
+          regex: [
+            { findRegex: 'foo', replaceString: 'bar', placement: [5], promptOnly: true, order: 100 },
+            { findRegex: 'bar', replaceString: 'baz', placement: [5], promptOnly: true, order: 0 },
+          ],
+          character_allowed_regex: [],
+        },
+        characters: [],
+        getContext: () => ({ this_chid: -1 }),
+      },
+    }
+
+    const regexEngine = await importRegexEngineShim()
+    expect(regexEngine.getRegexedString('foo', regexEngine.regex_placement.WORLD_INFO, { isPrompt: true })).toBe('baz')
+  })
+
+  it('skips public regex transforms when the ST regex extension is disabled', async () => {
+    testGlobal().CraftTalker = {
+      stHost: {
+        getRequestHeaders: () => ({ 'Content-Type': 'application/json' }),
+        extension_settings: {
+          disabledExtensions: ['regex'],
+          regex: [
+            { findRegex: 'sealed', replaceString: 'opened', placement: [5], promptOnly: true },
+          ],
+          character_allowed_regex: [],
+        },
+        characters: [],
+        getContext: () => ({ this_chid: -1 }),
+      },
+    }
+
+    const regexEngine = await importRegexEngineShim()
+    expect(regexEngine.getRegexedString('sealed', regexEngine.regex_placement.WORLD_INFO, { isPrompt: true })).toBe('sealed')
+  })
+
+  it('treats null ST regex depth bounds as unrestricted', async () => {
+    testGlobal().CraftTalker = {
+      stHost: {
+        getRequestHeaders: () => ({ 'Content-Type': 'application/json' }),
+        extension_settings: {
+          disabledExtensions: [],
+          regex: [
+            { findRegex: 'sealed', replaceString: 'opened', placement: [5], promptOnly: true, minDepth: null, maxDepth: null },
+          ],
+          character_allowed_regex: [],
+        },
+        characters: [],
+        getContext: () => ({ this_chid: -1 }),
+      },
+    }
+
+    const regexEngine = await importRegexEngineShim()
+    expect(regexEngine.getRegexedString('sealed', regexEngine.regex_placement.WORLD_INFO, { isPrompt: true, depth: 4 })).toBe('opened')
+  })
+
+  it('matches ST advanced regex substitution and capture trimming semantics', async () => {
+    testGlobal().CraftTalker = {
+      stHost: {
+        getRequestHeaders: () => ({ 'Content-Type': 'application/json' }),
+        extension_settings: {
+          regex: [
+            {
+              findRegex: '/alpha\\[(?<value>[^\\]]+)\\]/g',
+              replaceString: '$1|$<value>|{{match}}',
+              trimStrings: ['sec'],
+              placement: [5],
+              promptOnly: true,
+            },
+            {
+              findRegex: '{{user}}',
+              replaceString: '{{char}} sees {{match}}',
+              substituteRegex: 2,
+              placement: [5],
+              promptOnly: true,
+            },
+          ],
+          character_allowed_regex: [],
+        },
+        characters: [],
+        getContext: () => ({ this_chid: -1 }),
+        replaceVariableMacros: (value: unknown) => String(value ?? '')
+          .replace(/{{user}}/gi, 'a+b')
+          .replace(/{{char}}/gi, 'RegexBot'),
+      },
+    }
+
+    const regexEngine = await importRegexEngineShim()
+    expect(regexEngine.getRegexedString('alpha[secret]', regexEngine.regex_placement.WORLD_INFO, { isPrompt: true })).toBe('ret|ret|alpha[ret]')
+    expect(regexEngine.getRegexedString('a+b and aaab', regexEngine.regex_placement.WORLD_INFO, { isPrompt: true })).toBe('RegexBot sees a+b and aaab')
+    expect(regexEngine.runRegexScript({ findRegex: 'foo', replaceString: '{{char}}' }, 'foo', { characterOverride: 'Override' })).toBe('RegexBot')
+    expect(regexEngine.runRegexScript({ findRegex: 'foo', replaceString: 'bar' }, 'foo FOO foo')).toBe('bar FOO foo')
+    expect(regexEngine.runRegexScript({ findRegex: '/foo/i', replaceString: 'bar' }, 'foo FOO foo')).toBe('bar FOO foo')
+    expect(regexEngine.runRegexScript({ findRegex: '/foo/gi', replaceString: 'bar' }, 'foo FOO foo')).toBe('bar bar bar')
   })
 
   it('forwards character extension field writes through the public extensions shim', async () => {
@@ -1260,6 +1799,219 @@ describe('ST public compatibility shims', () => {
     expect(emit).not.toHaveBeenCalled()
   })
 
+  it('forwards resolved scan-enabled extension prompts into public world info scans', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      matchedEntries: [],
+      worldInfoString: '',
+      worldInfoBefore: '',
+      worldInfoAfter: '',
+      worldInfoExamples: [],
+      worldInfoDepth: [],
+      anBefore: [],
+      anAfter: [],
+      outletEntries: {},
+      allActivatedEntries: [],
+      scanEvents: [],
+    }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }))
+    const extensionPrompts = {
+      TEMP_USER_MESSAGE: { value: 'raw temporary text', scan: true },
+      FILTERED_PROMPT: { value: 'filtered text', scan: true },
+      DISPLAY_ONLY: { value: 'display text', scan: false },
+    }
+    const getExtensionPromptByName = vi.fn(async (name: string) => ({
+      TEMP_USER_MESSAGE: '  resolved temporary text  ',
+      FILTERED_PROMPT: '',
+      DISPLAY_ONLY: 'display text',
+    })[name] ?? '')
+    vi.stubGlobal('fetch', fetchMock)
+    testGlobal().CraftTalker = {
+      stHost: {
+        getRequestHeaders: () => ({ 'Content-Type': 'application/json' }),
+        event_types: {},
+        eventSource: { on: vi.fn(), emit: vi.fn() },
+        world_names: [],
+        selected_world_info: [],
+        world_info: { globalSelect: [], charLore: [], entries: {} },
+        world_info_settings: {},
+        getExtensionPromptByName,
+        getContext: () => ({
+          this_chid: -1,
+          extensionPrompts,
+          getExtensionPromptByName,
+        }),
+        loadWorldInfo: async () => null,
+        updateWorldInfoList: async () => {},
+      },
+    }
+
+    const worldInfoShim = await importWorldInfoShim()
+    await worldInfoShim.getWorldInfoPrompt(['plain chat'], 4096, true)
+
+    const body = JSON.parse(fetchMock.mock.calls[0]?.[1]?.body as string)
+    expect(body.scanInjects).toEqual(['  resolved temporary text  '])
+    expect(getExtensionPromptByName).toHaveBeenCalledWith('TEMP_USER_MESSAGE')
+    expect(getExtensionPromptByName).toHaveBeenCalledWith('FILTERED_PROMPT')
+    expect(getExtensionPromptByName).not.toHaveBeenCalledWith('DISPLAY_ONLY')
+  })
+
+  it('fails public world info scans closed when extension prompt resolution throws', async () => {
+    const fetchMock = vi.fn()
+    const diagnostics = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    testGlobal().CraftTalker = {
+      stHost: {
+        getRequestHeaders: () => ({ 'Content-Type': 'application/json' }),
+        event_types: {},
+        eventSource: { on: vi.fn(), emit: vi.fn() },
+        world_names: [],
+        selected_world_info: [],
+        world_info: { globalSelect: [], charLore: [], entries: {} },
+        world_info_settings: {},
+        recordCompatDiagnostic: diagnostics,
+        getExtensionPromptByName: vi.fn().mockRejectedValue(new Error('filter failed')),
+        getContext: () => ({
+          this_chid: -1,
+          extensionPrompts: { BROKEN_PROMPT: { value: 'broken', scan: true } },
+        }),
+        loadWorldInfo: async () => null,
+        updateWorldInfoList: async () => {},
+      },
+    }
+
+    const worldInfoShim = await importWorldInfoShim()
+    const result = await worldInfoShim.getWorldInfoPrompt(['plain chat'], 4096, true)
+
+    expect(fetchMock).not.toHaveBeenCalled()
+    expect(result.sourceEntries).toEqual({
+      globalLore: [],
+      characterLore: [],
+      chatLore: [],
+      personaLore: [],
+    })
+    expect(diagnostics).toHaveBeenCalledWith(
+      'getWorldInfoPrompt',
+      'stub',
+      expect.stringContaining('empty ST-shaped prompt result'),
+    )
+  })
+
+  it('returns a stable empty source-entry contract when the public scan fails', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('offline')))
+    const diagnostics = vi.fn()
+    testGlobal().CraftTalker = {
+      stHost: {
+        getRequestHeaders: () => ({ 'Content-Type': 'application/json' }),
+        event_types: {},
+        eventSource: { on: vi.fn(), emit: vi.fn() },
+        world_names: [],
+        selected_world_info: [],
+        world_info: { globalSelect: [], charLore: [], entries: {} },
+        world_info_settings: {},
+        loadWorldInfo: async () => null,
+        updateWorldInfoList: async () => {},
+        recordCompatDiagnostic: diagnostics,
+      },
+    }
+
+    const worldInfoShim = await importWorldInfoShim()
+    const result = await worldInfoShim.getWorldInfoPrompt([], 4096)
+
+    expect(result.sourceEntries).toEqual({
+      globalLore: [],
+      characterLore: [],
+      chatLore: [],
+      personaLore: [],
+    })
+    expect(result.allActivatedEntries).toEqual([])
+    expect(diagnostics).toHaveBeenCalledWith(
+      'getWorldInfoPrompt',
+      'stub',
+      expect.stringContaining('empty ST-shaped prompt result'),
+    )
+  })
+
+  it('exports a live ST WIAN boolean and merges world-info AN buckets into the note prompt', async () => {
+    const setExtensionPrompt = vi.fn()
+    const chatMetadata = {
+      note_interval: 2,
+      note_position: 1,
+      note_depth: 4,
+      note_role: 0,
+    }
+    const context = {
+      characterId: 0,
+      chatId: 'chat-wian',
+      chat: [{ is_user: true, mes: 'Hello' }],
+      chat_metadata: chatMetadata,
+      extensionPrompts: {
+        '2_floating_prompt': { value: 'Original author note.' },
+      },
+      setExtensionPrompt,
+    }
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      matchedEntries: [],
+      worldInfoString: '',
+      worldInfoBefore: '',
+      worldInfoAfter: '',
+      worldInfoExamples: [],
+      worldInfoDepth: [],
+      anBefore: ['  World note top.  '],
+      anAfter: ['  World note bottom.  '],
+      outletEntries: {},
+      allActivatedEntries: [],
+      scanEvents: [],
+      sourceEntries: { globalLore: [], characterLore: [], chatLore: [], personaLore: [] },
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } })))
+    testGlobal().CraftTalker = {
+      stHost: {
+        getRequestHeaders: () => ({ 'Content-Type': 'application/json' }),
+        event_types: {},
+        eventSource: { on: vi.fn(), emit: vi.fn() },
+        extension_settings: { note: { allowWIScan: true } },
+        world_names: [],
+        selected_world_info: [],
+        world_info: { globalSelect: [], charLore: [], entries: {} },
+        world_info_settings: {},
+        getContext: () => context,
+        loadWorldInfo: async () => null,
+        updateWorldInfoList: async () => {},
+      },
+    }
+
+    const authorsNoteShim = await importAuthorsNoteShim()
+    expect(typeof authorsNoteShim.shouldWIAddPrompt).toBe('boolean')
+    expect(authorsNoteShim.shouldWIAddPrompt).toBe(false)
+
+    chatMetadata.note_interval = 1
+    const worldInfoShim = await importWorldInfoShim()
+    await worldInfoShim.getWorldInfoPrompt(['hello'], 4096, true)
+
+    expect(authorsNoteShim.shouldWIAddPrompt).toBe(true)
+    expect(setExtensionPrompt).toHaveBeenCalledWith(
+      '2_floating_prompt',
+      '  World note top.  \nOriginal author note.\n  World note bottom.  ',
+      1,
+      4,
+      true,
+      0,
+    )
+  })
+
+  it('fails the WIAN gate closed when the compatibility context is unavailable', async () => {
+    testGlobal().CraftTalker = {
+      stHost: {
+        getRequestHeaders: () => ({ 'Content-Type': 'application/json' }),
+        getContext: () => { throw new Error('context unavailable') },
+      },
+    }
+
+    const authorsNoteShim = await importAuthorsNoteShim()
+    expect(authorsNoteShim.shouldWIAddPrompt).toBe(false)
+  })
+
   it('derives world info prompt character tags from ST charactersData contexts', async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
       matchedEntries: [],
@@ -1365,6 +2117,7 @@ describe('ST public compatibility shims', () => {
   it('emits ST-shaped world info scan-done events from public prompt scan metadata', async () => {
     const activatedEntry = { world: 'GlobalLore', uid: 1, content: 'Dragon lore' }
     const candidateEntry = { world: 'GlobalLore', uid: 2, content: 'Candidate lore' }
+    const recursiveEntry = { world: 'GlobalLore', uid: 2, content: 'Recursive lore' }
     const sortedEntries = [
       { world: 'GlobalLore', uid: 1, hash: 123, content: 'Dragon lore', order: 100 },
       { world: 'GlobalLore', uid: 2, hash: 456, content: 'Candidate lore', order: 90 },
@@ -1375,8 +2128,13 @@ describe('ST public compatibility shims', () => {
       chatLore: [],
       personaLore: [],
     }
+    const firstStickyEffect = { hash: 123, start: 2, end: 4, protected: false }
+    const recursiveStickyEffect = { hash: 456, start: 2, end: 5, protected: false }
     const timedEffects = {
-      sticky: { 'GlobalLore.1': { hash: 123, start: 2, end: 4, protected: false } },
+      sticky: {
+        'GlobalLore.1': firstStickyEffect,
+        'GlobalLore.2': recursiveStickyEffect,
+      },
       cooldown: {},
     }
     const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
@@ -1389,7 +2147,7 @@ describe('ST public compatibility shims', () => {
       anBefore: [],
       anAfter: [],
       outletEntries: {},
-      allActivatedEntries: [activatedEntry],
+      allActivatedEntries: [activatedEntry, recursiveEntry],
       overflowed: true,
       timedEffects,
       timedEffectsChanged: true,
@@ -1408,6 +2166,9 @@ describe('ST public compatibility shims', () => {
           recursionDelayCurrentLevel: 1,
           newAllEntries: [candidateEntry, activatedEntry],
           newSuccessfulEntries: [activatedEntry],
+          activatedEntries: [activatedEntry],
+          activatedText: 'Dragon lore\n',
+          timedEffectsMetadata: { sticky: { 'GlobalLore.1': firstStickyEffect }, cooldown: {} },
           timedEffectActiveEntryIds: {
             sticky: ['GlobalLore.1'],
             cooldown: [],
@@ -1420,11 +2181,14 @@ describe('ST public compatibility shims', () => {
           loopCount: 2,
           currentState: 'recursion',
           nextState: null,
-          activatedCount: 1,
+          activatedCount: 2,
           overflowed: true,
           budgetCurrent: 256,
           recursionDelayAvailableLevels: [],
           recursionDelayCurrentLevel: 2,
+          activatedEntries: [activatedEntry, recursiveEntry],
+          activatedText: 'Dragon lore\nRecursive lore\n',
+          timedEffectsMetadata: timedEffects,
         },
       ],
       vectorizedSkipped: [],
@@ -1473,18 +2237,22 @@ describe('ST public compatibility shims', () => {
     const firstScanPayload = emit.mock.calls[1]?.[1]
     expect(firstScanPayload.activated.entries).toBeInstanceOf(Map)
     expect(firstScanPayload.activated.entries.get('GlobalLore.1')).toEqual(activatedEntry)
-    expect(firstScanPayload.activated.text).toBe('Dragon lore')
+    expect(firstScanPayload.activated.text).toBe('Dragon lore\n')
     expect(firstScanPayload.new).toEqual({
       all: [candidateEntry, activatedEntry],
       successful: [activatedEntry],
     })
     expect(firstScanPayload.sortedEntries).toEqual(sortedEntries)
-    expect(firstScanPayload.timedEffects.metadata).toEqual(timedEffects)
+    expect(firstScanPayload.timedEffects.metadata).toEqual({
+      sticky: { 'GlobalLore.1': firstStickyEffect },
+      cooldown: {},
+    })
     expect(firstScanPayload.timedEffects.isValidEffectType('sticky')).toBe(true)
     expect(firstScanPayload.timedEffects.isValidEffectType('delay')).toBe(true)
     expect(firstScanPayload.timedEffects.isEffectActive('sticky', { world: 'GlobalLore', uid: 1 })).toBe(true)
     expect(firstScanPayload.timedEffects.isEffectActive('cooldown', { world: 'GlobalLore', uid: 1 })).toBe(false)
-    expect(firstScanPayload.timedEffects.getEffectMetadata('sticky', { world: 'GlobalLore', uid: 1 })).toEqual(timedEffects.sticky['GlobalLore.1'])
+    expect(firstScanPayload.timedEffects.getEffectMetadata('sticky', { world: 'GlobalLore', uid: 1 })).toEqual(firstStickyEffect)
+    expect(firstScanPayload.timedEffects.getEffectMetadata('sticky', { world: 'GlobalLore', uid: 2 })).toBeUndefined()
     expect(firstScanPayload.timedEffects.isEffectActive('sticky', { hash: 123 })).toBe(true)
     expect(firstScanPayload.timedEffects.getEffectMetadata('sticky', { hash: 123 })).toEqual(timedEffects.sticky['GlobalLore.1'])
     expect(firstScanPayload.timedEffects.isEffectActive('delay', { world: 'GlobalLore', uid: 2 })).toBe(true)
@@ -1499,7 +2267,15 @@ describe('ST public compatibility shims', () => {
       }),
       budget: { current: 256, overflowed: true },
     }))
-    expect(emit).toHaveBeenNthCalledWith(4, 'world_info_activated', [activatedEntry])
+    const secondScanPayload = emit.mock.calls[2]?.[1]
+    expect([...secondScanPayload.activated.entries.entries()]).toEqual([
+      ['GlobalLore.1', activatedEntry],
+      ['GlobalLore.2', recursiveEntry],
+    ])
+    expect(secondScanPayload.activated.text).toBe('Dragon lore\nRecursive lore\n')
+    expect(secondScanPayload.timedEffects.metadata).toEqual(timedEffects)
+    expect(secondScanPayload.timedEffects.getEffectMetadata('sticky', { world: 'GlobalLore', uid: 2 })).toEqual(recursiveStickyEffect)
+    expect(emit).toHaveBeenNthCalledWith(4, 'world_info_activated', [activatedEntry, recursiveEntry])
     expect(diagnostics.map(item => [item.id, item.status])).toEqual([
       ['WORLDINFO_ENTRIES_LOADED', 'partial'],
       ['WORLDINFO_SCAN_DONE', 'partial'],

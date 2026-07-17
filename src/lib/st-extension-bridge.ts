@@ -132,24 +132,44 @@ function sanitizeStPromptMessages(value: unknown): StCompatPromptMessage[] {
   })
 }
 
-export function runStGenerateAfterDataBridge(
+export type StPromptLifecycle = 'chat_completion' | 'text_completion'
+
+export function runStPromptLifecycleBridge(
   promptMessages: StCompatPromptMessage[],
   type: string,
+  lifecycle: StPromptLifecycle,
 ): Promise<StCompatPromptMessage[]> {
   return initializeHost()
     .then(async (host) => {
       const prompt = sanitizeStPromptMessages(promptMessages)
       await host.eventSource.emit(host.event_types.GENERATION_AFTER_COMMANDS, type, {}, false)
+
       const generateData = { prompt: prompt.map(message => ({ ...message })), type }
       await host.eventSource.emit(host.event_types.GENERATE_AFTER_DATA, generateData, false)
-      const sanitized = sanitizeStPromptMessages(generateData.prompt)
-      if (Array.isArray(generateData.prompt) && generateData.prompt.length === 0) return []
-      return sanitized.length > 0 ? sanitized : prompt
+      const generatedPrompt = sanitizeStPromptMessages(generateData.prompt)
+      const promptAfterGenerate = Array.isArray(generateData.prompt) && generateData.prompt.length === 0
+        ? []
+        : generatedPrompt.length > 0 ? generatedPrompt : prompt
+
+      if (lifecycle === 'text_completion') return promptAfterGenerate
+
+      const chatCompletionData = { messages: promptAfterGenerate.map(message => ({ ...message })), type }
+      await host.eventSource.emit(host.event_types.CHAT_COMPLETION_SETTINGS_READY, chatCompletionData)
+      const sanitized = sanitizeStPromptMessages(chatCompletionData.messages)
+      if (Array.isArray(chatCompletionData.messages) && chatCompletionData.messages.length === 0) return []
+      return sanitized.length > 0 ? sanitized : promptAfterGenerate
     })
     .catch((error: unknown) => {
-      console.warn('[ST Compat] Failed to run generate-after-data hooks.', error)
+      console.warn('[ST Compat] Failed to run prompt lifecycle hooks.', error)
       return promptMessages
     })
+}
+
+export function runStGenerateAfterDataBridge(
+  promptMessages: StCompatPromptMessage[],
+  type: string,
+): Promise<StCompatPromptMessage[]> {
+  return runStPromptLifecycleBridge(promptMessages, type, 'text_completion')
 }
 
 export function runStGenerationBeforeEndBridge(message: string, generationId: string): Promise<string> {

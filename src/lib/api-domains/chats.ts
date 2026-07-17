@@ -41,6 +41,14 @@ export const chatsApi = {
     request<ChatInfo[]>(`/chats/${encodeURIComponent(characterName)}`),
   get: (characterName: string, chatId: string) =>
     request<ChatDetail>(chatPath(characterName, chatId)),
+  getWindow: (characterName: string, chatId: string, options: { offset?: number; limit?: number; tail?: number } = {}) => {
+    const params = new URLSearchParams()
+    if (options.offset !== undefined) params.set('offset', String(options.offset))
+    if (options.limit !== undefined) params.set('limit', String(options.limit))
+    if (options.tail !== undefined) params.set('tail', String(options.tail))
+    const suffix = params.toString() ? `?${params.toString()}` : ''
+    return request<ChatDetail>(`${chatPath(characterName, chatId)}${suffix}`)
+  },
   create: (characterName: string, userName?: string) =>
     request<ChatDetail>(`/chats/${encodeURIComponent(characterName)}`, {
       method: 'POST',
