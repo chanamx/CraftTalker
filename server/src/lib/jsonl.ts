@@ -2,6 +2,7 @@ import fs from 'node:fs/promises'
 import { existsSync, createReadStream } from 'node:fs'
 import path from 'node:path'
 import readline from 'node:readline'
+import { once } from 'node:events'
 
 export interface ChatMessage {
   name: string
@@ -45,18 +46,112 @@ export async function readChatFile(filePath: string): Promise<ChatLine[]> {
     .filter(Boolean) as ChatLine[]
 }
 
+export interface ChatWindowOptions {
+  offset?: number
+  limit?: number
+  tail?: number
+}
+
+export interface ChatWindowResult {
+  lines: ChatLine[]
+  offset: number
+  totalLines: number
+}
+
+export async function readChatFileWindow(filePath: string, options: ChatWindowOptions = {}): Promise<ChatWindowResult> {
+  if (!existsSync(filePath)) return { lines: [], offset: 0, totalLines: 0 }
+  const offset = Math.max(0, Math.floor(options.offset ?? 0))
+  const limit = Math.max(1, Math.min(10_000, Math.floor(options.limit ?? 200)))
+  const tail = options.tail === undefined ? undefined : Math.max(1, Math.min(10_000, Math.floor(options.tail)))
+  const selected: ChatLine[] = []
+  let totalLines = 0
+  const fileStream = createReadStream(filePath)
+  const rl = readline.createInterface({ input: fileStream, crlfDelay: Infinity })
+  try {
+    for await (const rawLine of rl) {
+      if (!rawLine.trim()) continue
+      let parsed: unknown
+      try { parsed = JSON.parse(rawLine) } catch { continue }
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) continue
+      const line = parsed as ChatLine
+      totalLines += 1
+      if (tail !== undefined) {
+        selected.push(line)
+        if (selected.length > tail) selected.shift()
+      } else if (totalLines > offset && selected.length < limit) {
+        selected.push(line)
+      }
+    }
+  } finally {
+    rl.close()
+    if (!fileStream.closed) {
+      const closed = once(fileStream, 'close')
+      fileStream.destroy()
+      await closed
+    }
+  }
+  return { lines: selected, offset: tail === undefined ? Math.min(offset, Math.max(0, totalLines - selected.length)) : Math.max(0, totalLines - selected.length), totalLines }
+}
+
+async function replaceTempFile(tempPath: string, filePath: string): Promise<void> {
+  try {
+    await fs.rename(tempPath, filePath)
+  } catch (error) {
+    if (process.platform !== 'win32' || !existsSync(filePath)) throw error
+    const backupPath = `${filePath}.${process.pid}.${crypto.randomUUID()}.bak`
+    await fs.rename(filePath, backupPath)
+    try {
+      await fs.rename(tempPath, filePath)
+      await fs.rm(backupPath, { force: true })
+    } catch (replaceError) {
+      try { await fs.rename(backupPath, filePath) } catch { /* preserve original error */ }
+      throw replaceError
+    }
+  }
+}
+
+async function createUniqueTempPath(filePath: string, suffix: string): Promise<string> {
+  const tempPath = path.join(path.dirname(filePath), `.${path.basename(filePath)}.${process.pid}.${crypto.randomUUID()}.${suffix}.tmp`)
+  const handle = await fs.open(tempPath, 'wx')
+  await handle.close()
+  return tempPath
+}
+
 export async function writeChatFile(filePath: string, lines: ChatLine[]): Promise<void> {
   await fs.mkdir(path.dirname(filePath), { recursive: true })
   const content = lines.map(l => JSON.stringify(l)).join('\n') + '\n'
-  await fs.writeFile(filePath, content, 'utf8')
+  const tempPath = await createUniqueTempPath(filePath, 'write')
+  try {
+    const handle = await fs.open(tempPath, 'r+')
+    try {
+      await handle.writeFile(content, 'utf8')
+      await handle.sync()
+    } finally {
+      await handle.close()
+    }
+    await replaceTempFile(tempPath, filePath)
+  } finally {
+    await fs.rm(tempPath, { force: true })
+  }
 }
 
 export async function appendMessage(filePath: string, message: ChatMessage): Promise<void> {
   await fs.mkdir(path.dirname(filePath), { recursive: true })
-  const line = JSON.stringify(message) + '\n'
-  await fs.appendFile(filePath, line, 'utf8')
+  const tempPath = await createUniqueTempPath(filePath, 'append')
+  try {
+    if (existsSync(filePath)) await fs.copyFile(filePath, tempPath)
+    const handle = await fs.open(tempPath, 'a')
+    try {
+      await handle.writeFile(JSON.stringify(message) + '\n', 'utf8')
+      await handle.sync()
+    } finally {
+      await handle.close()
+    }
+    await replaceTempFile(tempPath, filePath)
+  } finally {
+    await fs.rm(tempPath, { force: true })
+  }
 }
-
 export async function getChatInfo(filePath: string): Promise<{
   file_id: string
   file_name: string

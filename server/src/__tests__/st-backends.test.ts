@@ -303,6 +303,804 @@ describe('SillyTavern host chat-completions backend bridge', () => {
     })
   })
 
+  it('maps ST json_schema to OpenAI-compatible structured output', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({
+      choices: [{ message: { content: '{"answer":"ok"}' }, finish_reason: 'stop' }],
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const res = await createTestApp().request('/api/backends/chat-completions/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_completion_source: 'openrouter',
+        proxy_password: 'openrouter-key',
+        model: 'openai/gpt-4o-mini',
+        messages: [{ role: 'user', content: 'Return JSON' }],
+        json_schema: {
+          name: 'answer',
+          description: 'One structured answer',
+          value: {
+            type: 'object',
+            properties: { answer: { type: 'string' } },
+            required: ['answer'],
+            additionalProperties: false,
+          },
+        },
+      }),
+    })
+
+    expect(res.status).toBe(200)
+    expect(sentJson(fetchMock)).toMatchObject({
+      response_format: {
+        type: 'json_schema',
+        json_schema: {
+          name: 'answer',
+          description: 'One structured answer',
+          strict: true,
+          schema: {
+            type: 'object',
+            required: ['answer'],
+          },
+        },
+      },
+    })
+    expect(sentJson(fetchMock)).not.toHaveProperty('json_schema')
+  })
+
+  it('applies ST structured output to streaming provider requests', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(sseResponse([
+      'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n',
+      'data: [DONE]\n\n',
+    ]))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const res = await createTestApp().request('/api/backends/chat-completions/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_completion_source: 'openrouter',
+        proxy_password: 'openrouter-key',
+        model: 'openai/gpt-4o-mini',
+        stream: true,
+        messages: [{ role: 'user', content: 'Return JSON' }],
+        json_schema: { name: 'answer', value: { type: 'object' } },
+      }),
+    })
+
+    expect(res.status).toBe(200)
+    expect(await res.text()).toContain('ok')
+    expect(sentJson(fetchMock)).toMatchObject({
+      stream: true,
+      response_format: {
+        type: 'json_schema',
+        json_schema: { name: 'answer', strict: true, schema: { type: 'object' } },
+      },
+    })
+  })
+
+  it('maps ST json_schema to Gemini response schema without replacing generation settings', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({
+      candidates: [{ content: { parts: [{ text: '{"answer":"ok"}' }] }, finishReason: 'STOP' }],
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const res = await createTestApp().request('/api/backends/chat-completions/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_completion_source: 'makersuite',
+        reverse_proxy: 'https://generativelanguage.googleapis.com',
+        proxy_password: 'google-key',
+        model: 'gemini-2.0-flash',
+        messages: [{ role: 'user', content: 'Return JSON' }],
+        max_output_tokens: 321,
+        temperature: 0.25,
+        json_schema: {
+          name: 'answer',
+          schema: {
+            type: 'object',
+            properties: { answer: { type: 'string' } },
+            required: ['answer'],
+          },
+        },
+      }),
+    })
+
+    expect(res.status).toBe(200)
+    expect(sentJson(fetchMock)).toMatchObject({
+      generationConfig: {
+        temperature: 0.25,
+        maxOutputTokens: 321,
+        responseMimeType: 'application/json',
+        responseSchema: {
+          type: 'object',
+          required: ['answer'],
+        },
+      },
+    })
+  })
+
+  it('maps ST json_schema to the OpenAI Responses text format', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({
+      output_text: '{"answer":"ok"}',
+      status: 'completed',
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const res = await createTestApp().request('/api/backends/chat-completions/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_completion_source: 'custom',
+        customApiFormat: 'openai_responses',
+        custom_url: 'https://responses.example/v1',
+        proxy_password: 'responses-key',
+        model: 'gpt-5-mini',
+        messages: [{ role: 'user', content: 'Return JSON' }],
+        json_schema: {
+          name: 'answer',
+          value: { type: 'object', properties: { answer: { type: 'string' } } },
+          strict: false,
+        },
+      }),
+    })
+
+    expect(res.status).toBe(200)
+    expect(sentJson(fetchMock)).toMatchObject({
+      text: {
+        format: {
+          type: 'json_schema',
+          name: 'answer',
+          strict: false,
+          schema: { type: 'object' },
+        },
+      },
+    })
+  })
+
+  it('rejects malformed or unsupported ST structured output before provider fetch', async () => {
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    const app = createTestApp()
+
+    const malformed = await app.request('/api/backends/chat-completions/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_completion_source: 'openrouter',
+        proxy_password: 'openrouter-key',
+        model: 'openai/gpt-4o-mini',
+        messages: [{ role: 'user', content: 'Return JSON' }],
+        json_schema: { name: 'answer', value: 'not-an-object' },
+      }),
+    })
+    expect(malformed.status).toBe(400)
+    await expect(malformed.json()).resolves.toMatchObject({
+      error: expect.stringContaining('json_schema'),
+      code: 1001,
+    })
+
+    const unsupported = await app.request('/api/backends/chat-completions/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_completion_source: 'claude',
+        reverse_proxy: 'https://api.anthropic.com/v1',
+        proxy_password: 'claude-key',
+        model: 'claude-3-5-sonnet-latest',
+        messages: [{ role: 'user', content: 'Return JSON' }],
+        json_schema: { name: 'answer', value: { type: 'object' } },
+      }),
+    })
+    expect(unsupported.status).toBe(400)
+    await expect(unsupported.json()).resolves.toMatchObject({
+      error: expect.stringContaining('Claude structured output'),
+      code: 1001,
+    })
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('forwards OpenAI-compatible tools and preserves non-streaming tool calls', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({
+      choices: [{
+        message: {
+          content: '',
+          tool_calls: [{
+            id: 'call-weather',
+            type: 'function',
+            function: { name: 'get_weather', arguments: '{"city":"Shanghai"}' },
+          }],
+          reasoning_details: [{ type: 'reasoning.encrypted', id: 'call-weather', data: 'tool-signature' }],
+        },
+        finish_reason: 'tool_calls',
+      }],
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const res = await createTestApp().request('/api/backends/chat-completions/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_completion_source: 'openrouter',
+        proxy_password: 'openrouter-key',
+        model: 'openai/gpt-4o-mini',
+        messages: [{ role: 'user', content: 'Weather?' }],
+        tools: [{
+          type: 'function',
+          function: {
+            name: 'get_weather',
+            description: 'Read weather',
+            parameters: { type: 'object', properties: { city: { type: 'string' } }, required: ['city'] },
+          },
+        }],
+        tool_choice: { type: 'function', function: { name: 'get_weather' } },
+      }),
+    })
+
+    expect(res.status).toBe(200)
+    expect(sentJson(fetchMock)).toMatchObject({
+      tools: [{ type: 'function', function: { name: 'get_weather' } }],
+      tool_choice: { type: 'function', function: { name: 'get_weather' } },
+    })
+    await expect(res.json()).resolves.toMatchObject({
+      choices: [{
+        message: {
+          tool_calls: [{ id: 'call-weather', function: { name: 'get_weather', arguments: '{"city":"Shanghai"}' } }],
+          reasoning_details: [{ id: 'call-weather', data: 'tool-signature' }],
+        },
+        finish_reason: 'tool_calls',
+      }],
+    })
+  })
+
+  it('preserves OpenAI-compatible assistant tool calls and tool results on the follow-up turn', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({
+      choices: [{ message: { content: 'Shanghai is sunny.' }, finish_reason: 'stop' }],
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const res = await createTestApp().request('/api/backends/chat-completions/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_completion_source: 'openrouter',
+        proxy_password: 'openrouter-key',
+        model: 'openai/gpt-4o-mini',
+        messages: [
+          { role: 'user', content: 'Weather?' },
+          {
+            role: 'assistant',
+            content: '',
+            tool_calls: [{
+              id: 'call-weather',
+              type: 'function',
+              function: { name: 'get_weather', arguments: '{"city":"Shanghai"}' },
+            }],
+            reasoning_details: [{ type: 'reasoning.encrypted', id: 'call-weather', data: 'tool-signature' }],
+            reasoning_content: 'provider reasoning state',
+          },
+          {
+            role: 'tool',
+            content: '{"condition":"sunny"}',
+            tool_call_id: 'call-weather',
+            name: 'get_weather',
+          },
+        ],
+        tools: [{ type: 'function', function: { name: 'get_weather', parameters: { type: 'object' } } }],
+        tool_choice: 'auto',
+      }),
+    })
+
+    expect(res.status).toBe(200)
+    expect(sentJson(fetchMock)).toMatchObject({
+      messages: [
+        { role: 'user', content: 'Weather?' },
+        {
+          role: 'assistant',
+          content: '',
+          tool_calls: [{
+            id: 'call-weather',
+            type: 'function',
+            function: { name: 'get_weather', arguments: '{"city":"Shanghai"}' },
+          }],
+          reasoning_details: [{ type: 'reasoning.encrypted', id: 'call-weather', data: 'tool-signature' }],
+          reasoning_content: 'provider reasoning state',
+        },
+        {
+          role: 'tool',
+          content: '{"condition":"sunny"}',
+          tool_call_id: 'call-weather',
+          name: 'get_weather',
+        },
+      ],
+    })
+  })
+
+  it('passes through OpenAI-compatible streaming tool-call deltas', async () => {
+    const providerChunk = 'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call-weather","type":"function","function":{"name":"get_weather","arguments":"{}"}}]}}]}\n\n'
+    const fetchMock = vi.fn().mockResolvedValue(sseResponse([providerChunk, 'data: [DONE]\n\n']))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const res = await createTestApp().request('/api/backends/chat-completions/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_completion_source: 'openrouter',
+        proxy_password: 'openrouter-key',
+        model: 'openai/gpt-4o-mini',
+        stream: true,
+        messages: [{ role: 'user', content: 'Weather?' }],
+        tools: [{ type: 'function', function: { name: 'get_weather', parameters: { type: 'object' } } }],
+        tool_choice: 'auto',
+      }),
+    })
+
+    expect(res.status).toBe(200)
+    expect(await res.text()).toBe(providerChunk + 'data: [DONE]\n\n')
+    expect(sentJson(fetchMock)).toMatchObject({
+      stream: true,
+      tools: [{ type: 'function', function: { name: 'get_weather' } }],
+      tool_choice: 'auto',
+    })
+  })
+
+  it('maps ST tools to Gemini declarations and preserves native non-streaming tool responses', async () => {
+    const responseContent = {
+      role: 'model',
+      parts: [{
+        functionCall: { name: 'get_weather', args: { city: 'Shanghai' } },
+        thoughtSignature: 'gemini-tool-signature',
+      }],
+    }
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({
+      candidates: [{ content: responseContent, finishReason: 'STOP' }],
+      modelVersion: 'gemini-2.5-flash',
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const res = await createTestApp().request('/api/backends/chat-completions/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_completion_source: 'makersuite',
+        reverse_proxy: 'https://generativelanguage.googleapis.com',
+        proxy_password: 'google-key',
+        model: 'gemini-2.5-flash',
+        messages: [{ role: 'user', content: 'Weather?' }],
+        tools: [{
+          type: 'function',
+          function: {
+            name: 'get_weather',
+            description: 'Read weather',
+            parameters: { type: 'object', properties: { city: { type: 'string' } } },
+          },
+        }],
+        tool_choice: 'required',
+      }),
+    })
+
+    expect(res.status).toBe(200)
+    expect(sentJson(fetchMock)).toMatchObject({
+      tools: [{
+        functionDeclarations: [{
+          name: 'get_weather',
+          description: 'Read weather',
+          parameters: { type: 'object', properties: { city: { type: 'string' } } },
+        }],
+      }],
+      toolConfig: { functionCallingConfig: { mode: 'ANY' } },
+    })
+    await expect(res.json()).resolves.toMatchObject({
+      choices: [{ message: { content: '' }, finish_reason: 'STOP' }],
+      responseContent,
+      model: 'gemini-2.5-flash',
+    })
+  })
+
+  it('converts ST tool-call history to Gemini function calls and responses', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({
+      candidates: [{ content: { role: 'model', parts: [{ text: 'Shanghai is sunny.' }] }, finishReason: 'STOP' }],
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const res = await createTestApp().request('/api/backends/chat-completions/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_completion_source: 'makersuite',
+        reverse_proxy: 'https://generativelanguage.googleapis.com',
+        proxy_password: 'google-key',
+        model: 'gemini-2.5-flash',
+        messages: [
+          { role: 'user', content: 'Weather?' },
+          {
+            role: 'assistant',
+            content: [{ type: 'text', text: 'Checking weather.' }],
+            signature: 'gemini-text-signature',
+          },
+          {
+            role: 'assistant',
+            content: [{
+              type: 'tool_calls',
+              tool_calls: [{
+                id: 'call-weather',
+                type: 'function',
+                function: { name: 'get_weather', arguments: '{"city":"Shanghai"}' },
+                signature: 'gemini-tool-signature',
+              }],
+            }],
+          },
+          {
+            role: 'tool',
+            content: '{"condition":"sunny"}',
+            tool_call_id: 'call-weather',
+            name: 'get_weather',
+          },
+        ],
+      }),
+    })
+
+    expect(res.status).toBe(200)
+    expect(sentJson(fetchMock)).toMatchObject({
+      contents: [
+        { role: 'user', parts: [{ text: 'Weather?' }] },
+        {
+          role: 'model',
+          parts: [
+            { text: 'Checking weather.', thoughtSignature: 'gemini-text-signature' },
+            {
+              functionCall: { name: 'get_weather', args: { city: 'Shanghai' } },
+              thoughtSignature: 'gemini-tool-signature',
+            },
+          ],
+        },
+        {
+          role: 'user',
+          parts: [{
+            functionResponse: {
+              name: 'get_weather',
+              response: { name: 'get_weather', content: '{"condition":"sunny"}' },
+            },
+          }],
+        },
+      ],
+    })
+  })
+
+  it('passes through native Gemini streaming events for ST consumers', async () => {
+    const providerChunk = 'data: {"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"get_weather","args":{"city":"Shanghai"}},"thoughtSignature":"gemini-tool-signature"}]},"finishReason":"STOP"}]}\n\n'
+    const fetchMock = vi.fn().mockResolvedValue(sseResponse([providerChunk]))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const res = await createTestApp().request('/api/backends/chat-completions/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_completion_source: 'makersuite',
+        reverse_proxy: 'https://generativelanguage.googleapis.com',
+        proxy_password: 'google-key',
+        model: 'gemini-2.5-flash',
+        stream: true,
+        messages: [{ role: 'user', content: 'Weather?' }],
+        tools: [{ type: 'function', function: { name: 'get_weather', parameters: { type: 'object' } } }],
+      }),
+    })
+
+    expect(res.status).toBe(200)
+    expect(await res.text()).toBe(providerChunk)
+  })
+
+  it('keeps native Gemini text streaming events for LittleWhiteBox without tools', async () => {
+    const providerChunk = 'data: {"candidates":[{"content":{"role":"model","parts":[{"text":"Sunny."}]},"finishReason":"STOP"}]}\n\n'
+    const fetchMock = vi.fn().mockResolvedValue(sseResponse([providerChunk]))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const res = await createTestApp().request('/api/backends/chat-completions/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_completion_source: 'makersuite',
+        reverse_proxy: 'https://generativelanguage.googleapis.com',
+        proxy_password: 'google-key',
+        model: 'gemini-2.5-flash',
+        stream: true,
+        messages: [{ role: 'user', content: 'Weather?' }],
+      }),
+    })
+
+    expect(res.status).toBe(200)
+    expect(await res.text()).toBe(providerChunk)
+  })
+
+  it('maps ST tools to Claude definitions and preserves native non-streaming content', async () => {
+    const content = [{
+      type: 'tool_use',
+      id: 'toolu_weather',
+      name: 'get_weather',
+      input: { city: 'Shanghai' },
+    }]
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({
+      id: 'msg_claude_tool',
+      type: 'message',
+      role: 'assistant',
+      model: 'claude-sonnet-4-5',
+      content,
+      stop_reason: 'tool_use',
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const res = await createTestApp().request('/api/backends/chat-completions/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_completion_source: 'claude',
+        reverse_proxy: 'https://api.anthropic.com/v1',
+        proxy_password: 'claude-key',
+        model: 'claude-sonnet-4-5',
+        use_sysprompt: true,
+        messages: [
+          { role: 'system', content: 'Use tools carefully.' },
+          { role: 'user', content: 'Weather?' },
+        ],
+        tools: [{
+          type: 'function',
+          function: {
+            name: 'get_weather',
+            description: 'Read weather',
+            parameters: { type: 'object', properties: { city: { type: 'string' } } },
+          },
+        }],
+        tool_choice: 'required',
+      }),
+    })
+
+    expect(res.status).toBe(200)
+    expect(sentJson(fetchMock)).toMatchObject({
+      system: 'Use tools carefully.',
+      messages: [{ role: 'user', content: 'Weather?' }],
+      tools: [{
+        name: 'get_weather',
+        description: 'Read weather',
+        input_schema: { type: 'object', properties: { city: { type: 'string' } } },
+      }],
+      tool_choice: { type: 'any' },
+    })
+    await expect(res.json()).resolves.toMatchObject({
+      choices: [{ message: { content: '' }, finish_reason: 'tool_use' }],
+      content,
+      model: 'claude-sonnet-4-5',
+    })
+  })
+
+  it('replays LittleWhiteBox Claude content blocks and tool results', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({
+      model: 'claude-sonnet-4-5',
+      content: [{ type: 'text', text: 'Shanghai is sunny.' }],
+      stop_reason: 'end_turn',
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const res = await createTestApp().request('/api/backends/chat-completions/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_completion_source: 'claude',
+        reverse_proxy: 'https://api.anthropic.com/v1',
+        proxy_password: 'claude-key',
+        model: 'claude-sonnet-4-5',
+        messages: [
+          { role: 'user', content: 'Weather?' },
+          {
+            role: 'assistant',
+            content: [
+              { type: 'thinking', thinking: 'I should check.', signature: 'claude-thinking-signature' },
+              { type: 'text', text: 'Checking weather.' },
+              {
+                type: 'tool_use',
+                id: 'toolu_weather',
+                name: 'get_weather',
+                input: { city: 'Shanghai' },
+              },
+            ],
+          },
+          {
+            role: 'tool',
+            content: '{"condition":"sunny"}',
+            tool_call_id: 'toolu_weather',
+          },
+        ],
+      }),
+    })
+
+    expect(res.status).toBe(200)
+    expect(sentJson(fetchMock)).toMatchObject({
+      messages: [
+        { role: 'user', content: 'Weather?' },
+        {
+          role: 'assistant',
+          content: [
+            { type: 'thinking', thinking: 'I should check.', signature: 'claude-thinking-signature' },
+            { type: 'text', text: 'Checking weather.' },
+            { type: 'tool_use', id: 'toolu_weather', name: 'get_weather', input: { city: 'Shanghai' } },
+          ],
+        },
+        {
+          role: 'user',
+          content: [{ type: 'tool_result', tool_use_id: 'toolu_weather', content: '{"condition":"sunny"}' }],
+        },
+      ],
+    })
+  })
+
+  it('passes through native Claude input_json_delta streaming events', async () => {
+    const chunks = [
+      'event: message_start\ndata: {"type":"message_start","message":{"model":"claude-sonnet-4-5"}}\n\n',
+      'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_weather","name":"get_weather","input":{}}}\n\n',
+      'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"city\\":\\"Shanghai\\"}"}}\n\n',
+      'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
+      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"tool_use"}}\n\n',
+      'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+    ]
+    const fetchMock = vi.fn().mockResolvedValue(sseResponse(chunks))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const res = await createTestApp().request('/api/backends/chat-completions/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_completion_source: 'claude',
+        reverse_proxy: 'https://api.anthropic.com/v1',
+        proxy_password: 'claude-key',
+        model: 'claude-sonnet-4-5',
+        stream: true,
+        messages: [{ role: 'user', content: 'Weather?' }],
+        tools: [{ type: 'function', function: { name: 'get_weather', parameters: { type: 'object' } } }],
+        tool_choice: 'auto',
+      }),
+    })
+
+    expect(res.status).toBe(200)
+    expect(await res.text()).toBe(chunks.join(''))
+  })
+
+  it('keeps native Claude text streaming events without tools', async () => {
+    const chunks = [
+      'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
+      'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Sunny."}}\n\n',
+      'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+    ]
+    const fetchMock = vi.fn().mockResolvedValue(sseResponse(chunks))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const res = await createTestApp().request('/api/backends/chat-completions/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_completion_source: 'claude',
+        reverse_proxy: 'https://api.anthropic.com/v1',
+        proxy_password: 'claude-key',
+        model: 'claude-sonnet-4-5',
+        stream: true,
+        messages: [{ role: 'user', content: 'Weather?' }],
+      }),
+    })
+
+    expect(res.status).toBe(200)
+    expect(await res.text()).toBe(chunks.join(''))
+  })
+
+  it('rejects malformed and unsupported ST tool calls before provider fetch', async () => {
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    const app = createTestApp()
+
+    const malformed = await app.request('/api/backends/chat-completions/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_completion_source: 'openrouter',
+        proxy_password: 'openrouter-key',
+        model: 'openai/gpt-4o-mini',
+        messages: [{ role: 'user', content: 'Weather?' }],
+        tools: [{ type: 'function', function: { name: '', parameters: [] } }],
+      }),
+    })
+    expect(malformed.status).toBe(400)
+    await expect(malformed.json()).resolves.toMatchObject({ error: expect.stringContaining('tools'), code: 1001 })
+
+    const mismatchedChoice = await app.request('/api/backends/chat-completions/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_completion_source: 'openrouter',
+        proxy_password: 'openrouter-key',
+        model: 'openai/gpt-4o-mini',
+        messages: [{ role: 'user', content: 'Weather?' }],
+        tools: [{ type: 'function', function: { name: 'get_weather', parameters: { type: 'object' } } }],
+        tool_choice: { type: 'function', function: { name: 'missing_tool' } },
+      }),
+    })
+    expect(mismatchedChoice.status).toBe(400)
+    await expect(mismatchedChoice.json()).resolves.toMatchObject({ error: expect.stringContaining('tool_choice'), code: 1001 })
+
+    const malformedGeminiHistory = await app.request('/api/backends/chat-completions/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_completion_source: 'makersuite',
+        reverse_proxy: 'https://generativelanguage.googleapis.com',
+        proxy_password: 'google-key',
+        model: 'gemini-2.5-flash',
+        messages: [{
+          role: 'assistant',
+          content: [{
+            type: 'tool_calls',
+            tool_calls: [{
+              id: 'call-weather',
+              type: 'function',
+              function: { name: 'get_weather', arguments: 'not-json' },
+            }],
+          }],
+        }],
+      }),
+    })
+    expect(malformedGeminiHistory.status).toBe(400)
+    await expect(malformedGeminiHistory.json()).resolves.toMatchObject({ error: expect.stringContaining('JSON object'), code: 1001 })
+
+    const malformedClaudeHistory = await app.request('/api/backends/chat-completions/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_completion_source: 'claude',
+        reverse_proxy: 'https://api.anthropic.com/v1',
+        proxy_password: 'claude-key',
+        model: 'claude-sonnet-4-5',
+        messages: [{
+          role: 'assistant',
+          content: [{ type: 'tool_use', name: 'get_weather', input: { city: 'Shanghai' } }],
+        }],
+      }),
+    })
+    expect(malformedClaudeHistory.status).toBe(400)
+    await expect(malformedClaudeHistory.json()).resolves.toMatchObject({ error: expect.stringContaining('tool_use'), code: 1001 })
+
+    const unsupportedNativeHistory = await app.request('/api/backends/chat-completions/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_completion_source: 'custom',
+        custom_url: 'https://api.openai.com/v1',
+        proxy_password: 'openai-key',
+        customApiFormat: 'openai_responses',
+        model: 'gpt-5',
+        messages: [{
+          role: 'assistant',
+          content: [{ type: 'tool_use', id: 'toolu_weather', name: 'get_weather', input: { city: 'Shanghai' } }],
+        }],
+      }),
+    })
+    expect(unsupportedNativeHistory.status).toBe(400)
+    await expect(unsupportedNativeHistory.json()).resolves.toMatchObject({ error: expect.stringContaining('tool calling'), code: 1001 })
+
+    const unsupported = await app.request('/api/backends/chat-completions/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_completion_source: 'custom',
+        custom_url: 'https://api.openai.com/v1',
+        proxy_password: 'openai-key',
+        customApiFormat: 'openai_responses',
+        model: 'gpt-5',
+        messages: [{ role: 'user', content: 'Weather?' }],
+        tools: [{ type: 'function', function: { name: 'get_weather', parameters: { type: 'object' } } }],
+      }),
+    })
+    expect(unsupported.status).toBe(400)
+    await expect(unsupported.json()).resolves.toMatchObject({ error: expect.stringContaining('tool calling'), code: 1001 })
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
   it('translates ST custom source headers, body includes, and body excludes', async () => {
     const fetchMock = vi.fn().mockResolvedValue(jsonResponse({
       choices: [{ message: { content: 'Custom reply' }, finish_reason: 'stop' }],

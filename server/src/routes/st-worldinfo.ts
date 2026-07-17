@@ -26,14 +26,16 @@ stWorldInfoRoute.post('/worldinfo/check', async (c) => {
   const result = await getWorldInfoPromptForContext({
     chat: normalizeWorldInfoPromptChat(payload.chat),
     maxContext: finiteNumber(payload.maxContext ?? payload.max_context),
-    dryRun: payload.isDryRun === true || payload.dryRun === true,
+    dryRun: booleanValue(payload.isDryRun ?? payload.dryRun),
     globalScanData: recordValue(payload.globalScanData ?? payload.global_scan_data),
+    scanInjects: scanInjectArrayValue(payload.scanInjects ?? payload.scan_injects),
     characterName: stringValue(payload.characterName ?? payload.character_name),
     characterTags: stringArrayValue(payload.characterTags ?? payload.character_tags ?? payload.characterTagIds ?? payload.character_tag_ids),
     characterTagNames: stringArrayValue(payload.characterTagNames ?? payload.character_tag_names),
     chatId: stringValue(payload.chatId ?? payload.chat_id),
     model: stringValue(payload.model),
     userName: stringValue(payload.userName ?? payload.user_name),
+    signal: c.req.raw.signal,
   })
   return c.json(result)
 })
@@ -86,6 +88,10 @@ function normalizeWorldInfoPromptChat(value: unknown): Array<string | { name: st
     )
 }
 
+function booleanValue(value: unknown): boolean | undefined {
+  return typeof value === 'boolean' ? value : undefined
+}
+
 function finiteNumber(value: unknown): number | undefined {
   if (typeof value === 'number' && Number.isFinite(value)) return value
   if (typeof value === 'string' && value.trim()) {
@@ -102,6 +108,11 @@ function stringValue(value: unknown): string | undefined {
 function stringArrayValue(value: unknown): string[] | undefined {
   if (!Array.isArray(value)) return undefined
   return value.map(item => String(item ?? '').trim()).filter(Boolean)
+}
+
+function scanInjectArrayValue(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined
+  return value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
 }
 
 function recordValue(value: unknown): Record<string, unknown> | undefined {

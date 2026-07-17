@@ -1,11 +1,12 @@
 import type { CharacterCard } from '../lib/png-parser.js'
-import type { EngineMessage } from '../engine/types.js'
+import type { EngineMessage, EnginePromptAnchors } from '../engine/types.js'
 
 export interface PromptBuildOptions {
   character: CharacterCard
   messages: EngineMessage[]
   userName?: string
   worldInfo?: string[]
+  promptAnchors?: EnginePromptAnchors
 }
 
 export interface BuiltPrompt {
@@ -13,10 +14,12 @@ export interface BuiltPrompt {
 }
 
 export function buildSTPrompt(options: PromptBuildOptions): BuiltPrompt {
-  const { character, messages, userName = 'User', worldInfo = [] } = options
+  const { character, messages, userName = 'User', worldInfo = [], promptAnchors } = options
   const result: EngineMessage[] = []
 
   const systemParts: string[] = []
+
+  result.push(...(promptAnchors?.beforeMain ?? []))
 
   if (character.system_prompt) {
     systemParts.push(character.system_prompt)
@@ -51,6 +54,8 @@ export function buildSTPrompt(options: PromptBuildOptions): BuiltPrompt {
   if (systemParts.length > 0) {
     result.push({ role: 'system', content: systemParts.join('\n\n') })
   }
+
+  result.push(...(promptAnchors?.afterMain ?? []))
 
   for (const msg of messages) {
     result.push(msg)

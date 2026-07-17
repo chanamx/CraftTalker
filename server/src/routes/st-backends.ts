@@ -27,6 +27,10 @@ import { consumeNDJSON, consumeSSE } from '../engine/native-stream.js'
 import { fetchModelsFromAPI } from '../services/llm-models.service.js'
 import type { GenerationPreset } from '../services/preset.service.js'
 import { getStCompatModelListResponse } from '../services/st-compat-models.service.js'
+import { resolveRuntimeConfig } from '../config/runtime.js'
+import { providerFetch } from '../lib/provider-fetch.js'
+import { applyStGeminiToolOptions, buildStGeminiContents } from '../lib/st-gemini-tools.js'
+import { applyStClaudeToolOptions, buildStClaudeMessages } from '../lib/st-claude-tools.js'
 
 const stBackendsRoute = new Hono()
 
@@ -105,7 +109,7 @@ stBackendsRoute.post(
     }
 
     const config = resolveLlmConfigApiKey(configFromStPayload(payload))
-    const models = await fetchModelsFromAPI(config)
+    const models = await fetchModelsFromAPI(config, c.req.raw.signal)
     return c.json({ data: models.map(id => ({ id })) })
   },
 )
@@ -130,14 +134,18 @@ stBackendsRoute.post(
     const config = resolveLlmConfigApiKey(configFromStPayload(payload))
     const preset = presetFromStPayload(payload)
     const messages = messagesFromStPayload(payload)
+    const structuredOutput = structuredOutputFromStPayload(payload)
+    const toolOptions = toolOptionsFromStPayload(payload)
+    assertStructuredOutputSupported(config, structuredOutput)
+    assertToolCallingSupported(config, toolOptions, messages)
 
     if (payload.stream === true) {
-      return new Response(streamChatCompletion(config, preset, messages), {
+      return new Response(streamChatCompletion(config, preset, messages, structuredOutput, toolOptions, c.req.raw.signal), {
         headers: headersForSse(),
       })
     }
 
-    const result = await generateDirect(config, preset, messages)
+    const result = await generateDirect(config, preset, messages, structuredOutput, toolOptions, c.req.raw.signal)
     return c.json(openAICompletionResponse(result))
   },
 )
@@ -224,7 +232,7 @@ function configFromStPayload(payload: StChatCompletionsPayload): LLMConfig {
   }
 
   return llmConfigSchema.parse({
-    source: sourceFromStSource(source),
+    source: reverseProxy && source === 'openai' ? 'vllm' : sourceFromStSource(source),
     apiUrl: reverseProxy || defaultBaseUrlForSource(source),
     apiKey,
     apiKeySessionId: stringValue(payload.apiKeySessionId) || undefined,
@@ -280,13 +288,26 @@ function streamChatCompletion(
   config: LLMConfig,
   preset: GenerationPreset,
   messages: DirectMessage,
+  structuredOutput?: StStructuredOutput,
+  toolOptions?: StToolOptions,
+  signal?: AbortSignal,
 ): ReadableStream<Uint8Array> {
   const encoder = new TextEncoder()
   return new ReadableStream({
     async start(controller) {
       try {
         const context = requestContext(config, preset, messages, true)
-        const response = await fetchLLM(context.url, context.headers, context.body)
+        const body = applyToolOptions(
+          applyStructuredOutput(context.body, context.apiFormat, structuredOutput),
+          context.apiFormat,
+          toolOptions,
+        )
+        const response = await fetchLLM(config, context.url, context.headers, body, signal)
+        if (shouldPassThroughProviderStream(context.apiFormat, toolOptions)) {
+          await pipeProviderStream(response, controller)
+          controller.close()
+          return
+        }
         for await (const text of streamTextFromResponse(response, context.apiFormat)) {
           controller.enqueue(encoder.encode(`data: ${JSON.stringify(openAIStreamChunk(text))}\n\n`))
         }
@@ -300,7 +321,20 @@ function streamChatCompletion(
   })
 }
 
-type DirectMessage = Array<{ role: string; content: string }>
+type DirectMessageItem = {
+  role: 'system' | 'developer' | 'user' | 'assistant' | 'tool'
+  content: string
+  name?: string
+  tool_calls?: Array<Record<string, unknown>>
+  tool_call_id?: string
+  reasoning_details?: Array<Record<string, unknown>>
+  reasoning?: string
+  reasoning_content?: string
+  signature?: string
+  content_blocks?: Array<Record<string, unknown>>
+}
+
+type DirectMessage = DirectMessageItem[]
 
 interface DirectCompletionResult {
   content: string
@@ -310,23 +344,125 @@ interface DirectCompletionResult {
     completionTokens: number
     totalTokens: number
   }
+  toolCalls?: Array<Record<string, unknown>>
+  reasoningDetails?: Array<Record<string, unknown>>
+  reasoning?: string
+  reasoningContent?: string
+  responseContent?: Record<string, unknown>
+  nativeContent?: Array<Record<string, unknown>>
+  model?: string
+}
+
+interface StStructuredOutput {
+  name: string
+  description?: string
+  schema: Record<string, unknown>
+  strict: boolean
+}
+
+interface StToolOptions {
+  tools: Array<Record<string, unknown>>
+  toolChoice: string | Record<string, unknown>
 }
 
 function messagesFromStPayload(payload: StChatCompletionsPayload): DirectMessage {
   const messages = payload.messages ?? []
   const normalized = messages
-    .map(message => ({
-      role: normalizeRole(message.role),
-      content: contentToText(message.content),
-    }))
-    .filter(message => message.content.trim() !== '')
+    .map((message): DirectMessageItem => {
+      const role = normalizeRole(message.role)
+      const content = contentToText(message.content)
+      const toolCalls = toolCallsFromStMessage(message.tool_calls ?? toolCallsFromStContent(message.content))
+      const toolCallId = stringValue(message.tool_call_id)
+      const name = stringValue(message.name)
+      const reasoningDetails = recordArrayFromStMessage(message.reasoning_details, 'reasoning_details')
+      const contentBlocks = contentBlocksFromStMessage(message.content)
+
+      if (toolCalls && role !== 'assistant') {
+        throw createError(ErrorCode.VALIDATION_ERROR, 'ST message tool_calls are only valid for assistant messages.')
+      }
+      if (role === 'tool' && !toolCallId) {
+        throw createError(ErrorCode.VALIDATION_ERROR, 'ST tool messages require a tool_call_id.')
+      }
+
+      return {
+        role,
+        content,
+        ...(name ? { name } : {}),
+        ...(toolCalls ? { tool_calls: toolCalls } : {}),
+        ...(toolCallId ? { tool_call_id: toolCallId } : {}),
+        ...(reasoningDetails ? { reasoning_details: reasoningDetails } : {}),
+        ...(typeof message.reasoning === 'string' ? { reasoning: message.reasoning } : {}),
+        ...(typeof message.reasoning_content === 'string' ? { reasoning_content: message.reasoning_content } : {}),
+        ...(typeof message.signature === 'string' ? { signature: message.signature } : {}),
+        ...(contentBlocks ? { content_blocks: contentBlocks } : {}),
+      }
+    })
+    .filter(message => (
+      message.content.trim() !== ''
+      || message.role === 'tool'
+      || Boolean(message.tool_calls?.length)
+      || Boolean(message.content_blocks?.length)
+    ))
   return normalized.length ? normalized : [{ role: 'user', content: '' }]
 }
 
-function normalizeRole(role: string): 'system' | 'user' | 'assistant' {
+function normalizeRole(role: string): DirectMessageItem['role'] {
   if (role === 'system') return 'system'
+  if (role === 'developer') return 'developer'
   if (role === 'assistant') return 'assistant'
+  if (role === 'tool') return 'tool'
   return 'user'
+}
+
+function toolCallsFromStMessage(value: unknown): Array<Record<string, unknown>> | undefined {
+  if (value === undefined || value === null) return undefined
+  if (!Array.isArray(value) || value.length === 0) {
+    throw createError(ErrorCode.VALIDATION_ERROR, 'ST message tool_calls must be a non-empty array.')
+  }
+
+  return value.map((entry) => {
+    if (!isPlainRecord(entry) || !isPlainRecord(entry.function)) {
+      throw createError(ErrorCode.VALIDATION_ERROR, 'ST message tool_calls must use OpenAI function-call objects.')
+    }
+    const id = stringValue(entry.id)
+    const name = stringValue(entry.function.name)
+    if (!id || !name) {
+      throw createError(ErrorCode.VALIDATION_ERROR, 'ST message tool_calls require an id and function name.')
+    }
+    const rawArguments = entry.function.arguments
+    const args = typeof rawArguments === 'string' ? rawArguments : JSON.stringify(rawArguments ?? {})
+    return {
+      id,
+      type: 'function',
+      function: { name, arguments: args },
+      ...(typeof entry.thoughtSignature === 'string' ? { thoughtSignature: entry.thoughtSignature } : {}),
+      ...(typeof entry.thought_signature === 'string' ? { thought_signature: entry.thought_signature } : {}),
+      ...(typeof entry.signature === 'string' ? { signature: entry.signature } : {}),
+    }
+  })
+}
+
+function toolCallsFromStContent(content: unknown): unknown[] | undefined {
+  if (!Array.isArray(content)) return undefined
+  const toolCalls = content.flatMap((part) => {
+    if (!isPlainRecord(part) || part.type !== 'tool_calls' || !Array.isArray(part.tool_calls)) return []
+    return part.tool_calls
+  })
+  return toolCalls.length ? toolCalls : undefined
+}
+
+function contentBlocksFromStMessage(content: unknown): Array<Record<string, unknown>> | undefined {
+  if (!Array.isArray(content)) return undefined
+  const blocks = content.filter(isPlainRecord)
+  return blocks.length ? structuredClone(blocks) : undefined
+}
+
+function recordArrayFromStMessage(value: unknown, field: string): Array<Record<string, unknown>> | undefined {
+  if (value === undefined || value === null) return undefined
+  if (!Array.isArray(value) || value.some(entry => !isPlainRecord(entry))) {
+    throw createError(ErrorCode.VALIDATION_ERROR, 'ST message ' + field + ' must be an array of objects.')
+  }
+  return value.length ? structuredClone(value) : undefined
 }
 
 function contentToText(content: unknown): string {
@@ -346,9 +482,17 @@ async function generateDirect(
   config: LLMConfig,
   preset: GenerationPreset,
   messages: DirectMessage,
+  structuredOutput?: StStructuredOutput,
+  toolOptions?: StToolOptions,
+  signal?: AbortSignal,
 ): Promise<DirectCompletionResult> {
   const context = requestContext(config, preset, messages, false)
-  const response = await fetchLLM(context.url, context.headers, context.body)
+  const body = applyToolOptions(
+    applyStructuredOutput(context.body, context.apiFormat, structuredOutput),
+    context.apiFormat,
+    toolOptions,
+  )
+  const response = await fetchLLM(config, context.url, context.headers, body, signal)
   const data = await response.json() as Record<string, unknown>
   return parseCompletionResult(data, context.apiFormat)
 }
@@ -358,12 +502,16 @@ function openAICompletionResponse(result: DirectCompletionResult): Record<string
     id: `chatcmpl-crafttalker-${Date.now()}`,
     object: 'chat.completion',
     created: Math.floor(Date.now() / 1000),
-    model: 'crafttalker-compat',
+    model: result.model || 'crafttalker-compat',
     choices: [{
       index: 0,
       message: {
         role: 'assistant',
         content: result.content,
+        ...(result.toolCalls ? { tool_calls: result.toolCalls } : {}),
+        ...(result.reasoningDetails ? { reasoning_details: result.reasoningDetails } : {}),
+        ...(result.reasoning ? { reasoning: result.reasoning } : {}),
+        ...(result.reasoningContent ? { reasoning_content: result.reasoningContent } : {}),
       },
       finish_reason: result.finishReason,
     }],
@@ -374,6 +522,8 @@ function openAICompletionResponse(result: DirectCompletionResult): Record<string
         total_tokens: result.usage.totalTokens,
       },
     } : {}),
+    ...(result.responseContent ? { responseContent: result.responseContent } : {}),
+    ...(result.nativeContent ? { content: result.nativeContent } : {}),
   }
 }
 
@@ -408,18 +558,27 @@ function requestContext(
   const headers = headersFromConfig(config, provider)
 
   switch (apiFormat) {
-    case 'anthropic_messages':
+    case 'anthropic_messages': {
+      const body = anthropicBody(config, preset, messages, stream)
       return {
         apiFormat,
-        body: anthropicBody(config, preset, messages, stream),
+        body: {
+          ...body,
+          messages: buildStClaudeMessages(messages),
+        },
         headers,
         url: joinUrl(baseUrl, '/messages'),
       }
+    }
     case 'gemini_generate_content': {
       const model = encodeURIComponent(geminiModelId(config.model))
+      const body = geminiBody(config, preset, messages)
       return {
         apiFormat,
-        body: geminiBody(config, preset, messages),
+        body: {
+          ...body,
+          contents: buildStGeminiContents(messages),
+        },
         headers,
         url: joinUrl(baseUrl, `/models/${model}:${stream ? 'streamGenerateContent?alt=sse' : 'generateContent'}`),
       }
@@ -463,15 +622,287 @@ function requestContext(
   }
 }
 
-async function fetchLLM(url: string, headers: Record<string, string>, body: unknown): Promise<Response> {
-  const response = await fetch(url, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(body),
+function structuredOutputFromStPayload(payload: StChatCompletionsPayload): StStructuredOutput | undefined {
+  const raw = payload.json_schema
+  if (raw === undefined || raw === null) return undefined
+  if (!isPlainRecord(raw)) {
+    throw createError(ErrorCode.VALIDATION_ERROR, 'ST json_schema must be an object.')
+  }
+
+  const name = stringValue(raw.name)
+  const schema = isPlainRecord(raw.value) ? raw.value : isPlainRecord(raw.schema) ? raw.schema : null
+  if (!name || !schema) {
+    throw createError(
+      ErrorCode.VALIDATION_ERROR,
+      'ST json_schema requires a non-empty name and an object value/schema.',
+    )
+  }
+
+  const description = stringValue(raw.description)
+  return {
+    name,
+    ...(description ? { description } : {}),
+    schema: structuredClone(schema),
+    strict: typeof raw.strict === 'boolean' ? raw.strict : true,
+  }
+}
+
+function assertStructuredOutputSupported(config: LLMConfig, structuredOutput?: StStructuredOutput): void {
+  if (!structuredOutput) return
+  const apiFormat = apiFormatFromConfig(config)
+  if (apiFormat === 'anthropic_messages') {
+    throw createError(
+      ErrorCode.VALIDATION_ERROR,
+      'Claude structured output is not implemented by the ST compatibility bridge.',
+    )
+  }
+  if (!['openai_chat', 'azure_openai_chat', 'openai_responses', 'gemini_generate_content'].includes(apiFormat)) {
+    throw createError(
+      ErrorCode.VALIDATION_ERROR,
+      'ST structured output is not implemented for ' + apiFormat + '.',
+    )
+  }
+}
+
+function applyStructuredOutput(
+  body: Record<string, unknown>,
+  apiFormat: APIFormat,
+  structuredOutput?: StStructuredOutput,
+): Record<string, unknown> {
+  if (!structuredOutput) return body
+  const { name, description, schema, strict } = structuredOutput
+
+  if (apiFormat === 'openai_chat' || apiFormat === 'azure_openai_chat') {
+    return {
+      ...body,
+      response_format: {
+        type: 'json_schema',
+        json_schema: {
+          name,
+          ...(description ? { description } : {}),
+          schema,
+          strict,
+        },
+      },
+    }
+  }
+
+  if (apiFormat === 'gemini_generate_content') {
+    const generationConfig = isPlainRecord(body.generationConfig) ? body.generationConfig : {}
+    return {
+      ...body,
+      generationConfig: {
+        ...generationConfig,
+        responseMimeType: 'application/json',
+        responseSchema: schema,
+      },
+    }
+  }
+
+  if (apiFormat === 'openai_responses') {
+    const text = isPlainRecord(body.text) ? body.text : {}
+    return {
+      ...body,
+      text: {
+        ...text,
+        format: {
+          type: 'json_schema',
+          name,
+          ...(description ? { description } : {}),
+          schema,
+          strict,
+        },
+      },
+    }
+  }
+
+  throw createError(
+    ErrorCode.VALIDATION_ERROR,
+    'ST structured output is not implemented for ' + apiFormat + '.',
+  )
+}
+
+function toolOptionsFromStPayload(payload: StChatCompletionsPayload): StToolOptions | undefined {
+  const rawTools = payload.tools
+  if (rawTools === undefined || rawTools === null) return undefined
+  if (!Array.isArray(rawTools) || rawTools.length === 0) {
+    throw createError(ErrorCode.VALIDATION_ERROR, 'ST tools must be a non-empty array.')
+  }
+
+  const toolNames = new Set<string>()
+  const tools = rawTools.map((rawTool) => {
+    if (!isPlainRecord(rawTool) || rawTool.type !== 'function' || !isPlainRecord(rawTool.function)) {
+      throw createError(ErrorCode.VALIDATION_ERROR, 'ST tools must contain OpenAI-style function definitions.')
+    }
+    const name = stringValue(rawTool.function.name)
+    const parameters = rawTool.function.parameters
+    if (!name || (parameters !== undefined && !isPlainRecord(parameters))) {
+      throw createError(ErrorCode.VALIDATION_ERROR, 'ST tools require a function name and object parameters.')
+    }
+    const description = stringValue(rawTool.function.description)
+    toolNames.add(name)
+    return {
+      type: 'function',
+      function: {
+        name,
+        ...(description ? { description } : {}),
+        ...(parameters ? { parameters: structuredClone(parameters) } : {}),
+        ...(typeof rawTool.function.strict === 'boolean' ? { strict: rawTool.function.strict } : {}),
+      },
+    }
+  })
+
+  const rawChoice = payload.tool_choice ?? 'auto'
+  let toolChoice: string | Record<string, unknown>
+  let forcedToolName: string | undefined
+  if (typeof rawChoice === 'string' && ['auto', 'none', 'required'].includes(rawChoice)) {
+    toolChoice = rawChoice
+  } else if (
+    isPlainRecord(rawChoice)
+    && rawChoice.type === 'function'
+    && isPlainRecord(rawChoice.function)
+    && stringValue(rawChoice.function.name)
+  ) {
+    forcedToolName = stringValue(rawChoice.function.name)
+    toolChoice = { type: 'function', function: { name: forcedToolName } }
+  } else {
+    throw createError(ErrorCode.VALIDATION_ERROR, 'ST tool_choice is not valid for OpenAI-compatible tool calling.')
+  }
+  if (forcedToolName && !toolNames.has(forcedToolName)) {
+    throw createError(ErrorCode.VALIDATION_ERROR, 'ST tool_choice must reference a function declared in tools.')
+  }
+  return { tools, toolChoice }
+}
+
+function assertToolCallingSupported(
+  config: LLMConfig,
+  toolOptions: StToolOptions | undefined,
+  messages: DirectMessage,
+): void {
+  const hasToolMessages = messages.some(message => (
+    message.role === 'tool'
+    || Boolean(message.tool_calls?.length)
+    || message.content_blocks?.some(block => block.type === 'tool_use' || block.type === 'tool_result')
+  ))
+  if (!toolOptions && !hasToolMessages) return
+  const apiFormat = apiFormatFromConfig(config)
+  if (
+    !isOpenAIToolFormat(apiFormat)
+    && apiFormat !== 'gemini_generate_content'
+    && apiFormat !== 'anthropic_messages'
+  ) {
+    throw createError(
+      ErrorCode.VALIDATION_ERROR,
+      'ST tool calling is not implemented for ' + apiFormat + '.',
+    )
+  }
+}
+
+function isOpenAIToolFormat(apiFormat: APIFormat): boolean {
+  return apiFormat === 'openai_chat' || apiFormat === 'azure_openai_chat'
+}
+
+function applyToolOptions(
+  body: Record<string, unknown>,
+  apiFormat: APIFormat,
+  toolOptions?: StToolOptions,
+): Record<string, unknown> {
+  if (!toolOptions) return body
+  if (apiFormat === 'anthropic_messages') {
+    return applyStClaudeToolOptions(body, toolOptions)
+  }
+  if (apiFormat === 'gemini_generate_content') {
+    return applyStGeminiToolOptions(body, toolOptions)
+  }
+  return {
+    ...body,
+    tools: toolOptions.tools,
+    tool_choice: toolOptions.toolChoice,
+  }
+}
+
+function shouldPassThroughProviderStream(apiFormat: APIFormat, toolOptions?: StToolOptions): boolean {
+  return apiFormat === 'gemini_generate_content'
+    || apiFormat === 'anthropic_messages'
+    || Boolean(toolOptions && isOpenAIToolFormat(apiFormat))
+}
+
+async function pipeProviderStream(
+  response: Response,
+  controller: ReadableStreamDefaultController<Uint8Array>,
+): Promise<void> {
+  const reader = response.body?.getReader()
+  if (!reader) throw createError(ErrorCode.LLM_API_ERROR, 'Provider returned an empty streaming response.')
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) return
+      controller.enqueue(value)
+    }
+  } finally {
+    reader.releaseLock()
+  }
+}
+
+function normalizeProviderToolCalls(value: unknown): Array<Record<string, unknown>> | undefined {
+  if (!Array.isArray(value)) return undefined
+  const calls = value.flatMap((entry) => {
+    if (!isPlainRecord(entry) || !isPlainRecord(entry.function)) return []
+    const name = stringValue(entry.function.name)
+    if (!name) return []
+    const id = stringValue(entry.id)
+    const args = typeof entry.function.arguments === 'string' ? entry.function.arguments : '{}'
+    return [{
+      ...(id ? { id } : {}),
+      type: 'function',
+      function: { name, arguments: args },
+      ...(typeof entry.thoughtSignature === 'string' ? { thoughtSignature: entry.thoughtSignature } : {}),
+      ...(typeof entry.thought_signature === 'string' ? { thought_signature: entry.thought_signature } : {}),
+      ...(typeof entry.signature === 'string' ? { signature: entry.signature } : {}),
+    }]
+  })
+  return calls.length ? calls : undefined
+}
+
+function normalizeReasoningDetails(value: unknown): Array<Record<string, unknown>> | undefined {
+  if (!Array.isArray(value)) return undefined
+  const details = value.flatMap((entry) => {
+    if (!isPlainRecord(entry)) return []
+    const type = stringValue(entry.type)
+    const data = typeof entry.data === 'string' ? entry.data : ''
+    if (!type || !data) return []
+    const id = stringValue(entry.id)
+    return [{ type, data, ...(id ? { id } : {}) }]
+  })
+  return details.length ? details : undefined
+}
+
+async function fetchLLM(
+  config: LLMConfig,
+  url: string,
+  headers: Record<string, string>,
+  body: unknown,
+  signal?: AbortSignal,
+): Promise<Response> {
+  const response = await providerFetch({
+    url,
+    source: config.source,
+    mode: resolveRuntimeConfig().mode,
+    timeoutMs: 180_000,
+    maxResponseBytes: 32 * 1024 * 1024,
+    init: {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+      signal,
+    },
   })
   if (!response.ok) {
-    const errorText = await response.text()
-    throw new Error(`LLM API request failed (${response.status}): ${errorText}`)
+    await response.body?.cancel().catch(() => undefined)
+    throw createError(ErrorCode.LLM_API_ERROR, `LLM API request failed (${response.status})`, {
+      status: response.status,
+      provider: config.source ?? config.type,
+    })
   }
   return response
 }
@@ -483,18 +914,30 @@ function parseCompletionResult(data: Record<string, unknown>, apiFormat: APIForm
   }
 
   if (apiFormat === 'anthropic_messages') {
-    const content = Array.isArray(data.content)
-      ? data.content.map(block => isRecord(block) && typeof block.text === 'string' ? block.text : '').join('')
-      : ''
-    return { content, finishReason: stringValue(data.stop_reason) || 'stop' }
+    const nativeContent = Array.isArray(data.content)
+      ? data.content.filter(isPlainRecord).map(block => structuredClone(block))
+      : []
+    const content = nativeContent
+      .filter(block => block.type === 'text' && typeof block.text === 'string')
+      .map(block => block.text)
+      .join('')
+    return {
+      content,
+      finishReason: stringValue(data.stop_reason) || 'stop',
+      ...(nativeContent.length ? { nativeContent } : {}),
+      ...(stringValue(data.model) ? { model: stringValue(data.model) } : {}),
+    }
   }
 
   if (apiFormat === 'gemini_generate_content') {
     const candidates = Array.isArray(data.candidates) ? data.candidates : []
     const candidate = isRecord(candidates[0]) ? candidates[0] : {}
+    const responseContent = isPlainRecord(candidate.content) ? structuredClone(candidate.content) : undefined
     return {
       content: geminiCandidateText(candidate),
       finishReason: stringValue(candidate.finishReason) || 'stop',
+      ...(responseContent ? { responseContent } : {}),
+      ...(stringValue(data.modelVersion) ? { model: stringValue(data.modelVersion) } : {}),
     }
   }
 
@@ -517,10 +960,16 @@ function parseCompletionResult(data: Record<string, unknown>, apiFormat: APIForm
   const first = isRecord(choices[0]) ? choices[0] : {}
   const message = isRecord(first.message) ? first.message : {}
   const usage = parseOpenAIUsage(data)
+  const toolCalls = normalizeProviderToolCalls(message.tool_calls)
+  const reasoningDetails = normalizeReasoningDetails(message.reasoning_details)
   return {
     content: stringValue(message.content) || stringValue(first.text),
     finishReason: stringValue(first.finish_reason) || 'stop',
     ...(usage ? { usage } : {}),
+    ...(toolCalls ? { toolCalls } : {}),
+    ...(reasoningDetails ? { reasoningDetails } : {}),
+    ...(typeof message.reasoning === 'string' ? { reasoning: message.reasoning } : {}),
+    ...(typeof message.reasoning_content === 'string' ? { reasoningContent: message.reasoning_content } : {}),
   }
 }
 
@@ -809,6 +1258,10 @@ function numberValue(value: unknown, fallback: number): number {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return isRecord(value) && !Array.isArray(value)
 }
 
 export { stBackendsRoute }

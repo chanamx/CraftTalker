@@ -7,6 +7,7 @@ import {
   checkWorldInfoSync,
   getSortedWorldInfoEntries,
   type WorldInfoEntriesLoadedHookInput,
+  type WorldInfoPromptContentTransformEntry,
   type WorldInfoScanHookInput,
   type WorldInfoVectorActivationInput,
 } from '../lib/world-info-compat.js'
@@ -115,6 +116,25 @@ describe('world-info compatibility scanning', () => {
     expect(result.worldInfoString).toBe('')
     expect(result.worldInfoDepth).toEqual([])
     expect(result.outletEntries).toEqual({})
+  })
+
+  it('applies async prompt content transforms after activation without mutating event entries', async () => {
+    const result = await scanAsync({
+      '1': makeEntry({ uid: 1, key: ['gate'], content: 'sealed gate' }),
+    }, ['gate'], {
+      promptContentTransformer: async (entries: WorldInfoPromptContentTransformEntry[]) => Object.fromEntries(
+        entries.map(entry => [entry.id, entry.content.replace('sealed', 'opened')]),
+      ),
+    })
+
+    expect(result.matchedEntries.map(entry => entry.content)).toEqual(['opened gate'])
+    expect(result.worldInfoBefore).toBe('opened gate')
+    expect(result.allActivatedEntries).toEqual([
+      expect.objectContaining({ content: 'sealed gate' }),
+    ])
+    expect(result.scanEvents.at(-1)?.newSuccessfulEntries).toEqual([
+      expect.objectContaining({ content: 'sealed gate' }),
+    ])
   })
 
   it('supports ST selective logic variants', () => {
@@ -678,6 +698,48 @@ describe('world-info compatibility scanning', () => {
     expect(result.matchedEntries.map(entry => entry.content)).toEqual(['one two'])
   })
 
+  it('passes the scan signal to async token counters and aborts before producing a result', async () => {
+    const controller = new AbortController()
+    let notifyCounterStarted!: () => void
+    const counterStarted = new Promise<void>(resolve => { notifyCounterStarted = resolve })
+    const tokenCounter = vi.fn((_text: string, signal?: AbortSignal) => {
+      notifyCounterStarted()
+      if (!signal) return Promise.resolve(1)
+      return new Promise<number>((_resolve, reject) => {
+        signal.addEventListener('abort', () => {
+          const error = new Error('scan canceled')
+          error.name = 'AbortError'
+          reject(error)
+        }, { once: true })
+      })
+    })
+    const scanPromise = scanAsync({
+      '1': makeEntry({ uid: 1, key: ['dragon'], content: 'cancelable lore' }),
+    }, ['dragon'], {
+      signal: controller.signal,
+      tokenCounter,
+    })
+
+    await counterStarted
+    controller.abort('request disconnected')
+    await expect(scanPromise).rejects.toMatchObject({ name: 'AbortError' })
+    expect(tokenCounter).toHaveBeenCalled()
+  })
+
+  it('checks cancellation after the final synchronous scan effect', () => {
+    const controller = new AbortController()
+
+    expect(() => scan({
+      '1': makeEntry({ uid: 1, key: ['dragon'], content: 'cancelable lore' }),
+    }, ['dragon'], {
+      signal: controller.signal,
+      promptContentTransformer: (entries: WorldInfoPromptContentTransformEntry[]) => {
+        controller.abort('request disconnected')
+        return Object.fromEntries(entries.map(entry => [entry.id, entry.content]))
+      },
+    })).toThrow(expect.objectContaining({ name: 'AbortError' }))
+  })
+
   it('uses keyword-matched vectorized content in recursive scans without a vector runtime', () => {
     const result = scan({
       '1': makeEntry({ uid: 1, key: ['dragon'], content: 'normal lore', insertion_order: 1 }),
@@ -783,6 +845,15 @@ describe('world-info compatibility scanning', () => {
       type: 'scan_done',
       newAllEntries: [expect.objectContaining({ uid: 1, content: 'first rune' })],
       newSuccessfulEntries: [expect.objectContaining({ uid: 1, content: 'first rune' })],
+      activatedEntries: [expect.objectContaining({ uid: 1, content: 'first rune' })],
+      activatedText: 'first rune\n',
+    })
+    expect(result.scanEvents[1]).toMatchObject({
+      activatedEntries: [
+        expect.objectContaining({ uid: 1, content: 'first rune' }),
+        expect.objectContaining({ uid: 2, content: 'delayed rune' }),
+      ],
+      activatedText: 'first rune\n',
     })
     expect(result.scanEvents[0]?.newAllEntries?.[0]).not.toHaveProperty('raw')
     expect(result.sortedEntries.map(entry => entry.uid)).toEqual([1, 2])
@@ -906,6 +977,26 @@ describe('world-info compatibility scanning', () => {
     expect(Object.keys(result.timedEffects.sticky)).toEqual(['test-world.1'])
   })
 
+  it('keeps timed-effect metadata isolated between scan event snapshots', () => {
+    const hook = vi.fn((input: WorldInfoScanHookInput) => {
+      const entry = input.activated.entries.get('test-world.1')
+      if (!entry) return
+      input.timedEffects.setTimedEffect('sticky', entry, input.loopCount === 1)
+    })
+
+    const result = scan({
+      '1': makeEntry({ uid: 1, key: ['dragon'], content: 'first lore', sticky: 4 }),
+      '2': makeEntry({ uid: 2, key: ['first lore'], content: 'recursive lore', prevent_recursion: true }),
+    }, ['dragon'], {
+      recursive: true,
+      scanDoneHooks: [hook],
+    })
+
+    expect(result.scanEvents).toHaveLength(2)
+    expect(Object.keys(result.scanEvents[0]?.timedEffectsMetadata?.sticky ?? {})).toEqual(['test-world.1'])
+    expect(result.scanEvents[1]?.timedEffectsMetadata).toEqual({ sticky: {}, cooldown: {} })
+    expect(Object.keys(result.timedEffects.sticky)).toEqual(['test-world.1'])
+  })
   it('applies scan-done activated entry patches before later hooks observe the same scan', () => {
     const replacementEntry = {
       ...getSortedWorldInfoEntries([{ name: 'test-world', type: 'character', entries: {
@@ -1118,6 +1209,10 @@ describe('world-info compatibility scanning', () => {
     expect(first.matchedEntries.map(entry => entry.content)).toEqual(['sticky lore'])
     expect(first.timedEffectsChanged).toBe(true)
     expect(Object.keys(first.timedEffects.sticky)).toEqual(['test-world.1'])
+    expect(first.scanEvents[0]?.timedEffectsMetadata).toEqual({
+      sticky: {},
+      cooldown: {},
+    })
 
     const second = scan({
       '1': makeEntry({ uid: 1, key: ['dragon'], content: 'sticky lore', sticky: 2, probability: 1 }),

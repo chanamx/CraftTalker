@@ -1,4 +1,5 @@
 import type { WorldBookEntry } from '../services/world.service.js'
+import { throwIfAborted } from './abort.js'
 
 export const WORLD_INFO_POSITION = {
   before: 0,
@@ -37,9 +38,13 @@ export type WorldInfoScanState = 'initial' | 'recursion' | 'min_activations'
 type ScanState = WorldInfoScanState
 export type WorldInfoTimedEffectType = 'sticky' | 'cooldown' | 'delay'
 type TimedEffectType = Exclude<WorldInfoTimedEffectType, 'delay'>
-export type TokenCounter = (text: string) => number | Promise<number>
+export type TokenCounter = (text: string, signal?: AbortSignal) => number | Promise<number>
 export type WorldInfoMacroResolver = (text: string) => string
 export type WorldInfoVectorActivator = (input: WorldInfoVectorActivationInput) => WorldInfoVectorActivation[] | Promise<WorldInfoVectorActivation[]>
+export type WorldInfoPromptContentTransformer = (
+  entries: WorldInfoPromptContentTransformEntry[],
+  signal?: AbortSignal,
+) => Record<string, string> | Promise<Record<string, string>>
 
 export interface MatchedEntry {
   content: string
@@ -50,6 +55,8 @@ export interface MatchedEntry {
   world?: string
   uid?: number
   outletName?: string
+  ignoreBudget?: boolean
+  group?: string
 }
 
 export interface WorldInfoSource {
@@ -82,6 +89,7 @@ export interface WorldInfoScanSettings {
   globalScanData?: WorldInfoGlobalScanData
   timedEffects?: WorldInfoTimedEffectsMetadata
   dryRun?: boolean
+  signal?: AbortSignal
   tokenCounter?: TokenCounter
   entriesLoadedHooks?: WorldInfoEntriesLoadedHook[]
   scanDoneHooks?: WorldInfoScanDoneHook[]
@@ -91,7 +99,18 @@ export interface WorldInfoScanSettings {
   vectorActivations?: WorldInfoVectorActivation[]
   vectorActivator?: WorldInfoVectorActivator
   macroResolver?: WorldInfoMacroResolver
+  promptContentTransformer?: WorldInfoPromptContentTransformer
   legacyUseRegexp?: boolean
+}
+
+export interface WorldInfoPromptContentTransformEntry {
+  id: string
+  world: string
+  uid: number
+  content: string
+  position: number
+  depth?: number
+  role: number
 }
 
 export interface WorldInfoChatMessage {
@@ -107,6 +126,8 @@ export interface WorldInfoForceActivation {
   depth?: number
   insertion_order?: number
   role?: number
+  ignoreBudget?: boolean
+  group?: string
 }
 
 export interface WorldInfoVectorActivation extends WorldInfoForceActivation {
@@ -172,6 +193,9 @@ export interface WorldInfoScanEvent {
   recursionDelayCurrentLevel?: number
   newAllEntries?: WorldInfoScanEventEntry[]
   newSuccessfulEntries?: WorldInfoScanEventEntry[]
+  activatedEntries?: WorldInfoScanEventEntry[]
+  activatedText?: string
+  timedEffectsMetadata?: WorldInfoTimedEffectsMetadata
   timedEffectActiveEntryIds?: WorldInfoTimedEffectActiveEntryIds
 }
 
@@ -392,8 +416,9 @@ type CheckWorldInfoExecutionEffect =
   | { type: 'apply-vector-activations'; runtime: CheckWorldInfoRuntime; settings: WorldInfoScanSettings }
   | { type: 'count-tokens'; tokenCounter: TokenCounter; text: string }
   | { type: 'emit-scan-done-hooks'; settings: WorldInfoScanSettings; input: WorldInfoScanHookInput }
+  | { type: 'transform-prompt-content'; transformer: WorldInfoPromptContentTransformer; entries: WorldInfoPromptContentTransformEntry[] }
 
-type CheckWorldInfoExecutionResult = void | number | WorldInfoCompatEntry[] | WorldInfoScanHookPatch
+type CheckWorldInfoExecutionResult = void | number | WorldInfoCompatEntry[] | WorldInfoScanHookPatch | Record<string, string>
 
 export function getSortedWorldInfoEntries(
   sources: WorldInfoSource[],
@@ -561,19 +586,29 @@ export function checkWorldInfoSync(input: CheckWorldInfoInput): WorldInfoPromptR
 }
 
 async function runCheckWorldInfo(input: CheckWorldInfoInput): Promise<WorldInfoPromptResult> {
+  const signal = input.settings?.signal
+  throwIfAborted(signal, 'World-info scan aborted')
   const execution = executeCheckWorldInfo(input)
   let step = execution.next()
   while (!step.done) {
-    step = execution.next(await runCheckWorldInfoEffect(step.value))
+    throwIfAborted(signal, 'World-info scan aborted')
+    const effectResult = await runCheckWorldInfoEffect(step.value, signal)
+    throwIfAborted(signal, 'World-info scan aborted')
+    step = execution.next(effectResult)
   }
   return step.value
 }
 
 function runCheckWorldInfoSync(input: CheckWorldInfoInput): WorldInfoPromptResult {
+  const signal = input.settings?.signal
+  throwIfAborted(signal, 'World-info scan aborted')
   const execution = executeCheckWorldInfo(input)
   let step = execution.next()
   while (!step.done) {
-    step = execution.next(runCheckWorldInfoEffectSync(step.value))
+    throwIfAborted(signal, 'World-info scan aborted')
+    const effectResult = runCheckWorldInfoEffectSync(step.value, signal)
+    throwIfAborted(signal, 'World-info scan aborted')
+    step = execution.next(effectResult)
   }
   return step.value
 }
@@ -699,6 +734,9 @@ function* executeCheckWorldInfo(
       recursionDelayCurrentLevel: runtime.currentRecursionDelayLevel,
       newAllEntries: newEntries.map(toScanEventEntry),
       newSuccessfulEntries: successfulEntries.map(toScanEventEntry),
+      activatedEntries: [...runtime.activated.values()].map(toScanEventEntry),
+      activatedText: runtime.activatedText,
+      timedEffectsMetadata: cloneTimedEffectsMetadata(runtime.timedEffects.metadata),
       timedEffectActiveEntryIds: getTimedEffectActiveEntryIds(runtime.timedEffects),
     })
 
@@ -706,33 +744,51 @@ function* executeCheckWorldInfo(
     runtime.scanState = patchResult.nextState
   }
 
+  throwIfAborted(settings.signal, 'World-info scan aborted')
   setTimedEffects(runtime.timedEffects, [...runtime.activated.values()], settings.dryRun === true)
-  return buildPromptResult([...runtime.activated.values()], runtime.overflowed, runtime.timedEffects, runtime.scanEvents, runtime.sortedEntries)
+  const activatedEntries = [...runtime.activated.values()]
+  const transformedContent = settings.promptContentTransformer
+    ? (yield {
+        type: 'transform-prompt-content',
+        transformer: settings.promptContentTransformer,
+        entries: activatedEntries.map(toPromptContentTransformEntry),
+      }) as Record<string, string>
+    : undefined
+  return buildPromptResult(activatedEntries, runtime.overflowed, runtime.timedEffects, runtime.scanEvents, runtime.sortedEntries, transformedContent)
 }
 
-async function runCheckWorldInfoEffect(effect: CheckWorldInfoExecutionEffect): Promise<CheckWorldInfoExecutionResult> {
+async function runCheckWorldInfoEffect(effect: CheckWorldInfoExecutionEffect, signal?: AbortSignal): Promise<CheckWorldInfoExecutionResult> {
   switch (effect.type) {
     case 'get-sorted-entries':
       return getSortedWorldInfoEntriesAsync(effect.sources, effect.settings)
     case 'apply-vector-activations':
       return applyVectorActivations(effect.runtime, effect.settings)
     case 'count-tokens':
-      return countTokens(effect.tokenCounter, effect.text)
+      return countTokens(effect.tokenCounter, effect.text, signal)
     case 'emit-scan-done-hooks':
       return emitScanDoneHooks(effect.settings, effect.input)
+    case 'transform-prompt-content':
+      return normalizeTransformedPromptContent(await effect.transformer(effect.entries, signal), effect.entries)
   }
 }
 
-function runCheckWorldInfoEffectSync(effect: CheckWorldInfoExecutionEffect): CheckWorldInfoExecutionResult {
+function runCheckWorldInfoEffectSync(effect: CheckWorldInfoExecutionEffect, signal?: AbortSignal): CheckWorldInfoExecutionResult {
   switch (effect.type) {
     case 'get-sorted-entries':
       return getSortedWorldInfoEntries(effect.sources, effect.settings)
     case 'apply-vector-activations':
       return applyVectorActivationsSync(effect.runtime, effect.settings)
     case 'count-tokens':
-      return countTokensSync(effect.tokenCounter, effect.text)
+      return countTokensSync(effect.tokenCounter, effect.text, signal)
     case 'emit-scan-done-hooks':
       return emitScanDoneHooksSync(effect.settings, effect.input)
+    case 'transform-prompt-content': {
+      const result = effect.transformer(effect.entries, signal)
+      if (isPromiseLike(result)) {
+        throw new Error('checkWorldInfoSync requires a synchronous promptContentTransformer')
+      }
+      return normalizeTransformedPromptContent(result, effect.entries)
+    }
   }
 }
 
@@ -795,7 +851,7 @@ function normalizeScanChat(input: CheckWorldInfoInput, settings: WorldInfoScanSe
 
 function normalizeScanInjects(scanInjects: string[] | undefined): string[] {
   return Array.isArray(scanInjects)
-    ? scanInjects.map(item => item.trim()).filter(Boolean)
+    ? scanInjects.filter(item => item.trim().length > 0)
     : []
 }
 
@@ -897,6 +953,8 @@ function activationKey(activation: WorldInfoForceActivation): string | null {
 function activationPatch(activation: WorldInfoForceActivation): Partial<WorldInfoCompatEntry> {
   const patch: Partial<WorldInfoCompatEntry> = {}
   if (typeof activation.content === 'string') patch.content = activation.content
+  if (typeof activation.ignoreBudget === 'boolean') patch.ignoreBudget = activation.ignoreBudget
+  if (typeof activation.group === 'string') patch.group = activation.group
   patchNumber(patch, 'position', activation.position)
   patchNumber(patch, 'depth', activation.depth)
   patchNumber(patch, 'insertion_order', activation.insertion_order)
@@ -1112,13 +1170,13 @@ function getSourceEntryGroups(entries: WorldInfoCompatEntry[]): WorldInfoSourceE
   return groups
 }
 
-async function countTokens(tokenCounter: TokenCounter, text: string): Promise<number> {
-  const count = await tokenCounter(text)
+async function countTokens(tokenCounter: TokenCounter, text: string, signal?: AbortSignal): Promise<number> {
+  const count = await tokenCounter(text, signal)
   return normalizeTokenCount(count)
 }
 
-function countTokensSync(tokenCounter: TokenCounter, text: string): number {
-  const count = tokenCounter(text)
+function countTokensSync(tokenCounter: TokenCounter, text: string, signal?: AbortSignal): number {
+  const count = tokenCounter(text, signal)
   if (isPromiseLike(count)) {
     throw new Error('checkWorldInfoSync requires a synchronous tokenCounter')
   }
@@ -1268,6 +1326,15 @@ function createTimedEffectsHookState(runtime: TimedEffectRuntime): WorldInfoTime
   }
 }
 
+function cloneTimedEffectsMetadata(metadata: WorldInfoTimedEffectsMetadata): WorldInfoTimedEffectsMetadata {
+  const cloneRecord = (record: Record<string, WorldInfoTimedEffect>) => Object.fromEntries(
+    Object.entries(record).map(([key, effect]) => [key, { ...effect }]),
+  )
+  return {
+    sticky: cloneRecord(metadata.sticky),
+    cooldown: cloneRecord(metadata.cooldown),
+  }
+}
 function getTimedEffectActiveEntryIds(runtime: TimedEffectRuntime): WorldInfoTimedEffectActiveEntryIds {
   return {
     sticky: [...runtime.sticky].sort(),
@@ -1731,6 +1798,7 @@ function buildPromptResult(
   timedEffects: TimedEffectRuntime,
   scanEvents: WorldInfoScanEvent[],
   sortedEntries: WorldInfoCompatEntry[],
+  transformedContent?: Record<string, string>,
 ): WorldInfoPromptResult {
   const beforeEntries: string[] = []
   const afterEntries: string[] = []
@@ -1742,7 +1810,10 @@ function buildPromptResult(
   const matchedEntries: MatchedEntry[] = []
 
   for (const entry of sortByOrder(entries)) {
-    const content = entry.content
+    const id = entryId(entry)
+    const content = Object.hasOwn(transformedContent ?? {}, id)
+      ? transformedContent?.[id] ?? entry.content
+      : entry.content
     if (!content) continue
     const matchedEntry: MatchedEntry = {
       content,
@@ -1753,6 +1824,8 @@ function buildPromptResult(
       world: entry.world,
       uid: entry.uid,
       outletName: entry.outletName,
+      ignoreBudget: entry.ignoreBudget,
+      group: entry.group,
     }
     matchedEntries.unshift(matchedEntry)
 
@@ -1814,6 +1887,30 @@ function buildPromptResult(
     vectorizedSkipped: scanEvents.filter(event => event.type === 'vectorized_skipped'),
     vectorizedActivated: scanEvents.filter(event => event.type === 'vectorized_activated'),
   }
+}
+
+function toPromptContentTransformEntry(entry: WorldInfoCompatEntry): WorldInfoPromptContentTransformEntry {
+  return {
+    id: entryId(entry),
+    world: entry.world,
+    uid: entry.uid,
+    content: entry.content,
+    position: entry.position,
+    depth: entry.position === WORLD_INFO_POSITION.atDepth ? entry.depth : undefined,
+    role: entry.role,
+  }
+}
+
+function normalizeTransformedPromptContent(
+  value: Record<string, string>,
+  entries: WorldInfoPromptContentTransformEntry[],
+): Record<string, string> {
+  const normalized: Record<string, string> = {}
+  for (const entry of entries) {
+    const content = value?.[entry.id]
+    if (typeof content === 'string') normalized[entry.id] = content
+  }
+  return normalized
 }
 
 function prepareTimedEffects(
