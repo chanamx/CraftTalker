@@ -51,13 +51,19 @@ Current hardening includes:
 - Upload temp files use `safePath` and `randomUUID`; user files, persona avatars, extension resources, character assets, and compatibility proxy paths validate names and base containment.
 - Markdown/XSS hardening through DOMPurify allow-lists, sanitized highlighted HTML, stripped dangerous protocols/styles/handlers, and safe external links.
 - First-stage server-side LLM key sessions through `/api/llm-sessions`; legacy client encrypted settings remain as migration/local-storage support.
-- CORS and CSRF share `server/src/config/origins.ts`; CSRF applies outside `test` and `development`.
+- CORS and CSRF share `server/src/config/origins.ts`; CSRF is bypassed only by the explicit test switch, never merely because `NODE_ENV=development`.
+- Remote API authentication runs before the protected API rate-limit bucket. Direct Node connections use the peer address; forwarded client-IP headers are trusted only when `CRAFTTALKER_TRUST_PROXY=true`. Anonymous and authenticated traffic do not share the same bucket.
+- LLM key sessions are in-process, owner-bound, revocable, and expire after 12 hours. Capacity is capped at 64 sessions per owner and 1,024 sessions globally; expired sessions are swept before creation and valid sessions are never silently evicted.
+- LLM key sessions are encrypted at rest in `LUKER_DATA_DIR/secrets/llm-key-vault.json`. Local deployments use a generated sibling key file; set `CRAFTTALKER_VAULT_SECRET` for a secret-derived vault key in managed/remote deployments. The vault remains single-process and is not a replacement for an OS keychain or external secret manager.
+- Provider endpoint policy requires HTTPS for public/custom providers, permits HTTP/private addresses only for explicit local provider types, and always rejects metadata, link-local, unspecified, multicast, and other reserved destinations. DNS results are checked before fetch; the remaining DNS-to-fetch TOCTOU boundary is documented and does not use a custom dispatcher.
+- `npm run size:audit` is a hard release gate: main gzip ≤60 KiB, ST host gzip ≤200 KiB, and total `dist` ≤5 MiB by default.
 - Extension management, generic CORS proxying, SD/Comfy proxying, group chat, and unsafe script execution fail closed unless a narrow trusted bridge exists.
+- `npm run audit:st-plugins` is a static capability/import audit, not a complete runtime sandbox for arbitrary extension JavaScript.
 - Vite/Rolldown build input and vendor splitting are configured so the latest known build has no large-chunk warning; the ST extension host stays in a lazy async chunk.
 
 Important remaining work:
 
-- In-memory LLM key sessions need a production vault/session/proxy design.
+- The first encrypted LLM session vault is now in place; future deployments can replace it with an OS keychain or external secret manager.
 - Production CSRF/session behavior needs deployment-oriented tests.
 - Long-stream cleanup, multi-process generation locking, and durable queue/worker behavior still need review.
 - ST compatibility needs continued real-asset and real-plugin audits, especially around deeper world-info recursion/vector behavior, chat edge payloads, attachments, media, quick replies, reasoning/logprobs, presets, and extension data.
@@ -122,13 +128,19 @@ cd server
 npm run build
 ```
 
-`npm run preview` previews the built frontend. After `npm run build` in `server`, start the backend with `npm start` from `server`.
+`npm run preview` previews the built frontend. After `npm run build` in `server`, start the emitted backend with `npm start` from `server`. Run `npm run smoke:production` there to start the emitted entrypoint on a temporary localhost port, check `/api/health`, and shut it down.
 
 ## Environment Variables
 
 | Variable | Purpose |
 | --- | --- |
 | `PORT` | Backend port; defaults to `3000`. |
+| `HOST` | Bind hostname; defaults to `127.0.0.1`. Non-loopback binding enters remote mode and requires authentication. |
+| `CRAFTTALKER_RUNTIME_MODE` | Explicit `local` or `remote` mode. Local mode rejects non-loopback hosts. |
+| `CRAFTTALKER_REMOTE_ACCESS_TOKEN` | Required in remote mode; bearer token/session secret, minimum 32 characters. |
+| `CRAFTTALKER_TRUST_PROXY` | Set to `true` only behind a trusted reverse proxy; enables proxy client-IP headers for rate limiting. |
+| `CRAFTTALKER_GENERATION_CONCURRENCY` | Maximum active generation attempts; defaults to `4`, clamped to `1..64`. |
+| `CRAFTTALKER_GENERATION_QUEUE_CAPACITY` | Maximum client-bound generation requests waiting in memory; defaults to `100`, clamped to `0..1000`. Queue wait is bounded to 30 seconds. |
 | `LUKER_DATA_DIR` | Overrides backend data storage directory; default is `server/data`. |
 | `LUKER_IMPORT_DIR` | Allows direct character imports from a controlled directory; default is temp `luker-import`. |
 | `ALLOWED_ORIGINS` | Comma-separated additional origins for CORS/CSRF checks. |
@@ -137,7 +149,17 @@ npm run build
 | `CRAFTTALKER_ST_CORS_PROXY_ALLOWLIST` | Trusted host allowlist for the constrained `/cors` proxy. |
 | `CRAFTTALKER_ST_IMAGE_BACKEND_PING_ENABLED` | Set to `true` to enable trusted SD/Comfy ping-only probes. Disabled by default. |
 | `CRAFTTALKER_ST_IMAGE_BACKEND_ALLOWLIST` | Exact trusted origins for SD/Comfy ping-only probes. |
-| `NODE_ENV` | `test` and `development` skip CSRF middleware for local tooling. |
+| `CRAFTTALKER_MAX_MAIN_GZIP_BYTES` | Optional `size:audit` override for the main bundle gzip budget; default `61440` bytes. |
+| `CRAFTTALKER_MAX_ST_HOST_GZIP_BYTES` | Optional `size:audit` override for the ST extension host gzip budget; default `204800` bytes. |
+| `CRAFTTALKER_MAX_RELEASE_BYTES` | Optional `size:audit` override for the complete `dist` release budget; default `5242880` bytes. |
+| `CRAFTTALKER_VAULT_SECRET` | Optional secret used to derive the encrypted LLM session vault key. Recommended for managed or remote deployments; changing it makes an existing secret-backed vault unavailable until the original secret is restored. |
+| `NODE_ENV` | Does not disable CSRF in development. Only the explicit test environment bypass is available to automated tests. |
+
+### Local and remote runtime safety
+
+The backend binds to `127.0.0.1` by default. To expose it beyond the local machine, set `HOST` to a non-loopback address or set `CRAFTTALKER_RUNTIME_MODE=remote`, and provide `CRAFTTALKER_REMOTE_ACCESS_TOKEN` (at least 32 characters). Remote mode protects API, file, chat, provider, and session routes with bearer authentication; `/api/health` and `/version` remain anonymous for probes.
+
+LLM key sessions are owner-bound, expire after inactivity/TTL, and are revocable. Persist only the session identifier in the frontend. Provider endpoints are validated before outbound requests; public providers require HTTPS, while local endpoints are reserved for explicitly local provider types. Rate limiting uses the direct Node peer address unless a trusted proxy is explicitly enabled. Chat detail supports bounded `?tail=N` or `?offset=N&limit=N` reads for long JSONL files; full reads remain available for explicit edit/export flows.
 
 ## Project Structure
 
@@ -169,13 +191,14 @@ CraftTalker/
 
 ## Verification
 
-Most recent known local baseline from 2026-07-07:
+Most recent known local baseline from 2026-07-13:
 
-- Root `npm run test`: 17 files / 176 frontend/root tests passed. Root Vitest now excludes `server/**`.
-- Server `npm run test`: 24 files / 281 tests passed.
+- Root `npm run test`: 21 files / 219 frontend/root tests passed. Root Vitest excludes `server/**`.
+- Server `npm run test`: 36 files / 381 tests passed.
 - Root and server typechecks passed.
 - Root and server builds passed; no Vite large chunk warning.
-- `npm run audit:st-shims` passed with 610 scanned files, 501 named imports, and 10 namespace/default imports.
+- `npm run audit:st-shims` and `npm run audit:st-plugins` passed.
+- `npm run size:audit` passed: main gzip about 49 KiB, ST host gzip about 171 KiB, and the complete release build about 3.0 MiB.
 - `git diff --check` reported no whitespace errors, aside from normal Windows LF-to-CRLF warnings in the dirty worktree.
 
 Useful checks after code changes:
@@ -185,11 +208,14 @@ npm run typecheck -- --pretty false
 npm run test
 npm run build
 npm run audit:st-shims
+npm run audit:st-plugins
+npm run size:audit
 
 cd server
 npm run typecheck -- --pretty false
 npm run test
 npm run build
+node scripts/production-smoke.mjs
 cd ..
 
 git diff --check

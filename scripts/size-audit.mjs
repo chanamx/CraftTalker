@@ -2,10 +2,12 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { evaluateBuildSizeBudget, readSizeBudgets } from './size-budget.mjs'
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const args = new Set(process.argv.slice(2))
 const jsonOutput = args.has('--json')
+const buildBudget = evaluateBuildSizeBudget(path.join(rootDir, 'dist'), readSizeBudgets())
 
 const files = collectFiles(rootDir)
 const categories = [
@@ -63,6 +65,7 @@ const report = {
   nestedGit: nestedGitRows,
   cleanupCandidates,
   largestNonDependencyFiles,
+  buildBudget,
   recommendations: buildRecommendations(categoryRows, thirdPartyRows, nestedGitRows),
 }
 
@@ -71,6 +74,8 @@ if (jsonOutput) {
 } else {
   printReport(report)
 }
+
+if (!buildBudget.ok) process.exitCode = 1
 
 function collectFiles(dir) {
   const results = []
@@ -258,6 +263,8 @@ function printReport(data) {
   console.log(`Total workspace: ${data.total.size} across ${data.total.files} files`)
   console.log('')
 
+  printBuildBudget(data.buildBudget)
+
   printTable('By category', data.categories, ['name', 'size', 'files', 'note'])
   printTable('Top-level directories/files', data.topLevel, ['name', 'size', 'files'])
 
@@ -280,6 +287,22 @@ function printReport(data) {
   } else {
     for (const item of data.recommendations) console.log(`- ${item}`)
   }
+}
+
+function printBuildBudget(result) {
+  console.log('Release build budget')
+  if (result.measurements) {
+    console.log(`- main gzip: ${formatBytes(result.measurements.mainGzipBytes)} / ${formatBytes(result.budgets.mainGzipBytes)}`)
+    console.log(`- ST host gzip: ${formatBytes(result.measurements.stHostGzipBytes)} / ${formatBytes(result.budgets.stHostGzipBytes)}`)
+    console.log(`- release build: ${formatBytes(result.measurements.releaseBytes)} / ${formatBytes(result.budgets.releaseBytes)}`)
+  }
+  if (result.ok) {
+    console.log('- status: passed')
+  } else {
+    console.log('- status: failed')
+    for (const error of result.errors) console.log(`- ${error}`)
+  }
+  console.log('')
 }
 
 function printTable(title, rows, columns) {

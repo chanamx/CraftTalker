@@ -5,8 +5,12 @@
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "typecheck": "tsc",
-    "build": "tsc",
+    "build": "node scripts/build.mjs",
     "start": "node dist/index.js",
+    "verify:release": "node scripts/verify-release.mjs",
+    "smoke:production": "node scripts/production-smoke.mjs",
+    "smoke:provider": "vitest run src/__tests__/provider-runtime.smoke.test.ts",
+    "runs:acknowledge-invalid-legacy": "tsx src/maintenance/acknowledge-invalid-legacy-run.ts",
     "test": "vitest run",
     "test:watch": "vitest"
   },

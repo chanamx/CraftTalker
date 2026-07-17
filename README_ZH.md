@@ -51,13 +51,19 @@ CraftTalker 的目标是强 SillyTavern 兼容，但不应被描述为“100% ST
 - 上传临时文件使用 `safePath` 和 `randomUUID`；user files、persona avatars、extension resources、character assets 和兼容代理路径都会校验文件名与 base containment。
 - Markdown/XSS 加固：DOMPurify allow-list、清洗后的高亮 HTML、剥离危险协议/样式/事件处理器，以及安全外链。
 - 第一阶段服务端 LLM key session 通过 `/api/llm-sessions` 实现；旧客户端加密设置仍作为迁移/本地存储支持存在。
-- CORS 与 CSRF 共用 `server/src/config/origins.ts`；CSRF 在非 `test` 和 `development` 环境启用。
+- CORS 与 CSRF 共用 `server/src/config/origins.ts`；只有显式测试开关可以跳过 CSRF，不能仅因 `NODE_ENV=development` 跳过。
+- 远程 API 会先完成认证，再进入受保护 API 的限流 bucket。Node 直连使用 peer address；只有设置 `CRAFTTALKER_TRUST_PROXY=true` 时才信任 forwarded client-IP headers。匿名与已认证流量不会共用同一 bucket。
+- LLM key session 仍是进程内实现，但已绑定 owner、可撤销，TTL 为 12 小时；每个 owner 最多 64 个、全局最多 1,024 个，创建前清理过期项，不静默撤销有效 session。
+- LLM key session 已加密持久化到 `LUKER_DATA_DIR/secrets/llm-key-vault.json`。本地部署使用同目录生成的 key 文件；托管/远程部署建议设置 `CRAFTTALKER_VAULT_SECRET`。该 vault 仍是单进程实现，不替代操作系统 keychain 或外部 secret manager。
+- Provider endpoint policy 要求公网/custom provider 使用 HTTPS；只有显式本地 provider 类型允许 HTTP/private 地址，并永久拒绝 metadata、link-local、unspecified、multicast 等保留目标。DNS 结果在 fetch 前检查；DNS 到 fetch 的 TOCTOU 是已知边界，本轮不引入自定义 dispatcher。
+- `npm run size:audit` 是硬门禁：默认 main gzip ≤60 KiB、ST host gzip ≤200 KiB、完整 `dist` ≤5 MiB。
 - Extension management、通用 CORS proxy、SD/Comfy proxy、group chat 和 unsafe script execution 默认 fail-closed，除非存在窄范围可信桥。
+- `npm run audit:st-plugins` 是静态 capability/import 审计，不是任意扩展 JavaScript 的完整运行时沙箱。
 - Vite/Rolldown 已配置 build input 和 vendor splitting；最新已知构建无大 chunk 警告，ST extension host 保持为懒加载 async chunk。
 
 仍需重点推进：
 
-- 内存型 LLM key sessions 需要升级为生产级 vault/session/proxy 设计。
+- LLM key session 已具备第一阶段加密 vault；后续仍可替换为操作系统 keychain 或外部 secret manager。
 - 生产 CSRF/session 行为需要面向部署的测试。
 - 长流清理、多进程生成锁和持久队列/worker 行为仍需审查。
 - ST 兼容还需要持续用真实资产和真实插件审计，尤其是更深的 world-info recursion/vector 行为、聊天边缘 payload、attachments、media、quick replies、reasoning/logprobs、presets 和 extension data。
@@ -122,13 +128,19 @@ cd server
 npm run build
 ```
 
-`npm run preview` 可预览前端构建产物。后端在 `server` 目录执行 `npm run build` 后，可用 `npm start` 启动。
+`npm run preview` 可预览前端构建产物。后端在 `server` 目录执行 `npm run build` 后会生成 `server/dist/`，可用 `npm start` 启动；可运行 `npm run smoke:production` 启动临时 localhost 实例并检查 `/api/health`。
 
 ## 环境变量
 
 | 变量 | 作用 |
 | --- | --- |
 | `PORT` | 后端端口，默认 `3000`。 |
+| `HOST` | 监听地址，默认 `127.0.0.1`。非 loopback 地址会进入远程模式并强制认证。 |
+| `CRAFTTALKER_RUNTIME_MODE` | 显式设置 `local` 或 `remote`；local 不允许非 loopback 监听。 |
+| `CRAFTTALKER_REMOTE_ACCESS_TOKEN` | 远程模式必填，至少 32 个字符，用于 Bearer/session 认证。 |
+| `CRAFTTALKER_TRUST_PROXY` | 仅在可信反向代理后设置为 `true`，启用代理客户端 IP 头用于限流。 |
+| `CRAFTTALKER_GENERATION_CONCURRENCY` | 同时执行的 generation 上限，默认 `4`，限制在 `1..64`。 |
+| `CRAFTTALKER_GENERATION_QUEUE_CAPACITY` | 内存中等待的 client-bound generation 上限，默认 `100`，限制在 `0..1000`；排队等待最多 30 秒。 |
 | `LUKER_DATA_DIR` | 覆盖后端数据存储目录，默认是 `server/data`。 |
 | `LUKER_IMPORT_DIR` | 允许从受控目录直接导入角色文件，默认是临时 `luker-import`。 |
 | `ALLOWED_ORIGINS` | 额外允许的 CORS/CSRF 来源，多个值用英文逗号分隔。 |
@@ -137,7 +149,17 @@ npm run build
 | `CRAFTTALKER_ST_CORS_PROXY_ALLOWLIST` | 受限 `/cors` 代理的可信 host allowlist。 |
 | `CRAFTTALKER_ST_IMAGE_BACKEND_PING_ENABLED` | 设为 `true` 后启用可信 SD/Comfy ping-only 探测。默认关闭。 |
 | `CRAFTTALKER_ST_IMAGE_BACKEND_ALLOWLIST` | SD/Comfy ping-only 探测允许的精确可信 origin。 |
-| `NODE_ENV` | `test` 与 `development` 会跳过 CSRF 中间件，方便本地工具链。 |
+| `CRAFTTALKER_MAX_MAIN_GZIP_BYTES` | 可选的 `size:audit` main gzip 字节预算覆盖值，默认 `61440`。 |
+| `CRAFTTALKER_MAX_ST_HOST_GZIP_BYTES` | 可选的 `size:audit` ST extension host gzip 字节预算覆盖值，默认 `204800`。 |
+| `CRAFTTALKER_MAX_RELEASE_BYTES` | 可选的完整 `dist` 发布产物字节预算覆盖值，默认 `5242880`。 |
+| `CRAFTTALKER_VAULT_SECRET` | 可选的加密 LLM session vault 密钥派生 secret。建议托管/远程部署使用；更换后原 secret-backed vault 需要恢复原 secret 才能解密。 |
+| `NODE_ENV` | 不会在 development 中关闭 CSRF；自动化测试只能使用显式测试开关。 |
+
+### 本地与远程运行安全
+
+后端默认只监听 `127.0.0.1`。需要远程访问时，将 `HOST` 设为非 loopback 地址或设置 `CRAFTTALKER_RUNTIME_MODE=remote`，并提供至少 32 个字符的 `CRAFTTALKER_REMOTE_ACCESS_TOKEN`。远程模式保护 API、文件、聊天、provider 和 session 路由；`/api/health` 与 `/version` 保留匿名探针访问。
+
+LLM key session 绑定 owner，具有 TTL/过期和撤销语义；前端只应持久化 session ID。出站 provider URL 会统一校验：公网 provider 默认要求 HTTPS，本地 URL 仅对显式本地 provider 类型开放。直连 Node 时限流使用 peer address，只有显式启用可信代理时才使用 forwarded headers。长 JSONL 聊天详情支持 `?tail=N` 或 `?offset=N&limit=N` 窗口读取；完整读取保留给明确的编辑/导出流程。
 
 ## 项目结构
 
@@ -169,13 +191,14 @@ CraftTalker/
 
 ## 验证
 
-2026-07-07 最新已知本地基线：
+2026-07-13 最新已知本地基线：
 
-- Root `npm run test`：17 个文件 / 176 个 frontend/root 测试通过。Root Vitest 现在排除 `server/**`。
-- Server `npm run test`：24 个文件 / 281 个测试通过。
+- Root `npm run test`：21 个文件 / 219 个 frontend/root 测试通过。Root Vitest 排除 `server/**`。
+- Server `npm run test`：36 个文件 / 381 个测试通过。
 - Root 与 server typecheck 通过。
 - Root 与 server build 通过；无 Vite large chunk warning。
-- `npm run audit:st-shims` 通过：扫描 610 个文件，检查 501 个 named imports 和 10 个 namespace/default imports。
+- `npm run audit:st-shims` 与 `npm run audit:st-plugins` 通过。
+- `npm run size:audit` 通过：main gzip 约 49 KiB、ST host gzip 约 171 KiB、完整 release build 约 3.0 MiB。
 - `git diff --check` 无 whitespace 错误；脏 Windows 工作区仍可能显示常见 LF-to-CRLF 提醒。
 
 代码改动后常用检查：
@@ -185,11 +208,14 @@ npm run typecheck -- --pretty false
 npm run test
 npm run build
 npm run audit:st-shims
+npm run audit:st-plugins
+npm run size:audit
 
 cd server
 npm run typecheck -- --pretty false
 npm run test
 npm run build
+node scripts/production-smoke.mjs
 cd ..
 
 git diff --check
