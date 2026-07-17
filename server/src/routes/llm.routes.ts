@@ -12,11 +12,11 @@ llmRoutes.post(
     const config = resolveLlmConfigApiKey(c.req.valid('json'))
 
     try {
-      const models = await fetchModelsFromAPI(config)
+      const models = await fetchModelsFromAPI(config, c.req.raw.signal)
       return c.json(models)
     } catch (error) {
-      console.error('[LLM] Failed to fetch models:', error)
-      return c.json({ error: 'Failed to fetch models', details: String(error) }, 500)
+      console.error('[LLM] Failed to fetch models:', error instanceof Error ? error.name : 'Unknown error')
+      return c.json({ error: 'Failed to fetch models' }, 502)
     }
   },
 )

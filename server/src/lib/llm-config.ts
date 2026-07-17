@@ -1,8 +1,30 @@
 import { AppError, ErrorCode } from './errors.js'
 import { resolveLlmSessionApiKey } from '../services/llm-session.service.js'
 import { z } from 'zod'
+import { inspectJsonComplexity } from './bounded-json.js'
 
 const legacyTypeSchema = z.enum(['openai', 'kobold', 'textgen', 'novel', 'custom'])
+
+const customHeadersSchema = z.record(z.string().max(8192)).superRefine((value, ctx) => {
+  if (Object.keys(value).length > 64) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Too many custom headers' })
+  }
+  if (JSON.stringify(value).length > 64 * 1024) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Custom headers are too large' })
+  }
+})
+
+const customBodyFieldsSchema = z.record(z.unknown()).superRefine((value, ctx) => {
+  if (Object.keys(value).length > 128) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Too many custom body fields' })
+  }
+  if (JSON.stringify(value).length > 256 * 1024) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Custom body fields are too large' })
+  }
+  if (!inspectJsonComplexity(value, { maxDepth: 12, maxNodes: 10_000, maxArrayLength: 1_000 }).ok) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Custom body fields are too complex' })
+  }
+})
 
 export const llmApiFormatSchema = z.enum([
   'openai_chat',
@@ -59,19 +81,19 @@ const llmSourceSchema = z.enum([
 
 export const llmConfigSchema = z.object({
   source: llmSourceSchema.optional(),
-  apiUrl: z.string(),
-  apiKey: z.string(),
-  apiKeySessionId: z.string().optional(),
-  model: z.string(),
+  apiUrl: z.string().trim().min(1).max(4096),
+  apiKey: z.string().max(4096),
+  apiKeySessionId: z.string().max(256).optional(),
+  model: z.string().trim().min(1).max(512),
   type: legacyTypeSchema.default('openai'),
   useReverseProxy: z.boolean().optional(),
-  reverseProxyUrl: z.string().optional(),
-  reverseProxyPassword: z.string().optional(),
-  reverseProxyName: z.string().optional(),
+  reverseProxyUrl: z.string().max(4096).optional(),
+  reverseProxyPassword: z.string().max(4096).optional(),
+  reverseProxyName: z.string().max(256).optional(),
   customApiFormat: llmApiFormatSchema.optional(),
-  customHeaders: z.record(z.string()).optional(),
-  customBodyFields: z.record(z.unknown()).optional(),
-  excludeBodyFields: z.array(z.string()).optional(),
+  customHeaders: customHeadersSchema.optional(),
+  customBodyFields: customBodyFieldsSchema.optional(),
+  excludeBodyFields: z.array(z.string().max(256)).max(128).optional(),
   azureConfig: z.object({
     resourceName: z.string(),
     deploymentName: z.string(),

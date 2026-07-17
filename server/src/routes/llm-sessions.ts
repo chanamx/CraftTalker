@@ -6,7 +6,7 @@ import * as llmSessionService from '../services/llm-session.service.js'
 const llmSessionsRoute = new Hono()
 
 const createSchema = z.object({
-  apiKey: z.string(),
+  apiKey: z.string().min(1).max(4096),
   label: z.string().trim().min(1).max(120).optional(),
 })
 

@@ -6,6 +6,8 @@ import {
   providerFromConfig,
 } from '../lib/llm-provider.js'
 import type { LLMConfig } from '../lib/llm-config.js'
+import { resolveRuntimeConfig } from '../config/runtime.js'
+import { providerFetch } from '../lib/provider-fetch.js'
 
 type ModelListItem = Record<string, unknown>
 
@@ -21,7 +23,7 @@ interface ModelListResponse {
 
 const MAX_MODEL_LIST_PAGES = 10
 
-export async function fetchModelsFromAPI(config: LLMConfig): Promise<string[]> {
+export async function fetchModelsFromAPI(config: LLMConfig, signal?: AbortSignal): Promise<string[]> {
   const provider = providerFromConfig(config)
   const apiFormat = apiFormatFromConfig(config)
   let url: string | undefined = initialModelListUrl(modelListUrlFromConfig(config), apiFormat)
@@ -33,9 +35,17 @@ export async function fetchModelsFromAPI(config: LLMConfig): Promise<string[]> {
       console.info('[LLM] Fetching models from:', url)
     }
 
-    const response = await fetch(url, {
-      method: 'GET',
-      headers,
+    const response = await providerFetch({
+      url,
+      source: config.source,
+      mode: resolveRuntimeConfig().mode,
+      timeoutMs: 10_000,
+      maxResponseBytes: 4 * 1024 * 1024,
+      init: {
+        method: 'GET',
+        headers,
+        signal,
+      },
     })
 
     if (!response.ok) {
