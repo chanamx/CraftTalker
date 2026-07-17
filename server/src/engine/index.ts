@@ -16,4 +16,4 @@ export function getEngineName(): string {
 }
 
 export { NativeEngine } from './native.js'
-export type { Engine, EngineRequest, EngineResponse, EngineMessage } from './types.js'
+export type { Engine, EngineRequest, EngineResponse, EngineMessage, EnginePromptAnchors } from './types.js'

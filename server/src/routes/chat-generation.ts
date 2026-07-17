@@ -2,19 +2,23 @@ import type { Context } from 'hono'
 import * as chatService from '../services/chat.service.js'
 import * as characterService from '../services/character.service.js'
 import * as presetService from '../services/preset.service.js'
-import { getEngine } from '../engine/index.js'
 import { AppError, ErrorCode } from '../lib/errors.js'
 import {
-  getGenerationLockInfo,
-  tryAcquireGenerationLock,
+  acquireGenerationLock,
+  type GenerationLockInfo,
   type GenerationLock,
   type GenerationOperation,
 } from '../lib/generation-locks.js'
 import { resolveLlmConfigApiKey, type LLMConfig } from '../lib/llm-config.js'
+import { resolveRuntimeOwnerId } from '../config/runtime.js'
 import * as runService from '../services/run.service.js'
-import type { EngineMessage } from '../engine/types.js'
+import type { EngineMessage, EnginePromptAnchors } from '../engine/types.js'
 import type { WorldInfoChatMessage } from '../lib/world-info-compat.js'
 import type { MatchedEntry } from '../lib/world-match.js'
+import {
+  executeNonStreamGeneration,
+  GenerationStreamExecution,
+} from '../services/generation-executor.js'
 
 export interface GenerationOverrides {
   temperature?: number
@@ -61,6 +65,8 @@ export type LoadWorldEntries = (
   model?: string,
   userName?: string,
   operation?: GenerationOperation,
+  preset?: { type?: string; name?: string; regexScripts?: unknown[] },
+  scanInjects?: string[],
 ) => Promise<WorldEntries>
 
 interface PreparedGenerationContext {
@@ -69,6 +75,7 @@ interface PreparedGenerationContext {
   config: LLMConfig
   userName?: string
   messages: EngineMessage[]
+  promptAnchors?: EnginePromptAnchors
   worldEntries: WorldEntries
 }
 
@@ -92,8 +99,34 @@ export async function handleGenerate(input: {
   const stream = input.stream ?? true
   const isContinue = input.isContinue ?? false
   const operation = input.operation ?? 'generate'
-  const lock = tryAcquireGenerationLock(input.characterName, input.chatId, operation)
-  if (!lock) return generationInProgressResponse(input.c, input.characterName, input.chatId)
+  const admission = await acquireGenerationLock({
+    characterName: input.characterName,
+    chatId: input.chatId,
+    operation,
+    signal: input.c.req.raw.signal,
+    ownerId: resolveRuntimeOwnerId(),
+    providerKey: input.config.source ?? input.config.type,
+  })
+  if (admission.status === 'rejected') {
+    switch (admission.reason) {
+      case 'not_accepting':
+        return generationUnavailableResponse(input.c)
+      case 'queue_full':
+        return generationQueueBackpressureResponse(input.c, admission.retryAfterSeconds ?? 1, false)
+      case 'queue_timeout':
+        return generationQueueBackpressureResponse(input.c, admission.retryAfterSeconds ?? 1, true)
+      case 'client_aborted':
+        return generationCanceledBeforeStartResponse(input.c)
+      case 'duplicate':
+        return generationInProgressResponse(
+          input.c,
+          input.characterName,
+          input.chatId,
+          admission.existing,
+        )
+    }
+  }
+  const lock = admission.lock
 
   let run: GenerationRun | null = null
   let handlerOwnsRun = false
@@ -130,7 +163,7 @@ export async function handleGenerate(input: {
     }
 
     handlerOwnsRun = true
-    return await handleNonStreamGeneration(input.c, context, run, isContinue)
+    return await handleNonStreamGeneration(input.c, context, run, lock, isContinue)
   } catch (error) {
     if (run && !handlerOwnsRun) {
       await runService.failRun(run.runId, {
@@ -144,8 +177,19 @@ export async function handleGenerate(input: {
   }
 }
 
-function generationInProgressResponse(c: Context, characterName: string, chatId: string) {
-  const active = getGenerationLockInfo(characterName, chatId)
+function generationUnavailableResponse(c: Context) {
+  return c.json({
+    error: 'Server is shutting down and cannot accept new generation requests',
+    code: ErrorCode.SERVICE_UNAVAILABLE,
+  }, 503)
+}
+
+function generationInProgressResponse(
+  c: Context,
+  characterName: string,
+  chatId: string,
+  active?: GenerationLockInfo,
+) {
   return c.json({
     error: '当前聊天正在生成，请稍后再试',
     code: ErrorCode.GENERATION_IN_PROGRESS,
@@ -156,6 +200,27 @@ function generationInProgressResponse(c: Context, characterName: string, chatId:
       startedAt: active.startedAt,
     } : { characterName, chatId },
   }, 409)
+}
+
+function generationQueueBackpressureResponse(
+  c: Context,
+  retryAfterSeconds: number,
+  timedOut: boolean,
+) {
+  return c.json({
+    error: timedOut
+      ? 'Generation queue wait timed out. Please retry shortly.'
+      : 'Generation queue is full. Please retry shortly.',
+    code: ErrorCode.GENERATION_QUEUE_FULL,
+    details: { retryAfterSeconds },
+  }, 429, { 'Retry-After': String(retryAfterSeconds) })
+}
+
+function generationCanceledBeforeStartResponse(c: Context) {
+  return c.json({
+    error: 'Generation request was canceled before execution started.',
+    code: ErrorCode.VALIDATION_ERROR,
+  }, 408)
 }
 
 async function prepareGenerationContext(input: {
@@ -184,24 +249,33 @@ async function prepareGenerationContext(input: {
     ? extractStCompatChatOverrideMessages(input.stCompatChatOverride)
     : extractChatMessages(chat)
   const extensionPrompts = input.stCompatExtensionPrompts ?? []
-  const messagesWithExtensionPrompts = applyStCompatExtensionPrompts(chatMessages, extensionPrompts)
-  const promptMessages = input.stCompatPromptMessages
-    ? extractStCompatPromptMessages(input.stCompatPromptMessages)
+  const hasPromptMessageOverride = input.stCompatPromptMessages !== undefined
+  const promptAnchors = hasPromptMessageOverride ? undefined : buildStCompatPromptAnchors(extensionPrompts)
+  const messagesWithExtensionPrompts = applyStCompatExtensionPrompts(
+    chatMessages,
+    extensionPrompts.filter(prompt => !isMainPromptAnchor(prompt)),
+  )
+  const promptMessages = hasPromptMessageOverride
+    ? extractStCompatPromptMessages(input.stCompatPromptMessages ?? [])
     : messagesWithExtensionPrompts
-  const messagesForWorldScan = input.stCompatPromptMessages
-    ? promptMessages
-    : extensionPrompts.some(prompt => prompt.scan === true)
-      ? applyStCompatExtensionPrompts(chatMessages, extensionPrompts.filter(prompt => prompt.scan === true))
-      : chatMessages
+  const scanInjects = extensionPrompts
+    .filter(prompt => prompt.scan === true && prompt.value)
+    .map(prompt => prompt.value)
   const messages = promptMessages.map(({ role, content }) => ({ role, content }))
   const worldEntries = await input.loadWorldEntries(
     character,
     chat,
-    messagesForWorldScan,
+    chatMessages,
     getContextLength(preset, input.genOverrides),
     resolvedConfig.model,
     userName,
     input.operation,
+    {
+      type: input.presetType,
+      name: preset.name,
+      regexScripts: Array.isArray(preset.regex_scripts) ? preset.regex_scripts : undefined,
+    },
+    scanInjects,
   )
 
   return {
@@ -210,6 +284,7 @@ async function prepareGenerationContext(input: {
     config: resolvedConfig,
     userName,
     messages,
+    promptAnchors,
     worldEntries,
   }
 }
@@ -221,27 +296,70 @@ function handleStreamGeneration(
   lock: GenerationLock,
   isContinue: boolean,
 ) {
-  const streamGenerator = getEngine().generateStream({
-    messages: context.messages,
-    character: context.character,
-    preset: context.preset,
-    config: context.config,
-    userName: context.userName,
-    signal: c.req.raw.signal,
-    worldEntries: context.worldEntries,
-  })
-  const handler = new StreamGenerationHandler({
+  const execution = new GenerationStreamExecution({
     run,
-    lock,
     isContinue,
+    clientSignal: c.req.raw.signal,
+    shutdownSignal: lock.signal,
+    request: {
+      messages: context.messages,
+      character: context.character,
+      preset: context.preset,
+      config: context.config,
+      userName: context.userName,
+      promptAnchors: context.promptAnchors,
+      worldEntries: context.worldEntries,
+    },
   })
+  const encoder = new TextEncoder()
+  let sourceCanceled = false
+  let lockReleased = false
+  const releaseLock = () => {
+    if (lockReleased) return
+    lockReleased = true
+    lock.release()
+  }
+  const encodeSse = (payload: unknown) => encoder.encode(`data: ${JSON.stringify(payload)}\n\n`)
 
   const readable = new ReadableStream<Uint8Array>({
-    async start(controller) {
-      await handler.handleStream(streamGenerator, controller)
+    start(controller) {
+      // Keep `start` non-blocking so a client cancellation can reach the
+      // underlying source while the generator is still waiting on upstream.
+      void (async () => {
+        try {
+          for await (const event of execution.events()) {
+            if (event.type === 'chunk') {
+              controller.enqueue(encodeSse({ content: event.content }))
+              continue
+            }
+            controller.enqueue(encodeSse({
+              done: true,
+              runId: event.runId,
+              ...(event.committedLineIndex !== undefined
+                ? { committedLineIndex: event.committedLineIndex }
+                : {}),
+            }))
+            controller.enqueue(encoder.encode('data: [DONE]\n\n'))
+          }
+          if (!sourceCanceled) controller.close()
+        } catch (error) {
+          if (!sourceCanceled) {
+            try {
+              controller.enqueue(encodeSse(getStreamErrorPayload(error)))
+              controller.close()
+            } catch {
+              // The client may already have disconnected.
+            }
+          }
+        } finally {
+          releaseLock()
+        }
+      })()
     },
-    cancel() {
-      handler.cancel()
+    async cancel(reason) {
+      sourceCanceled = true
+      await execution.cancel(reason)
+      releaseLock()
     },
   })
 
@@ -256,201 +374,30 @@ async function handleNonStreamGeneration(
   c: Context,
   context: PreparedGenerationContext,
   run: GenerationRun,
+  lock: GenerationLock,
   isContinue: boolean,
 ) {
-  let partialContent = ''
-
-  try {
-    const response = await getEngine().generate({
+  const response = await executeNonStreamGeneration({
+    run,
+    isContinue,
+    clientSignal: c.req.raw.signal,
+    shutdownSignal: lock.signal,
+    request: {
       messages: context.messages,
       character: context.character,
       preset: context.preset,
       config: context.config,
       userName: context.userName,
+      promptAnchors: context.promptAnchors,
       worldEntries: context.worldEntries,
-    })
-    partialContent = response.content
-    const committedLineIndex = await saveGeneratedContent({
-      characterName: run.characterName,
-      chatId: run.chatId,
-      content: response.content,
-      isContinue,
-    })
-
-    await runService.completeRun(run.runId, {
-      partialContent: response.content,
-      committedLineIndex,
-    }).catch(() => {})
-
-    return c.json({
-      content: response.content,
-      finishReason: response.finishReason,
-      usage: response.usage,
-    })
-  } catch (error) {
-    await runService.failRun(run.runId, {
-      error: getErrorMessage(error),
-      partialContent,
-    }).catch(() => {})
-    throw error
-  }
-}
-
-class StreamGenerationHandler {
-  private readonly encoder = new TextEncoder()
-  private readonly chunks: string[] = []
-  private canceled = false
-  private saved = false
-  private terminalRunStarted = false
-  private lockReleased = false
-  private lastPartialFlushAt = 0
-  private committedLineIndex: number | undefined
-
-  constructor(
-    private readonly options: {
-      run: GenerationRun
-      lock: GenerationLock
-      isContinue: boolean
     },
-  ) {}
+  })
 
-  async handleStream(
-    streamGenerator: AsyncGenerator<string, void, unknown>,
-    controller: ReadableStreamDefaultController<Uint8Array>,
-  ): Promise<void> {
-    try {
-      for await (const chunk of streamGenerator) {
-        if (this.canceled) break
-        this.chunks.push(chunk)
-        controller.enqueue(this.encodeSse({ content: chunk }))
-        await this.flushPartial()
-      }
-      if (this.canceled) return
-
-      await this.flushPartial(true)
-      this.committedLineIndex = await this.saveGeneratedContent()
-      await this.completeRun()
-      controller.enqueue(this.encodeSse({
-        done: true,
-        runId: this.options.run.runId,
-        ...(this.committedLineIndex !== undefined ? { committedLineIndex: this.committedLineIndex } : {}),
-      }))
-      controller.enqueue(this.encoder.encode('data: [DONE]\n\n'))
-      controller.close()
-    } catch (error) {
-      if (!this.canceled) await this.handleError(error, controller)
-    } finally {
-      this.releaseLock()
-    }
-  }
-
-  cancel(): void {
-    this.canceled = true
-    if (this.startTerminalRun()) {
-      runService.cancelRun(this.options.run.runId, {
-        partialContent: this.fullContent(),
-        error: 'Client disconnected',
-      }).catch(() => {})
-    }
-    this.releaseLock()
-  }
-
-  private async saveGeneratedContent(): Promise<number | undefined> {
-    if (this.saved) return this.committedLineIndex
-
-    this.committedLineIndex = await saveGeneratedContent({
-      characterName: this.options.run.characterName,
-      chatId: this.options.run.chatId,
-      content: this.fullContent(),
-      isContinue: this.options.isContinue,
-    })
-    this.saved = true
-    return this.committedLineIndex
-  }
-
-  private async flushPartial(force = false): Promise<void> {
-    const now = Date.now()
-    if (!force && now - this.lastPartialFlushAt < 500) return
-    this.lastPartialFlushAt = now
-    await runService.updateRunPartial(this.options.run.runId, this.fullContent()).catch(() => {})
-  }
-
-  private async completeRun(): Promise<void> {
-    if (!this.startTerminalRun()) return
-
-    await runService.completeRun(this.options.run.runId, {
-      partialContent: this.fullContent(),
-      committedLineIndex: this.committedLineIndex,
-    }).catch(() => {})
-  }
-
-  private async handleError(
-    error: unknown,
-    controller: ReadableStreamDefaultController<Uint8Array>,
-  ): Promise<void> {
-    if (!(error instanceof AppError)) {
-      this.committedLineIndex = await this.saveGeneratedContent().catch(() => this.committedLineIndex)
-    }
-
-    if (this.startTerminalRun()) {
-      await runService.failRun(this.options.run.runId, {
-        error: getErrorMessage(error),
-        partialContent: this.fullContent(),
-        committedLineIndex: this.committedLineIndex,
-      }).catch(() => {})
-    }
-
-    try {
-      controller.enqueue(this.encodeSse(getStreamErrorPayload(error)))
-      controller.close()
-    } catch {
-      // The client may already have disconnected.
-    }
-  }
-
-  private startTerminalRun(): boolean {
-    if (this.terminalRunStarted) return false
-    this.terminalRunStarted = true
-    return true
-  }
-
-  private releaseLock(): void {
-    if (this.lockReleased) return
-    this.lockReleased = true
-    this.options.lock.release()
-  }
-
-  private fullContent(): string {
-    return this.chunks.join('')
-  }
-
-  private encodeSse(payload: unknown): Uint8Array {
-    return this.encoder.encode(`data: ${JSON.stringify(payload)}\n\n`)
-  }
-}
-
-async function saveGeneratedContent(input: {
-  characterName: string
-  chatId: string
-  content: string
-  isContinue: boolean
-}): Promise<number | undefined> {
-  if (!input.content) return undefined
-
-  if (input.isContinue) {
-    const chatData = await chatService.getChat(input.characterName, input.chatId)
-    const lastIdx = chatData.lines.length - 1
-    const lastLine = chatData.lines[lastIdx] as { mes?: string; is_user?: boolean }
-    if (lastIdx > 0 && lastLine.mes !== undefined && !lastLine.is_user) {
-      await chatService.editMessage(input.characterName, input.chatId, lastIdx, lastLine.mes + input.content)
-      return lastIdx
-    }
-    return undefined
-  }
-
-  await chatService.addMessage(input.characterName, input.chatId, false, input.content)
-  const chatData = await chatService.getChat(input.characterName, input.chatId)
-  return chatData.lines.length - 1
+  return c.json({
+    content: response.content,
+    finishReason: response.finishReason,
+    usage: response.usage,
+  })
 }
 
 function mergePresetWithOverrides(
@@ -501,6 +448,7 @@ function extractStCompatPromptMessages(messages: StCompatPromptMessage[]): ChatM
 }
 
 const EXTENSION_PROMPT_POSITION = {
+  NONE: -1,
   IN_PROMPT: 0,
   IN_CHAT: 1,
   BEFORE_PROMPT: 2,
@@ -513,8 +461,8 @@ const EXTENSION_PROMPT_ROLE = {
   ASSISTANT: 2,
 } as const
 
-function extensionPromptRole(prompt: StCompatExtensionPrompt): ChatMessageForGeneration['role'] {
-  switch (prompt.role) {
+function extensionPromptRole(role: StCompatExtensionPrompt['role']): ChatMessageForGeneration['role'] {
+  switch (role) {
     case EXTENSION_PROMPT_ROLE.USER:
       return 'user'
     case EXTENSION_PROMPT_ROLE.ASSISTANT:
@@ -525,10 +473,29 @@ function extensionPromptRole(prompt: StCompatExtensionPrompt): ChatMessageForGen
   }
 }
 
+function isMainPromptAnchor(prompt: StCompatExtensionPrompt): boolean {
+  return prompt.position === EXTENSION_PROMPT_POSITION.BEFORE_PROMPT
+    || prompt.position === EXTENSION_PROMPT_POSITION.IN_PROMPT
+}
+
+function buildStCompatPromptAnchors(prompts: StCompatExtensionPrompt[]): EnginePromptAnchors | undefined {
+  const beforeMain: EngineMessage[] = []
+  const afterMain: EngineMessage[] = []
+
+  for (const prompt of prompts) {
+    if (!prompt.value) continue
+    const message = { role: extensionPromptRole(prompt.role), content: prompt.value }
+    if (prompt.position === EXTENSION_PROMPT_POSITION.BEFORE_PROMPT) beforeMain.push(message)
+    if (prompt.position === EXTENSION_PROMPT_POSITION.IN_PROMPT) afterMain.push(message)
+  }
+
+  return beforeMain.length || afterMain.length ? { beforeMain, afterMain } : undefined
+}
+
 function extensionPromptMessage(prompt: StCompatExtensionPrompt): ChatMessageForGeneration {
   return {
     name: prompt.key,
-    role: extensionPromptRole(prompt),
+    role: extensionPromptRole(prompt.role),
     content: prompt.value,
   }
 }
@@ -542,26 +509,55 @@ function applyStCompatExtensionPrompts(
   const result = [...messages]
   const before: ChatMessageForGeneration[] = []
   const after: ChatMessageForGeneration[] = []
+  const inChat: StCompatExtensionPrompt[] = []
 
   for (const prompt of prompts) {
     if (!prompt.value) continue
-    const message = extensionPromptMessage(prompt)
+    if (prompt.position === EXTENSION_PROMPT_POSITION.NONE) continue
 
+    if (prompt.position === EXTENSION_PROMPT_POSITION.IN_CHAT) {
+      inChat.push(prompt)
+      continue
+    }
+
+    const message = extensionPromptMessage(prompt)
     if (prompt.position === EXTENSION_PROMPT_POSITION.AFTER_PROMPT) {
       after.push(message)
       continue
     }
 
-    if (prompt.position === EXTENSION_PROMPT_POSITION.IN_CHAT) {
-      const depth = typeof prompt.depth === 'number' && Number.isFinite(prompt.depth)
-        ? Math.max(0, Math.floor(prompt.depth))
-        : 0
-      const insertIdx = Math.max(0, result.length - depth)
-      result.splice(insertIdx, 0, message)
-      continue
-    }
-
     before.push(message)
+  }
+
+  const originalMessageCount = result.length
+  const grouped = new Map<number, Map<number, string[]>>()
+  for (const prompt of inChat.sort((left, right) => left.key < right.key ? -1 : left.key > right.key ? 1 : 0)) {
+    const content = prompt.value.trim()
+    if (!content) continue
+    const depth = typeof prompt.depth === 'number' && Number.isFinite(prompt.depth)
+      ? Math.max(0, Math.floor(prompt.depth))
+      : 0
+    const role = prompt.role === EXTENSION_PROMPT_ROLE.USER || prompt.role === EXTENSION_PROMPT_ROLE.ASSISTANT
+      ? prompt.role
+      : EXTENSION_PROMPT_ROLE.SYSTEM
+    const byRole = grouped.get(depth) ?? new Map<number, string[]>()
+    const contents = byRole.get(role) ?? []
+    contents.push(content)
+    byRole.set(role, contents)
+    grouped.set(depth, byRole)
+  }
+
+  for (const depth of [...grouped.keys()].sort((left, right) => left - right)) {
+    const insertIdx = Math.max(0, originalMessageCount - depth)
+    const byRole = grouped.get(depth)
+    for (const role of [EXTENSION_PROMPT_ROLE.SYSTEM, EXTENSION_PROMPT_ROLE.USER, EXTENSION_PROMPT_ROLE.ASSISTANT]) {
+      const contents = byRole?.get(role)
+      if (!contents?.length) continue
+      result.splice(insertIdx, 0, {
+        role: extensionPromptRole(role),
+        content: contents.join('\n'),
+      })
+    }
   }
 
   return [...before, ...result, ...after]

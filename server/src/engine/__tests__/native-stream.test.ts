@@ -39,6 +39,24 @@ describe('native stream consumers', () => {
     expect(chunks).toEqual(['Hello', ' ignored after done'])
   })
 
+  it('cancels the upstream SSE reader when DONE arrives before the body closes', async () => {
+    let canceled = false
+    const encoder = new TextEncoder()
+    const response = new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode('data: {"delta":"done"}\n\ndata: [DONE]\n\n'))
+      },
+      cancel() {
+        canceled = true
+      },
+    }))
+
+    expect(await collect(consumeSSE(response, data => (
+      data && typeof data === 'object' ? (data as { delta?: string }).delta : undefined
+    )))).toEqual(['done'])
+    expect(canceled).toBe(true)
+  })
+
   it('ignores malformed SSE JSON without failing the stream', async () => {
     const response = responseFromChunks([
       'event: message\n',

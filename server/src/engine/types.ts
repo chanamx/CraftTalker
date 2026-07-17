@@ -8,8 +8,14 @@ export interface EngineMessage {
   content: string
 }
 
+export interface EnginePromptAnchors {
+  beforeMain?: EngineMessage[]
+  afterMain?: EngineMessage[]
+}
+
 export interface EngineRequest {
   messages: EngineMessage[]
+  promptAnchors?: EnginePromptAnchors
   character: CharacterCard
   preset: GenerationPreset
   config: LLMConfig
@@ -33,4 +39,5 @@ export interface Engine {
   generate(request: EngineRequest): Promise<EngineResponse>
   generateStream(request: EngineRequest): AsyncGenerator<string, void, unknown>
   testConnection(config: LLMConfig): Promise<boolean>
+  dispose?: () => Promise<void>
 }

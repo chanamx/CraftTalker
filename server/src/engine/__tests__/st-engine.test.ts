@@ -69,6 +69,23 @@ afterEach(() => {
 })
 
 describe('STEngine compatibility shell', () => {
+  it('preserves typed extension prompts around the compat main prompt', async () => {
+    const anchoredRequest = request()
+    anchoredRequest.promptAnchors = {
+      beforeMain: [{ role: 'user', content: 'Before {{char}}' }],
+      afterMain: [{ role: 'assistant', content: 'After {{user}}' }],
+    }
+
+    const messages = await new STEngine().buildCompatPrompt(anchoredRequest)
+    const beforeIndex = messages.findIndex(message => message.content === 'Before STBot')
+    const mainIndex = messages.findIndex(message => message.content.includes('[Character: STBot]'))
+    const afterIndex = messages.findIndex(message => message.content === 'After Bob')
+
+    expect(beforeIndex).toBeGreaterThanOrEqual(0)
+    expect(beforeIndex).toBeLessThan(mainIndex)
+    expect(mainIndex).toBeLessThan(afterIndex)
+  })
+
   it('keeps the sillytavern engine identity while using NativeEngine provider transport', async () => {
     const fetchMock = vi.fn().mockResolvedValue(jsonResponse({
       choices: [{ message: { content: 'st reply' }, finish_reason: 'stop' }],

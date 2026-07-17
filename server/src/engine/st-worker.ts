@@ -26,6 +26,7 @@ workerPort.on('message', async (msg: WorkerMsg) => {
           messages: req.messages,
           userName: req.userName,
           worldInfo: req.worldEntries?.map(entry => entry.content),
+          promptAnchors: req.promptAnchors,
         })
         workerPort.postMessage({ id, type: 'result', payload: messages })
         break

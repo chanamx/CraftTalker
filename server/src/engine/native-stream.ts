@@ -11,29 +11,37 @@ export async function* consumeSSE(
 
   const decoder = new TextDecoder()
   let buffer = ''
+  let completed = false
 
-  while (true) {
-    const { done, value } = await reader.read()
-    if (done) break
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) {
+        completed = true
+        break
+      }
 
-    buffer += decoder.decode(value, { stream: true })
-    const lines = buffer.split('\n')
-    buffer = lines.pop() ?? ''
+      buffer += decoder.decode(value, { stream: true })
+      const lines = buffer.split('\n')
+      buffer = lines.pop() ?? ''
 
-    for (const line of lines) {
-      const trimmed = line.trim()
-      if (!trimmed || !trimmed.startsWith('data: ')) continue
-      const data = trimmed.slice(6)
-      if (data === '[DONE]') return
+      for (const line of lines) {
+        const trimmed = line.trim()
+        if (!trimmed || !trimmed.startsWith('data: ')) continue
+        const data = trimmed.slice(6)
+        if (data === '[DONE]') return
 
-      try {
-        const parsed: unknown = JSON.parse(data)
-        const content = extract(parsed)
-        if (content) yield content
-      } catch {
-        continue
+        try {
+          const parsed: unknown = JSON.parse(data)
+          const content = extract(parsed)
+          if (content) yield content
+        } catch {
+          continue
+        }
       }
     }
+  } finally {
+    if (!completed) await reader.cancel('SSE consumer stopped before the provider body completed.').catch(() => undefined)
   }
 }
 
@@ -46,6 +54,7 @@ export async function* consumeNDJSON(
 
   const decoder = new TextDecoder()
   let buffer = ''
+  let completed = false
 
   const flushLine = function* (line: string): Generator<string> {
     const trimmed = line.trim()
@@ -59,20 +68,27 @@ export async function* consumeNDJSON(
     }
   }
 
-  while (true) {
-    const { done, value } = await reader.read()
-    if (done) break
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) {
+        completed = true
+        break
+      }
 
-    buffer += decoder.decode(value, { stream: true })
-    const lines = buffer.split('\n')
-    buffer = lines.pop() ?? ''
+      buffer += decoder.decode(value, { stream: true })
+      const lines = buffer.split('\n')
+      buffer = lines.pop() ?? ''
 
-    for (const line of lines) {
-      yield* flushLine(line)
+      for (const line of lines) {
+        yield* flushLine(line)
+      }
     }
-  }
 
-  if (buffer.trim()) {
-    yield* flushLine(buffer)
+    if (buffer.trim()) {
+      yield* flushLine(buffer)
+    }
+  } finally {
+    if (!completed) await reader.cancel('NDJSON consumer stopped before the provider body completed.').catch(() => undefined)
   }
 }

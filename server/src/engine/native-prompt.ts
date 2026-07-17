@@ -1,6 +1,7 @@
 import type { CharacterCard } from '../lib/png-parser.js'
 import type { MatchedEntry } from '../lib/world-match.js'
 import { resolveMacros, type MacroEnv } from '../lib/macros.js'
+import type { EngineMessage, EnginePromptAnchors } from './types.js'
 
 export type ChatMessage = Array<{ role: string; content: string }>
 
@@ -39,14 +40,30 @@ function worldEntryChatRole(entry: MatchedEntry): 'system' | 'user' | 'assistant
   }
 }
 
+function resolveAnchorMessages(messages: EngineMessage[] | undefined, macroEnv: MacroEnv): EngineMessage[] {
+  return (messages ?? []).map(message => ({
+    role: message.role,
+    content: resolveMacros(message.content, macroEnv),
+  }))
+}
+
+function completionMessage(message: { role: string; content: string }, character: CharacterCard): string {
+  if (message.role === 'user') return `鐢ㄦ埛: ${message.content}`
+  if (message.role === 'assistant') return `${character.name}: ${message.content}`
+  return message.content
+}
+
 export function buildOpenAIMessages(
   messages: Array<{ role: string; content: string }>,
   character: CharacterCard,
   macroEnv: MacroEnv,
   worldEntries?: MatchedEntry[],
+  promptAnchors?: EnginePromptAnchors,
 ): ChatMessage {
   const result: ChatMessage = []
   const r = (text: string) => resolveMacros(text, macroEnv)
+
+  result.push(...resolveAnchorMessages(promptAnchors?.beforeMain, macroEnv))
 
   let systemPrompt = ''
   if (character.system_prompt) {
@@ -82,16 +99,18 @@ export function buildOpenAIMessages(
   }
 
   result.push({ role: 'system', content: systemPrompt })
+  result.push(...resolveAnchorMessages(promptAnchors?.afterMain, macroEnv))
 
   const atDepthEntries = worldEntries?.filter(e => e.position === WI_POSITION.AT_DEPTH) ?? []
 
+  const chatStartIndex = result.length
   for (const msg of messages) {
     result.push(msg)
   }
 
   for (const entry of atDepthEntries) {
     const content = resolveMacros(entry.content, macroEnv)
-    const insertIdx = Math.max(1, result.length - entry.depth)
+    const insertIdx = Math.max(chatStartIndex, result.length - entry.depth)
     result.splice(insertIdx, 0, { role: worldEntryChatRole(entry), content })
   }
   return result
@@ -102,10 +121,13 @@ export function buildCompletionPrompt(
   character: CharacterCard,
   macroEnv: MacroEnv,
   worldEntries?: MatchedEntry[],
+  promptAnchors?: EnginePromptAnchors,
 ): string {
   const parts: string[] = []
   const r = (text: string) => resolveMacros(text, macroEnv)
   const mutableMessages = [...messages]
+
+  parts.push(...resolveAnchorMessages(promptAnchors?.beforeMain, macroEnv).map(message => completionMessage(message, character)))
 
   if (character.system_prompt) parts.push(r(character.system_prompt))
 
@@ -132,6 +154,8 @@ export function buildCompletionPrompt(
     if (emBottom) exampleBlock += '\n' + emBottom
     parts.push(`[对话示例]\n${exampleBlock}`)
   }
+
+  parts.push(...resolveAnchorMessages(promptAnchors?.afterMain, macroEnv).map(message => completionMessage(message, character)))
 
   if (worldEntries?.length) {
     const atDepthEntries = worldEntries.filter(e => e.position === WI_POSITION.AT_DEPTH)

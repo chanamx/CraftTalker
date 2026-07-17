@@ -26,6 +26,8 @@ import { buildCompletionPrompt, buildOpenAIMessages, type ChatMessage } from './
 import { consumeNDJSON, consumeSSE } from './native-stream.js'
 import { createError, ErrorCode, AppError } from '../lib/errors.js'
 import type { MacroEnv } from '../lib/macros.js'
+import { resolveRuntimeConfig } from '../config/runtime.js'
+import { providerFetch } from '../lib/provider-fetch.js'
 
 interface NativeRequestContext {
   config: LLMConfig
@@ -219,13 +221,20 @@ export class NativeEngine implements Engine {
     const url = modelListUrlFromConfig(config)
     const headers = headersFromConfig(config, provider)
 
-    debugLlm('test request', { url })
+    debugLlm('test request', { source: config.source ?? config.type })
     try {
-      const response = await fetch(url, { headers })
-      debugLlm('test response', { url, status: response.status })
+      const response = await providerFetch({
+        url,
+        source: config.source,
+        mode: resolveRuntimeConfig().mode,
+        timeoutMs: 5_000,
+        maxResponseBytes: 4 * 1024 * 1024,
+        init: { headers },
+      })
+      debugLlm('test response', { source: config.source ?? config.type, status: response.status })
       return response.ok
     } catch (e) {
-      errorLlm('test failed', { url, error: String(e) })
+      errorLlm('test failed', { source: config.source ?? config.type, error: String(e) })
       return false
     }
   }
@@ -253,14 +262,14 @@ export class NativeEngine implements Engine {
 
   protected buildPromptInput(request: EngineRequest, macroEnv: MacroEnv): NativePromptInput {
     return {
-      chatMessages: buildOpenAIMessages(request.messages, request.character, macroEnv, request.worldEntries),
-      prompt: buildCompletionPrompt(request.messages, request.character, macroEnv, request.worldEntries),
+      chatMessages: buildOpenAIMessages(request.messages, request.character, macroEnv, request.worldEntries, request.promptAnchors),
+      prompt: buildCompletionPrompt(request.messages, request.character, macroEnv, request.worldEntries, request.promptAnchors),
     }
   }
 
   private async generateChatCompletion(context: NativeRequestContext): Promise<EngineResponse> {
     const body = openAICompatibleBody(context.config, context.preset, context.chatMessages, false)
-    const response = await this.fetchLLM(joinUrl(context.baseUrl, '/chat/completions'), context.headers, body, context.signal)
+    const response = await this.fetchLLM(context.config, joinUrl(context.baseUrl, '/chat/completions'), context.headers, body, context.signal)
     const data = await response.json() as {
       choices: Array<{ message?: { content?: string }; finish_reason?: string }>
       usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number }
@@ -275,7 +284,7 @@ export class NativeEngine implements Engine {
 
   private async generateAzureChatCompletion(context: NativeRequestContext): Promise<EngineResponse> {
     const body = azureChatBody(context.config, context.preset, context.chatMessages, false)
-    const response = await this.fetchLLM(azureChatCompletionsUrl(context.baseUrl, context.config), context.headers, body, context.signal)
+    const response = await this.fetchLLM(context.config, azureChatCompletionsUrl(context.baseUrl, context.config), context.headers, body, context.signal)
     const data = await response.json() as {
       choices: Array<{ message?: { content?: string }; finish_reason?: string }>
       usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number }
@@ -290,7 +299,7 @@ export class NativeEngine implements Engine {
 
   private async generateCompletion(context: NativeRequestContext): Promise<EngineResponse> {
     const body = completionBody(context.config, context.preset, context.prompt, false)
-    const response = await this.fetchLLM(joinUrl(context.baseUrl, '/completions'), context.headers, body, context.signal)
+    const response = await this.fetchLLM(context.config, joinUrl(context.baseUrl, '/completions'), context.headers, body, context.signal)
     const data = await response.json() as {
       choices: Array<{ text?: string; finish_reason?: string }>
       usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number }
@@ -305,7 +314,7 @@ export class NativeEngine implements Engine {
 
   private async generateResponses(context: NativeRequestContext): Promise<EngineResponse> {
     const body = openAIResponsesBody(context.config, context.preset, context.chatMessages, false)
-    const response = await this.fetchLLM(joinUrl(context.baseUrl, '/responses'), context.headers, body, context.signal)
+    const response = await this.fetchLLM(context.config, joinUrl(context.baseUrl, '/responses'), context.headers, body, context.signal)
     const data = await response.json() as {
       output_text?: string
       output?: OpenAIResponseOutputItem[]
@@ -323,7 +332,7 @@ export class NativeEngine implements Engine {
 
   private async generateOllamaNative(context: NativeRequestContext): Promise<EngineResponse> {
     const body = ollamaNativeBody(context.config, context.preset, context.chatMessages, false)
-    const response = await this.fetchLLM(ollamaNativeChatUrl(context.baseUrl), context.headers, body, context.signal)
+    const response = await this.fetchLLM(context.config, ollamaNativeChatUrl(context.baseUrl), context.headers, body, context.signal)
     const data = await response.json() as {
       message?: { content?: string }
       done_reason?: string
@@ -344,7 +353,7 @@ export class NativeEngine implements Engine {
 
   private async generateAnthropic(context: NativeRequestContext): Promise<EngineResponse> {
     const body = anthropicBody(context.config, context.preset, context.chatMessages, false)
-    const response = await this.fetchLLM(joinUrl(context.baseUrl, '/messages'), context.headers, body, context.signal)
+    const response = await this.fetchLLM(context.config, joinUrl(context.baseUrl, '/messages'), context.headers, body, context.signal)
     const data = await response.json() as {
       content?: Array<{ type?: string; text?: string }>
       stop_reason?: string
@@ -366,7 +375,7 @@ export class NativeEngine implements Engine {
   private async generateGemini(context: NativeRequestContext): Promise<EngineResponse> {
     const body = geminiBody(context.config, context.preset, context.chatMessages)
     const model = encodeURIComponent(geminiModelId(context.config.model))
-    const response = await this.fetchLLM(joinUrl(context.baseUrl, `/models/${model}:generateContent`), context.headers, body, context.signal)
+    const response = await this.fetchLLM(context.config, joinUrl(context.baseUrl, `/models/${model}:generateContent`), context.headers, body, context.signal)
     const data = await response.json() as {
       candidates?: Array<{ content?: { parts?: Array<{ text?: string }> }; finishReason?: string }>
       usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number; totalTokenCount?: number }
@@ -382,25 +391,25 @@ export class NativeEngine implements Engine {
 
   private async *streamChatCompletion(context: NativeRequestContext): AsyncGenerator<string, void, unknown> {
     const body = openAICompatibleBody(context.config, context.preset, context.chatMessages, true)
-    const response = await this.fetchLLM(joinUrl(context.baseUrl, '/chat/completions'), context.headers, body, context.signal)
+    const response = await this.fetchLLM(context.config, joinUrl(context.baseUrl, '/chat/completions'), context.headers, body, context.signal)
     yield* consumeSSE(response, (parsed) => asOpenAIStreamChunk(parsed).choices?.[0]?.delta?.content)
   }
 
   private async *streamAzureChatCompletion(context: NativeRequestContext): AsyncGenerator<string, void, unknown> {
     const body = azureChatBody(context.config, context.preset, context.chatMessages, true)
-    const response = await this.fetchLLM(azureChatCompletionsUrl(context.baseUrl, context.config), context.headers, body, context.signal)
+    const response = await this.fetchLLM(context.config, azureChatCompletionsUrl(context.baseUrl, context.config), context.headers, body, context.signal)
     yield* consumeSSE(response, (parsed) => asOpenAIStreamChunk(parsed).choices?.[0]?.delta?.content)
   }
 
   private async *streamCompletion(context: NativeRequestContext): AsyncGenerator<string, void, unknown> {
     const body = completionBody(context.config, context.preset, context.prompt, true)
-    const response = await this.fetchLLM(joinUrl(context.baseUrl, '/completions'), context.headers, body, context.signal)
+    const response = await this.fetchLLM(context.config, joinUrl(context.baseUrl, '/completions'), context.headers, body, context.signal)
     yield* consumeSSE(response, (parsed) => asOpenAIStreamChunk(parsed).choices?.[0]?.text)
   }
 
   private async *streamResponses(context: NativeRequestContext): AsyncGenerator<string, void, unknown> {
     const body = openAIResponsesBody(context.config, context.preset, context.chatMessages, true)
-    const response = await this.fetchLLM(joinUrl(context.baseUrl, '/responses'), context.headers, body, context.signal)
+    const response = await this.fetchLLM(context.config, joinUrl(context.baseUrl, '/responses'), context.headers, body, context.signal)
     yield* consumeSSE(response, (parsed) => {
       const chunk = asOpenAIResponsesStreamChunk(parsed)
       return chunk.type === 'response.output_text.delta' ? chunk.delta : undefined
@@ -409,7 +418,7 @@ export class NativeEngine implements Engine {
 
   private async *streamAnthropic(context: NativeRequestContext): AsyncGenerator<string, void, unknown> {
     const body = anthropicBody(context.config, context.preset, context.chatMessages, true)
-    const response = await this.fetchLLM(joinUrl(context.baseUrl, '/messages'), context.headers, body, context.signal)
+    const response = await this.fetchLLM(context.config, joinUrl(context.baseUrl, '/messages'), context.headers, body, context.signal)
     yield* consumeSSE(response, (parsed) => {
       const chunk = asAnthropicStreamChunk(parsed)
       if (chunk.type === 'content_block_delta') return chunk.delta?.text
@@ -421,7 +430,7 @@ export class NativeEngine implements Engine {
   private async *streamGemini(context: NativeRequestContext): AsyncGenerator<string, void, unknown> {
     const body = geminiBody(context.config, context.preset, context.chatMessages)
     const model = encodeURIComponent(geminiModelId(context.config.model))
-    const response = await this.fetchLLM(joinUrl(context.baseUrl, `/models/${model}:streamGenerateContent?alt=sse`), context.headers, body, context.signal)
+    const response = await this.fetchLLM(context.config, joinUrl(context.baseUrl, `/models/${model}:streamGenerateContent?alt=sse`), context.headers, body, context.signal)
     yield* consumeSSE(response, (parsed) => {
       const candidate = asGeminiStreamChunk(parsed).candidates?.[0]
       return candidate ? geminiTextFromCandidate(candidate) : undefined
@@ -430,35 +439,46 @@ export class NativeEngine implements Engine {
 
   private async *streamOllamaNative(context: NativeRequestContext): AsyncGenerator<string, void, unknown> {
     const body = ollamaNativeBody(context.config, context.preset, context.chatMessages, true)
-    const response = await this.fetchLLM(ollamaNativeChatUrl(context.baseUrl), context.headers, body, context.signal)
+    const response = await this.fetchLLM(context.config, ollamaNativeChatUrl(context.baseUrl), context.headers, body, context.signal)
     yield* consumeNDJSON(response, (parsed) => asOllamaStreamChunk(parsed).message?.content)
   }
 
-  private async fetchLLM(url: string, headers: Record<string, string>, body: unknown, signal?: AbortSignal): Promise<Response> {
-    debugLlm('request', { url })
+  private async fetchLLM(config: LLMConfig, url: string, headers: Record<string, string>, body: unknown, signal?: AbortSignal): Promise<Response> {
+    const providerLabel = config.source ?? config.type
+    debugLlm('request', { source: providerLabel })
     let response: Response
     try {
-      response = await fetch(url, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify(body),
-        signal,
+      response = await providerFetch({
+        url,
+        source: config.source,
+        mode: resolveRuntimeConfig().mode,
+        timeoutMs: 180_000,
+        maxResponseBytes: 32 * 1024 * 1024,
+        init: {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(body),
+          signal,
+        },
       })
     } catch (error) {
       if (error instanceof AppError) throw error
-      errorLlm('connection failed', { url, error: String(error) })
-      throw createError(ErrorCode.LLM_CONNECTION_ERROR, 'LLM 服务连接失败', { originalError: String(error), apiUrl: url })
+      errorLlm('connection failed', { source: providerLabel, error: String(error) })
+      throw createError(ErrorCode.LLM_CONNECTION_ERROR, 'LLM 服务连接失败', { provider: providerLabel })
     }
 
     if (!response.ok) {
       const errorText = await response.text()
-      errorLlm('api error', { url, status: response.status, errorText: errorText.slice(0, 500) })
+      errorLlm('api error', { source: providerLabel, status: response.status, errorText: errorText.slice(0, 500) })
       let detail = errorText
       try {
         const parsed = JSON.parse(errorText)
         detail = parsed?.error?.message ?? parsed?.message ?? errorText
       } catch { /* not JSON */ }
-      throw createError(ErrorCode.LLM_API_ERROR, `LLM API 请求失败 (${response.status}): ${detail}`, { status: response.status, errorText, apiUrl: url })
+      throw createError(ErrorCode.LLM_API_ERROR, `LLM API 请求失败 (${response.status}): ${detail}`, {
+        status: response.status,
+        provider: providerLabel,
+      })
     }
 
     return response

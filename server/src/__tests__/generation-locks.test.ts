@@ -1,13 +1,13 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import fs from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
 import { createApp } from '../app.js'
 import { setEngine, NativeEngine } from '../engine/index.js'
-import { clearGenerationLocksForTest } from '../lib/generation-locks.js'
+import { abortActiveGenerations, clearGenerationLocksForTest } from '../lib/generation-locks.js'
 import type { Engine, EngineRequest, EngineResponse } from '../engine/types.js'
 import { addMessage, getChat, updateChatMetadata } from '../services/chat.service.js'
-import { listGenerationRuns } from '../services/run.service.js'
+import { clearRunJournalStoresForTest, listGenerationRuns } from '../services/run.service.js'
 import { clearLlmKeySessionsForTest } from '../services/llm-session.service.js'
 
 let testDataDir = ''
@@ -48,6 +48,59 @@ class FailingGenerateEngine extends SlowStreamEngine {
   }
 }
 
+class FailingStreamEngine extends SlowStreamEngine {
+  async *generateStream(request: EngineRequest): AsyncGenerator<string, void, unknown> {
+    lastEngineRequest = request
+    yield 'partial'
+    throw new Error('test stream failed')
+  }
+}
+
+class AbortAwareStreamEngine extends SlowStreamEngine {
+  aborted = false
+  finalized = false
+
+  async *generateStream(request: EngineRequest): AsyncGenerator<string, void, unknown> {
+    lastEngineRequest = request
+    try {
+      yield 'started'
+      await new Promise<void>((resolve) => {
+        if (request.signal?.aborted) {
+          this.aborted = true
+          resolve()
+          return
+        }
+        request.signal?.addEventListener('abort', () => {
+          this.aborted = true
+          resolve()
+        }, { once: true })
+      })
+    } finally {
+      this.finalized = true
+    }
+  }
+}
+
+class AbortAwareGenerateEngine extends SlowStreamEngine {
+  aborted = false
+
+  async generate(request: EngineRequest): Promise<EngineResponse> {
+    lastEngineRequest = request
+    await new Promise<void>((resolve) => {
+      if (request.signal?.aborted) {
+        this.aborted = true
+        resolve()
+        return
+      }
+      request.signal?.addEventListener('abort', () => {
+        this.aborted = true
+        resolve()
+      }, { once: true })
+    })
+    throw new Error('generation aborted')
+  }
+}
+
 beforeEach(() => {
   process.env.NODE_ENV = 'test'
   testDataDir = path.join(os.tmpdir(), `luker-generation-locks-${crypto.randomUUID()}`)
@@ -63,9 +116,12 @@ beforeEach(() => {
 
 afterEach(() => {
   clearGenerationLocksForTest()
+  clearRunJournalStoresForTest()
   clearLlmKeySessionsForTest()
   setEngine(new NativeEngine())
   delete process.env.LUKER_DATA_DIR
+  delete process.env.CRAFTTALKER_GENERATION_CONCURRENCY
+  delete process.env.CRAFTTALKER_GENERATION_QUEUE_CAPACITY
   fs.rmSync(testDataDir, { recursive: true, force: true })
 })
 
@@ -92,7 +148,12 @@ async function createChat(app: ReturnType<typeof createApp>, characterName: stri
   return body.chatId
 }
 
-function streamRequest(app: ReturnType<typeof createApp>, characterName: string, chatId: string) {
+function streamRequest(
+  app: ReturnType<typeof createApp>,
+  characterName: string,
+  chatId: string,
+  signal?: AbortSignal,
+) {
   return app.request(`/api/chats/${characterName}/${chatId}/stream`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -104,6 +165,7 @@ function streamRequest(app: ReturnType<typeof createApp>, characterName: string,
         type: 'openai',
       },
     }),
+    signal,
   })
 }
 
@@ -119,11 +181,18 @@ function generationBody(extra: Record<string, unknown> = {}) {
   })
 }
 
-function generateRequest(app: ReturnType<typeof createApp>, characterName: string, chatId: string, extra: Record<string, unknown> = {}) {
+function generateRequest(
+  app: ReturnType<typeof createApp>,
+  characterName: string,
+  chatId: string,
+  extra: Record<string, unknown> = {},
+  signal?: AbortSignal,
+) {
   return app.request(`/api/chats/${characterName}/${chatId}/generate`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: generationBody(extra),
+    signal,
   })
 }
 
@@ -260,8 +329,11 @@ describe('generation locks', () => {
     expect(res.status).toBe(200)
     await res.json()
 
+    expect(lastEngineRequest?.promptAnchors).toEqual({
+      beforeMain: [],
+      afterMain: [{ role: 'system', content: 'Remember the plugin-provided rule.' }],
+    })
     expect(lastEngineRequest?.messages).toEqual([
-      { role: 'system', content: 'Remember the plugin-provided rule.' },
       { role: 'user', content: 'What should I remember?' },
     ])
 
@@ -297,6 +369,64 @@ describe('generation locks', () => {
       { role: 'assistant', content: 'Second' },
       { role: 'assistant', content: 'Assistant-side injected note.' },
       { role: 'user', content: 'Third' },
+    ])
+  })
+
+  it('sorts and groups ST in-chat prompts against the original chat depth', async () => {
+    const app = createApp()
+    writeCharacter('GroupedDepthBot')
+    const chatId = await createChat(app, 'GroupedDepthBot')
+    await addMessage('GroupedDepthBot', chatId, true, 'First')
+    await addMessage('GroupedDepthBot', chatId, false, 'Second')
+    await addMessage('GroupedDepthBot', chatId, true, 'Third')
+
+    const res = await generateRequest(app, 'GroupedDepthBot', chatId, {
+      stCompatExtensionPrompts: [
+        { key: 'z-system', value: '  Z system  ', position: 1, depth: 1, role: 0 },
+        { key: 'a-system', value: 'A system', position: 1, depth: 1, role: 0 },
+        { key: 'm-user', value: 'User note', position: 1, depth: 1, role: 1 },
+        { key: 'b-assistant', value: 'Assistant note', position: 1, depth: 1, role: 2 },
+        { key: 'tail-system', value: 'Tail note', position: 1, depth: 0, role: 0 },
+        { key: 'deep-system', value: 'Deep note', position: 1, depth: 2, role: 0 },
+      ],
+    })
+
+    expect(res.status).toBe(200)
+    await res.json()
+    expect(lastEngineRequest?.messages).toEqual([
+      { role: 'user', content: 'First' },
+      { role: 'system', content: 'Deep note' },
+      { role: 'assistant', content: 'Second' },
+      { role: 'assistant', content: 'Assistant note' },
+      { role: 'user', content: 'User note' },
+      { role: 'system', content: 'A system\nZ system' },
+      { role: 'user', content: 'Third' },
+      { role: 'system', content: 'Tail note' },
+    ])
+  })
+
+  it('keeps ST NONE extension prompts out of generation messages', async () => {
+    const app = createApp()
+    writeCharacter('NonePromptBot')
+    const chatId = await createChat(app, 'NonePromptBot')
+    await addMessage('NonePromptBot', chatId, true, 'Hello')
+
+    const res = await generateRequest(app, 'NonePromptBot', chatId, {
+      stCompatExtensionPrompts: [
+        {
+          key: 'scan-only-note',
+          value: 'This must not enter the final prompt.',
+          position: -1,
+          scan: false,
+          role: 0,
+        },
+      ],
+    })
+
+    expect(res.status).toBe(200)
+    await res.json()
+    expect(lastEngineRequest?.messages).toEqual([
+      { role: 'user', content: 'Hello' },
     ])
   })
 
@@ -340,6 +470,32 @@ describe('generation locks', () => {
     const chat = await getChat('PromptHookBot', chatId)
     const userLine = chat.lines.find(line => line.is_user === true)
     expect(userLine?.mes).toBe('Hello {{macro_like}}')
+  })
+
+  it('maps ST absolute extension prompts to typed native main-prompt anchors', async () => {
+    const app = createApp()
+    writeCharacter('PromptAnchorBot')
+    const chatId = await createChat(app, 'PromptAnchorBot')
+    await addMessage('PromptAnchorBot', chatId, true, 'Hello')
+
+    const res = await generateRequest(app, 'PromptAnchorBot', chatId, {
+      stCompatExtensionPrompts: [
+        { key: 'before-main', value: 'Before main', position: 2, role: 1 },
+        { key: 'after-main', value: 'After main', position: 0, role: 2 },
+        { key: 'in-chat', value: 'In chat', position: 1, depth: 0, role: 0 },
+      ],
+    })
+
+    expect(res.status).toBe(200)
+    await res.json()
+    expect(lastEngineRequest?.promptAnchors).toEqual({
+      beforeMain: [{ role: 'user', content: 'Before main' }],
+      afterMain: [{ role: 'assistant', content: 'After main' }],
+    })
+    expect(lastEngineRequest?.messages).toEqual([
+      { role: 'user', content: 'Hello' },
+      { role: 'system', content: 'In chat' },
+    ])
   })
 
   it('rejects unsafe fields in ST-compatible generation overrides', async () => {
@@ -443,9 +599,41 @@ describe('generation locks', () => {
     expect(res.status).toBe(200)
     const text = await res.text()
     const [run] = (await listGenerationRuns()).filter(item => item.characterName === 'StreamMetaBot' && item.chatId === chatId)
+    const stored = await getChat('StreamMetaBot', chatId)
 
     expect(text).toContain(`data: {"done":true,"runId":"${run?.runId}","committedLineIndex":2}`)
     expect(text.trimEnd()).toContain('data: [DONE]')
+    expect(stored.lines[2]).toMatchObject({
+      extra: { crafttalker: { run_ids: [run?.runId] } },
+    })
+  })
+
+  it('maps stream executor failures to SSE and releases the chat lock', async () => {
+    setEngine(new FailingStreamEngine())
+    const app = createApp()
+    writeCharacter('StreamFailureBot')
+    const chatId = await createChat(app, 'StreamFailureBot')
+
+    const failed = await streamRequest(app, 'StreamFailureBot', chatId)
+    expect(failed.status).toBe(200)
+    const text = await failed.text()
+    expect(text).toContain('data: {"content":"partial"}')
+    expect(text).toContain('"code":1000')
+    expect(text).not.toContain('data: [DONE]')
+
+    const runs = await listGenerationRuns()
+    expect(runs.find(run => run.characterName === 'StreamFailureBot' && run.chatId === chatId)).toMatchObject({
+      status: 'failed',
+      error: 'test stream failed',
+      partialContent: 'partial',
+      committedLineIndex: 1,
+    })
+    expect((await getChat('StreamFailureBot', chatId)).lines[1]).toMatchObject({ mes: 'partial' })
+
+    setEngine(new SlowStreamEngine())
+    const retried = await streamRequest(app, 'StreamFailureBot', chatId)
+    expect(retried.status).toBe(200)
+    await drain(retried)
   })
 
   it('rejects concurrent generation for the same chat but allows other chats', async () => {
@@ -478,6 +666,112 @@ describe('generation locks', () => {
     await drain(afterComplete)
   }, 10_000)
 
+  it('queues different chats up to capacity and returns bounded 429 beyond it', async () => {
+    process.env.CRAFTTALKER_GENERATION_CONCURRENCY = '1'
+    process.env.CRAFTTALKER_GENERATION_QUEUE_CAPACITY = '1'
+    const engine = new AbortAwareStreamEngine()
+    setEngine(engine)
+    const app = createApp()
+    writeCharacter('QueueBot')
+    const chatA = await createChat(app, 'QueueBot')
+    const chatB = await createChat(app, 'QueueBot')
+    const chatC = await createChat(app, 'QueueBot')
+
+    const first = await streamRequest(app, 'QueueBot', chatA)
+    const firstReader = first.body?.getReader()
+    expect((await firstReader?.read())?.done).toBe(false)
+
+    let secondSettled = false
+    const secondPromise = Promise.resolve(streamRequest(app, 'QueueBot', chatB)).then(response => {
+      secondSettled = true
+      return response
+    })
+    await new Promise(resolve => setTimeout(resolve, 10))
+    expect(secondSettled).toBe(false)
+
+    const full = await streamRequest(app, 'QueueBot', chatC)
+    expect(full.status).toBe(429)
+    expect(full.headers.get('Retry-After')).toBe('1')
+    expect(await full.json()).toMatchObject({ code: 5003 })
+
+    await firstReader?.cancel('release queue')
+    const second = await secondPromise
+    expect(second.status).toBe(200)
+    const secondReader = second.body?.getReader()
+    expect((await secondReader?.read())?.done).toBe(false)
+    await secondReader?.cancel('cleanup')
+
+    const runs = await listGenerationRuns()
+    expect(runs.some(run => run.chatId === chatC)).toBe(false)
+  })
+
+  it('aborts and closes the upstream generator when the client cancels a stream', async () => {
+    const engine = new AbortAwareStreamEngine()
+    setEngine(engine)
+    const app = createApp()
+    writeCharacter('CancelBot')
+    const chatId = await createChat(app, 'CancelBot')
+
+    const response = await streamRequest(app, 'CancelBot', chatId)
+    const reader = response.body?.getReader()
+    expect(reader).toBeDefined()
+    expect((await reader?.read())?.done).toBe(false)
+
+    await reader?.cancel('test disconnect')
+    await vi.waitFor(() => {
+      expect(engine.aborted).toBe(true)
+      expect(engine.finalized).toBe(true)
+    })
+
+    const runs = await listGenerationRuns()
+    expect(runs.find(run => run.characterName === 'CancelBot' && run.chatId === chatId)?.status).toBe('canceled')
+  })
+
+  it('propagates client cancellation to non-stream generation', async () => {
+    const engine = new AbortAwareGenerateEngine()
+    setEngine(engine)
+    const app = createApp()
+    writeCharacter('CancelFullBot')
+    const chatId = await createChat(app, 'CancelFullBot')
+    const controller = new AbortController()
+
+    const request = generateRequest(app, 'CancelFullBot', chatId, {}, controller.signal)
+    await vi.waitFor(() => expect(lastEngineRequest).not.toBeNull())
+    controller.abort('test disconnect')
+    await Promise.resolve(request).catch(() => undefined)
+
+    expect(engine.aborted).toBe(true)
+  })
+
+  it('rejects new generations with 503 after shutdown starts', async () => {
+    const app = createApp()
+    writeCharacter('ShutdownRejectBot')
+    const chatId = await createChat(app, 'ShutdownRejectBot')
+    abortActiveGenerations('test shutdown')
+
+    const response = await generateRequest(app, 'ShutdownRejectBot', chatId)
+    expect(response.status).toBe(503)
+    expect(await response.json()).toMatchObject({ code: 5002 })
+  })
+
+  it('interrupts an active stream without committing partial content during shutdown', async () => {
+    const engine = new AbortAwareStreamEngine()
+    setEngine(engine)
+    const app = createApp()
+    writeCharacter('ShutdownStreamBot')
+    const chatId = await createChat(app, 'ShutdownStreamBot')
+
+    const response = await streamRequest(app, 'ShutdownStreamBot', chatId)
+    const reader = response.body?.getReader()
+    expect((await reader?.read())?.done).toBe(false)
+    abortActiveGenerations('test shutdown')
+    await vi.waitFor(() => expect(engine.finalized).toBe(true))
+    await reader?.read()
+
+    const runs = await listGenerationRuns()
+    expect(runs.find(run => run.characterName === 'ShutdownStreamBot' && run.chatId === chatId)?.status).toBe('interrupted')
+    expect((await getChat('ShutdownStreamBot', chatId)).lines).toHaveLength(1)
+  })
   it('keeps regenerate deletion inside the generation lock', async () => {
     const app = createApp()
     writeCharacter('RegenBot')
@@ -818,6 +1112,62 @@ describe('generation locks', () => {
     await drain(res)
 
     expect(lastEngineRequest?.worldEntries?.map(entry => entry.content)).toEqual(['extension-scanned lore'])
+  })
+
+  it('isolates world-info scanning from non-scan prompts and generation-after-data messages', async () => {
+    const app = createApp()
+    writeCharacter('ExtensionScanIsolationBot')
+    const charPath = path.join(testDataDir, 'characters', 'ExtensionScanIsolationBot', 'character.json')
+    fs.writeFileSync(
+      charPath,
+      JSON.stringify({
+        name: 'ExtensionScanIsolationBot',
+        description: 'Test bot',
+        extensions: { world: 'ExtensionScanIsolationWorld' },
+      }),
+      'utf8',
+    )
+    fs.writeFileSync(
+      path.join(testDataDir, 'worlds', 'ExtensionScanIsolationWorld.json'),
+      JSON.stringify({
+        name: 'ExtensionScanIsolationWorld',
+        enabled: true,
+        global_enabled: false,
+        entries: {
+          '1': { uid: 1, key: ['scan signal'], content: 'scan-enabled lore', enabled: true, insertion_order: 100 },
+          '2': { uid: 2, key: ['display signal'], content: 'display-only lore', enabled: true, insertion_order: 90 },
+          '3': { uid: 3, key: ['hook signal'], content: 'hook-only lore', enabled: true, insertion_order: 80 },
+        },
+      }),
+      'utf8',
+    )
+
+    const chatId = await createChat(app, 'ExtensionScanIsolationBot')
+    await addMessage('ExtensionScanIsolationBot', chatId, true, 'plain message', 'Alice')
+
+    const res = await generateRequest(app, 'ExtensionScanIsolationBot', chatId, {
+      stCompatChatOverride: [
+        { name: 'Alice', is_user: true, is_system: false, mes: 'plain message' },
+      ],
+      stCompatExtensionPrompts: [
+        { key: 'scan-only', value: 'scan signal', position: -1, scan: true, role: 0 },
+        { key: 'display-only', value: 'display signal', position: 0, scan: false, role: 0 },
+      ],
+      stCompatPromptMessages: [
+        { role: 'system', content: 'display signal' },
+        { role: 'system', content: 'hook signal' },
+        { role: 'user', content: 'plain message' },
+      ],
+    })
+
+    expect(res.status).toBe(200)
+    await res.json()
+    expect(lastEngineRequest?.worldEntries?.map(entry => entry.content)).toEqual(['scan-enabled lore'])
+    expect(lastEngineRequest?.messages).toEqual([
+      { role: 'system', content: 'display signal' },
+      { role: 'system', content: 'hook signal' },
+      { role: 'user', content: 'plain message' },
+    ])
   })
 
   it('uses the native generation operation for ST world-info trigger filters', async () => {

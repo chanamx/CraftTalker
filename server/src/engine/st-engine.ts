@@ -106,6 +106,7 @@ export class STEngine extends NativeEngine {
       messages: request.messages,
       userName: macroEnv.user,
       worldInfo: request.worldEntries?.map(entry => entry.content),
+      promptAnchors: request.promptAnchors,
     })
     return {
       chatMessages: messages,
